@@ -177,3 +177,96 @@ ns:RegisterSelfTest("mail-queue", function(verbose)
 
     return report(t, verbose)
 end)
+
+-- ── Suite 6: Raid-Prep → Conduit settings migration (pure; migrate.lua) ────────
+ns:RegisterSelfTest("raidprep-migration", function(verbose)
+    local t = newT("raidprep-migration")
+    local M = ns.Migrate
+
+    local function count(set) local n = 0; for _ in pairs(set) do n = n + 1 end; return n end
+
+    -- A Raid-Prep-shaped SavedVariables fixture.
+    --   item set = union(class itemIDs) + mailExtra - mailIgnored
+    --            = {13442, 13446, 20520}  (13444 removed by mailIgnored)
+    local prepDB = {
+        classes = {
+            WARRIOR = { { itemID = 13442 }, { itemID = 13446 } },
+            MAGE    = { { itemID = 13444 }, { itemID = 13446 } },  -- 13446 dup across classes
+        },
+        mailExtra   = { [20520] = true },   -- Dark Rune added by hand
+        mailIgnored = { [13444] = true },   -- Major Mana Potion unchecked
+        mailTo      = { Alliance = "Bankalt", Horde = "Hordebank" },
+    }
+
+    -- ComputeItemSet: union - ignored, de-duplicated.
+    local set = M.ComputeItemSet(prepDB)
+    eq(t, count(set), 3, "item set has 3 items (dup collapsed, ignored removed)")
+    check(t, set[13442] == true, "kept class item 13442")
+    check(t, set[13446] == true, "kept class item 13446 (from two classes)")
+    check(t, set[20520] == true, "kept mailExtra item 20520")
+    check(t, set[13444] == nil,  "mailIgnored 13444 excluded")
+
+    -- FactionRecipients: both factions, Alliance first.
+    local recips = M.FactionRecipients(prepDB)
+    eq(t, #recips, 2, "both faction recipients found")
+    eq(t, recips[1].faction, "Alliance", "Alliance ordered first")
+    eq(t, recips[1].recipient, "Bankalt", "Alliance recipient")
+    eq(t, recips[2].recipient, "Hordebank", "Horde recipient")
+
+    -- BuildConsumesRules: one list-mode rule per faction, distinct item copies.
+    local id = 0
+    local function alloc() id = id + 1; return id end
+    local rules = M.BuildConsumesRules(prepDB, alloc)
+    eq(t, #rules, 2, "two rules built (one per faction)")
+    eq(t, rules[1].name, "Send Consumes (Alliance)", "Alliance rule named")
+    eq(t, rules[2].name, "Send Consumes (Horde)", "Horde rule named")
+    eq(t, rules[1].kind, "items", "rule kind is items")
+    eq(t, rules[1].filter.mode, "list", "rule filter is list mode")
+    eq(t, rules[1].recipient, "Bankalt", "Alliance rule recipient")
+    eq(t, count(rules[1].filter.items), 3, "rule 1 carries the full item set")
+    eq(t, count(rules[2].filter.items), 3, "rule 2 carries the full item set")
+    check(t, rules[1].filter.items ~= rules[2].filter.items, "each rule owns a distinct items table")
+    rules[1].filter.items[13442] = nil
+    check(t, rules[2].filter.items[13442] == true, "mutating rule 1 items does not affect rule 2")
+
+    -- Single-faction fixture => one plain "Send Consumes" (no suffix).
+    local solo = { classes = {}, mailExtra = { [13510] = true }, mailIgnored = {},
+                   mailTo = { Alliance = "Solobank", Horde = "" } }
+    id = 0
+    local soloRules = M.BuildConsumesRules(solo, alloc)
+    eq(t, #soloRules, 1, "single faction => one rule")
+    eq(t, soloRules[1].name, "Send Consumes", "single-faction rule unsuffixed")
+    eq(t, soloRules[1].recipient, "Solobank", "single-faction recipient")
+
+    -- Legacy bare-string mailTo is honored.
+    local legacy = { classes = {}, mailExtra = {}, mailIgnored = {}, mailTo = "OldBank" }
+    local legRules = M.BuildConsumesRules(legacy, alloc)
+    eq(t, #legRules, 1, "legacy string mailTo => one rule")
+    eq(t, legRules[1].recipient, "OldBank", "legacy recipient migrated")
+
+    -- Apply: idempotent + non-destructive marker behavior.
+    local db = { rules = {}, nextRuleId = 1 }
+    local added = M.Apply(db, prepDB)
+    eq(t, added, 2, "first Apply adds 2 rules")
+    eq(t, #db.rules, 2, "db has 2 rules after first Apply")
+    check(t, db.migratedRaidPrep == true, "marker set after Apply")
+    eq(t, db.nextRuleId, 3, "nextRuleId advanced past the 2 assigned ids")
+
+    local added2 = M.Apply(db, prepDB)
+    eq(t, added2, 0, "second Apply is a no-op (idempotent)")
+    eq(t, #db.rules, 2, "no duplicate rules on re-apply")
+
+    -- Apply with no Raid-Prep data present: no rules, marker NOT set (door open).
+    local db2 = { rules = {}, nextRuleId = 1 }
+    eq(t, M.Apply(db2, nil), 0, "absent prepDB adds nothing")
+    check(t, db2.migratedRaidPrep ~= true, "absent prepDB leaves marker unset")
+
+    -- Apply with Raid-Prep present but no recipient configured: 0 rules, marker set.
+    local db3 = { rules = {}, nextRuleId = 1 }
+    local noRcpt = { classes = { WARRIOR = { { itemID = 13442 } } }, mailExtra = {},
+                     mailIgnored = {}, mailTo = { Alliance = "", Horde = "" } }
+    eq(t, M.Apply(db3, noRcpt), 0, "no recipient => 0 rules")
+    check(t, db3.migratedRaidPrep == true, "marker set (data seen) even with 0 rules")
+
+    return report(t, verbose)
+end)

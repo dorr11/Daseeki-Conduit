@@ -11,6 +11,7 @@
 
 core.lua
 rules.lua
+migrate.lua
 network.lua
 mail.lua
 panel.lua
