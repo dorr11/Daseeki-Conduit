@@ -76,26 +76,71 @@ local function build()
     f:EnableMouse(true)
     f:Hide()
 
-    -- Header.
+    -- Ledger ground: grain substrate + aged-edge vignette + 1px bronze window keyline
+    -- (BRAND_SPEC §4). Kit calls are guarded so an older Core (no Phase-0 kit) still
+    -- loads — the panel just renders flat.
+    if UI.PaintLedgerGround then UI.PaintLedgerGround(f) end
+
+    -- §4 layering contract: chrome text must sit on a flat fill, never on grain. The
+    -- header and footer text bands get a flat "panel" backer at BACKGROUND sublevel 3
+    -- (above the kit's grain[1]/vignette[2]); the bronze keyline (BORDER) and the side
+    -- vignettes still draw above/around them. The middle (the rules list) already sits
+    -- on its own inset card. No-op-safe if the kit painted nothing.
+    local function flatBacker(anchorSetup)
+        local t = f:CreateTexture(nil, "BACKGROUND", nil, 3)
+        UI.Skin(t, function(self) self:SetColorTexture(UI.Color("panel")) end)
+        anchorSetup(t)
+        return t
+    end
+    flatBacker(function(t)
+        t:SetPoint("TOPLEFT", f, "TOPLEFT", 1, -1)
+        t:SetPoint("TOPRIGHT", f, "TOPRIGHT", -1, -1)
+        t:SetHeight(PAD + HEADER_H)
+    end)
+    flatBacker(function(t)
+        t:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 1, 1)
+        t:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -1, 1)
+        t:SetHeight(FOOT_H + PAD)
+    end)
+
+    -- Header. ONE maker's mark per window (§5), on the titlebar (§4).
     local title = f:CreateFontString(nil, "OVERLAY")
-    title:SetFontObject(UI.fonts.header)
-    title:SetPoint("TOPLEFT", f, "TOPLEFT", PAD, -PAD)
+    -- Window title → ceremonial MORPHEUS ≥16 (§3); falls back to the serif header font.
+    title:SetFontObject(UI.fonts.ceremonial or UI.fonts.header)
     title:SetText("Conduit")
     f.title = title
 
+    if UI.MakerMark then
+        local mark = UI.MakerMark(f, { size = 18 })
+        mark:SetPoint("TOPLEFT", f, "TOPLEFT", PAD, -PAD)
+        title:SetPoint("LEFT", mark, "RIGHT", 6, -1)
+        f.mark = mark
+    else
+        title:SetPoint("TOPLEFT", f, "TOPLEFT", PAD, -PAD)
+    end
+
+    -- Slash-command hint → uppercase letter-spaced micro-label (§3); stays faint (calm).
     local hint = f:CreateFontString(nil, "OVERLAY")
-    hint:SetFontObject(UI.fonts.small)
+    hint:SetFontObject(UI.fonts.microLabel or UI.fonts.small)
     hint:SetPoint("TOPRIGHT", f, "TOPRIGHT", -PAD, -PAD - 2)
     hint:SetJustifyH("RIGHT")
     UI.Skin(hint, function(self) self:SetTextColor(UI.Color("faint")) end)
-    hint:SetText("/conduit")
+    hint:SetText("/CONDUIT")
     f.hint = hint
 
-    local rule = f:CreateTexture(nil, "ARTWORK")
-    rule:SetHeight(1)
-    rule:SetPoint("TOPLEFT", f, "TOPLEFT", PAD, -(PAD + HEADER_H))
-    rule:SetPoint("TOPRIGHT", f, "TOPRIGHT", -PAD, -(PAD + HEADER_H))
-    UI.Skin(rule, function(self) self:SetColorTexture(UI.Color("borderLite")) end)
+    -- Header divider: the ONE section hairline, pixel-snapped via the kit (§1). Falls
+    -- back to a plain 1px texture on an older Core.
+    if UI.Hairline then
+        local hair = UI.Hairline(f, { token = "border" })
+        hair:SetPoint("TOPLEFT", f, "TOPLEFT", PAD, -(PAD + HEADER_H))
+        hair:SetPoint("TOPRIGHT", f, "TOPRIGHT", -PAD, -(PAD + HEADER_H))
+    else
+        local hair = f:CreateTexture(nil, "ARTWORK")
+        hair:SetHeight(1)
+        hair:SetPoint("TOPLEFT", f, "TOPLEFT", PAD, -(PAD + HEADER_H))
+        hair:SetPoint("TOPRIGHT", f, "TOPRIGHT", -PAD, -(PAD + HEADER_H))
+        UI.Skin(hair, function(self) self:SetColorTexture(UI.Color("border")) end)
+    end
 
     -- Disabled banner (shown when this character is opted out).
     local banner = f:CreateFontString(nil, "OVERLAY")
@@ -139,7 +184,7 @@ local function build()
     empty:SetJustifyH("LEFT")
     empty:SetWordWrap(true)
     UI.Skin(empty, function(self) self:SetTextColor(UI.Color("muted")) end)
-    empty:SetText("No rules yet. Open |cffffd200/conduit settings|r to add a rule, or the Send Consumes preset.")
+    empty:SetText("No rules yet. Open " .. ns:Wrap("brand", "/conduit settings") .. " to add a rule, or the Send Consumes preset.")
     empty:Hide()
     f.empty = empty
 
@@ -203,13 +248,15 @@ function Panel.Refresh()
         shown = shown + 1
 
         row.name:SetText(rule.name or ("Rule " .. i))
-        local recip = (rule.recipient and rule.recipient ~= "") and rule.recipient or "|cffcf5d4ano recipient|r"
+        local hasRecip = rule.recipient and rule.recipient ~= ""
+        local recip = hasRecip and rule.recipient or ns:Wrap("danger", "no recipient")
         local kindStr = rule.kind == "gold" and "gold" or "items"
         row.sub:SetText(kindStr .. "  ->  " .. recip)
 
-        local ok = rule.enabled and rule.recipient and rule.recipient ~= ""
-        local dotTok = (not rule.enabled) and "faint" or ok and "ok" or "danger"
-        row.dot:SetColorTexture(UI.Color(dotTok))
+        -- Attention inversion (§2/§5): rows are calm by default; only a rule that is
+        -- enabled yet can't send (no recipient) tints. Disabled + ready rules stay idle.
+        local problem = rule.enabled and not hasRecip
+        row.dot:SetColorTexture(UI.Color(problem and "danger" or "idle"))
 
         -- Per-rule Send: disabled while a run is active or char disabled.
         local canSend = rule.enabled and not active and not disabled

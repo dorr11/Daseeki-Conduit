@@ -209,12 +209,13 @@ local function armNext()
         if (mail.money and mail.money > 0) or (type(n) == "number" and n > 0) then
             S.awaitingClick = true
             local total = #S.queue
+            local sendNext = ns:Wrap("brand", "Send Next")   -- actionable: selection/urgency (§2)
             if mail.money and mail.money > 0 then
-                say(("mail %d/%d ready: %s to %s. Click |cffffd200Send Next|r.")
-                    :format(S.idx, total, GetCoinTextureString and GetCoinTextureString(mail.money) or (mail.money .. "c"), mail.recipient))
+                say(("mail %d/%d ready: %s to %s. Click %s.")
+                    :format(S.idx, total, GetCoinTextureString and GetCoinTextureString(mail.money) or (mail.money .. "c"), mail.recipient, sendNext))
             else
-                say(("mail %d/%d ready: %d item(s) to %s. Click |cffffd200Send Next|r.")
-                    :format(S.idx, total, S.pendingCount, mail.recipient))
+                say(("mail %d/%d ready: %d item(s) to %s. Click %s.")
+                    :format(S.idx, total, S.pendingCount, mail.recipient, sendNext))
             end
             notifyPanel()
             return
@@ -291,10 +292,11 @@ StaticPopupDialogs["DASEEKI_CONDUIT_SEND_CONFIRM"] = {
 -- Build the dry-run summary text for the popup from a summary table.
 local function summaryText(summary, mailCount, skipped)
     local lines = {}
-    lines[#lines + 1] = ("Send |cffffd200%d|r mail(s)?"):format(mailCount)
+    -- Neutral facts stay calm bright cream (attention inversion §5); no alarm color on a count.
+    lines[#lines + 1] = ("Send %s mail(s)?"):format(ns:Wrap("text", mailCount))
     lines[#lines + 1] = ""
     if summary.itemCount > 0 then
-        lines[#lines + 1] = ("Items:  |cffffffff%d|r"):format(summary.itemCount)
+        lines[#lines + 1] = ("Items:  %s"):format(ns:Wrap("text", summary.itemCount))
     end
     if summary.goldCopper > 0 then
         local g = GetCoinTextureString and GetCoinTextureString(summary.goldCopper) or (summary.goldCopper .. "c")
@@ -311,12 +313,12 @@ local function summaryText(summary, mailCount, skipped)
             local parts = {}
             if r.items > 0 then parts[#parts + 1] = r.items .. " item(s)" end
             if r.gold  > 0 then parts[#parts + 1] = (GetCoinTextureString and GetCoinTextureString(r.gold) or (r.gold .. "c")) end
-            lines[#lines + 1] = ("|cffffd200%s|r  <-  %s  (%d mail)"):format(name, table.concat(parts, " + "), r.mails)
+            lines[#lines + 1] = ("%s  <-  %s  (%d mail)"):format(ns:Wrap("text", name), table.concat(parts, " + "), r.mails)
         end
     end
     if skipped and #skipped > 0 then
         lines[#lines + 1] = ""
-        lines[#lines + 1] = ("|cff9a8f79%d rule(s) skipped (nothing to send / bad recipient).|r"):format(#skipped)
+        lines[#lines + 1] = ns:Wrap("muted", ("%d rule(s) skipped (nothing to send / bad recipient)."):format(#skipped))
     end
     return table.concat(lines, "\n")
 end

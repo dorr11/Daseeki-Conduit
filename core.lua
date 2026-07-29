@@ -18,6 +18,9 @@ local ADDON, ns = ...
 ns.ADDON    = ADDON
 ns.DISPLAY  = "Daseeki Conduit"
 ns.VERSION  = "0.1.0"
+ns.CHAT_TAG_TEXT = "Daseeki Conduit"
+-- Static fallback used only when Daseeki Core (DaseekiUI) is absent; when present the
+-- chat tag derives from the live "brand" token (Field Ledger rollout, BRAND_SPEC §2).
 ns.CHAT_TAG = "|cff4fc3f7Daseeki Conduit|r"
 
 -- Schema version for DaseekiConduitDB. Bump + add a migration branch below on any
@@ -41,8 +44,34 @@ ns.MAIL_SUBJECT = "Daseeki Conduit"
 -- Small utilities
 ----------------------------------------------------------------------
 
+-- Token → "|cffRRGGBB" escape prefix for chat / StaticPopup strings, where a real
+-- FontObject can't be assigned. Reads the live theme so spans track SetTheme. Returns
+-- nil when Core is absent (headless self-test harness), so callers fall back to plain
+-- text and never error. (Field Ledger rollout: eliminates hardcoded |cff literals.)
+function ns:Hex(token)
+    local UI = _G.DaseekiUI
+    if not (UI and UI.Color) then return nil end
+    local r, g, b = UI.Color(token)
+    local function b255(v) return math.max(0, math.min(255, math.floor((v or 0) * 255 + 0.5))) end
+    return ("|cff%02x%02x%02x"):format(b255(r), b255(g), b255(b))
+end
+
+-- Wrap `text` in a token color for chat/popup strings; plain text if Core is absent.
+function ns:Wrap(token, text)
+    local h = ns:Hex(token)
+    if not h then return tostring(text) end
+    return h .. tostring(text) .. "|r"
+end
+
+-- Brand-tinted chat tag (falls back to the static cyan tag when Core is unavailable).
+local function chatTag()
+    local h = ns.Hex and ns:Hex("brand")
+    if h then return h .. ns.CHAT_TAG_TEXT .. "|r" end
+    return ns.CHAT_TAG
+end
+
 function ns:Print(...)
-    print(ns.CHAT_TAG .. ":", ...)
+    print(chatTag() .. ":", ...)
 end
 
 -- Surface errors to the real handler (style-guide standing rule: layout/runtime

@@ -540,8 +540,11 @@ function Options.Build(flow)
         items = function()
             local out = {}
             for _, rule in ipairs((ns.db and ns.db.rules) or {}) do
-                local status = (not rule.enabled) and "muted"
-                    or (rule.recipient and rule.recipient ~= "") and "ok" or "danger"
+                -- Attention inversion (§2/§5): only a rule that is enabled yet can't send
+                -- (no recipient) tints danger; disabled + ready rules stay calm (MakeList's
+                -- default faint dot). MakeList's status vocabulary is ok/danger/faint.
+                local hasRecip = rule.recipient and rule.recipient ~= ""
+                local status = (rule.enabled and not hasRecip) and "danger" or nil
                 local tag = rule.kind == "gold" and "  [gold]" or ""
                 out[#out + 1] = { text = (rule.name or "Rule") .. tag, value = rule.id, status = status }
             end
