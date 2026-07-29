@@ -76,6 +76,16 @@ local function build()
     f:EnableMouse(true)
     f:Hide()
 
+    -- ESC-close (BRAND_SPEC §8). The panel is an unprotected frame, so UISpecialFrames is
+    -- safe. Named + guarded add (idempotent) so a rebuild never double-registers.
+    local GNAME = "DaseekiConduitPanel"
+    _G[GNAME] = f
+    if type(UISpecialFrames) == "table" then
+        local seen = false
+        for _, n in ipairs(UISpecialFrames) do if n == GNAME then seen = true; break end end
+        if not seen then table.insert(UISpecialFrames, GNAME) end
+    end
+
     -- Ledger ground: grain substrate + aged-edge vignette + 1px bronze window keyline
     -- (BRAND_SPEC §4). Kit calls are guarded so an older Core (no Phase-0 kit) still
     -- loads — the panel just renders flat.
@@ -119,10 +129,27 @@ local function build()
         title:SetPoint("TOPLEFT", f, "TOPLEFT", PAD, -PAD)
     end
 
+    -- Top-right ✕ (BRAND_SPEC §8) — matches the hub/Nexus close treatment. ESC-close is
+    -- wired via UISpecialFrames above. Closing only hides the panel; an in-progress run is
+    -- left intact (reopen with /conduit show — see core.lua).
+    local closeBtn = CreateFrame("Button", nil, f)
+    closeBtn:SetSize(24, 24)
+    closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -4, -4)
+    local cx = closeBtn:CreateFontString(nil, "OVERLAY")
+    cx:SetFontObject(UI.fonts.body)
+    cx:SetPoint("CENTER", closeBtn, "CENTER", 0, 0)
+    cx:SetText("X")
+    closeBtn:SetScript("OnEnter", function() cx:SetFontObject(UI.fonts.danger) end)
+    closeBtn:SetScript("OnLeave", function() cx:SetFontObject(UI.fonts.body) end)
+    closeBtn:SetScript("OnClick", function() Panel.Hide() end)
+    f.closeBtn = closeBtn
+
     -- Slash-command hint → uppercase letter-spaced micro-label (§3); stays faint (calm).
+    -- Sits to the LEFT of the ✕ (created above); vertical offset preserves its original
+    -- title-baseline alignment while clearing the close button.
     local hint = f:CreateFontString(nil, "OVERLAY")
     hint:SetFontObject(UI.fonts.microLabel or UI.fonts.small)
-    hint:SetPoint("TOPRIGHT", f, "TOPRIGHT", -PAD, -PAD - 2)
+    hint:SetPoint("TOPRIGHT", closeBtn, "LEFT", -4, 4)
     hint:SetJustifyH("RIGHT")
     UI.Skin(hint, function(self) self:SetTextColor(UI.Color("faint")) end)
     hint:SetText("/CONDUIT")

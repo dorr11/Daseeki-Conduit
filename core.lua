@@ -207,6 +207,7 @@ end
 local function printHelp()
     ns:Print("commands:")
     ns:Print("  /conduit                 - open the mailbox panel help / hub settings")
+    ns:Print("  /conduit show            - re-open the mailbox panel (while a mailbox is open)")
     ns:Print("  /conduit settings        - open the Daseeki hub to Conduit settings")
     ns:Print("  /conduit disable         - disable Conduit on this character")
     ns:Print("  /conduit enable          - re-enable Conduit on this character")
@@ -233,6 +234,12 @@ local function dispatch(msg)
         ns:SetCharDisabled(false)
         ns:Print("enabled on this character.")
         if ns.Panel and ns.Panel.Refresh then ns.Panel.Refresh() end
+    elseif cmd == "show" then
+        if _G.MailFrame and _G.MailFrame:IsShown() and ns.Panel and ns.Panel.Show then
+            ns.Panel.Show()
+        else
+            ns:Print("open a mailbox first — the Conduit panel docks beside it.")
+        end
     elseif cmd == "debug" then
         local sub = (rest or ""):match("^(%S*)")
         sub = (sub or ""):lower()
