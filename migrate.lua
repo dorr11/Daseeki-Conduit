@@ -173,6 +173,10 @@ function Migrate.Run()
     local added = Migrate.Apply(db, prepDB)
     if added > 0 then
         ns:Print(("imported %d Send Consumes rule(s) from Raid Prep — open /conduit settings to review the recipient(s)."):format(added))
+        -- The imported recipients are new to the auto-friend directory. friends.lua
+        -- also stamps at login, but PLAYER_LOGIN handler order is an implementation
+        -- detail — telling it explicitly makes the import order-independent.
+        if ns.Friends and ns.Friends.OnRecipientChanged then ns.Friends.OnRecipientChanged() end
         if ns.Options and ns.Options.Refresh then ns.Options.Refresh() end
         if ns.Panel and ns.Panel.Refresh then ns.Panel.Refresh() end
     end

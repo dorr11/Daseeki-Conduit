@@ -270,3 +270,197 @@ ns:RegisterSelfTest("raidprep-migration", function(verbose)
 
     return report(t, verbose)
 end)
+
+-- ── Suite 7: auto-friend directory + skip matrix (pure; friends.lua) ───────────
+ns:RegisterSelfTest("auto-friend", function(verbose)
+    local t = newT("auto-friend")
+    local F = ns.Friends
+
+    -- ── canonicalisation ──────────────────────────────────────────────────────
+    eq(t, F.NormalizeRealm("Blood Sail Buccaneers"), "bloodsailbuccaneers", "realm strips spaces + case")
+    eq(t, F.NormalizeRealm(nil), "", "nil realm normalizes to empty")
+    eq(t, F.CanonicalKey("Bankalt", "Whitemane"), "bankalt-whitemane", "key = name-realm, folded")
+    eq(t, F.CanonicalKey("Bankalt-Faerlina", "Whitemane"), "bankalt-faerlina",
+       "an explicit -Realm in the name beats the stamping realm")
+    eq(t, F.CanonicalKey("  BankAlt  ", "Whitemane"), "bankalt-whitemane", "key trims + folds")
+    check(t, F.CanonicalKey("", "Whitemane") == nil, "empty name has no key")
+
+    local sBase, sRealm = F.SplitRecipient("Bank-Blood Sail Buccaneers")
+    eq(t, sBase, "Bank", "split takes the base name")
+    eq(t, sRealm, "Blood Sail Buccaneers", "split keeps the raw realm")
+
+    -- ── collection from rules (self / malformed / empty all excluded) ──────────
+    local ctx = { me = "Hero", realm = "whitemane", faction = "Alliance" }
+    local collected = F.CollectFromRules({
+        { recipient = "Bankalt" },
+        { recipient = "Bankalt", enabled = false },   -- dup + disabled: still one entry
+        { recipient = "" },                           -- no recipient
+        { recipient = "Hero" },                       -- self
+        { recipient = "Bad Name" },                   -- malformed (space)
+        { recipient = "Vault-Whitemane" },
+    }, ctx)
+    local nCollected = 0; for _ in pairs(collected) do nCollected = nCollected + 1 end
+    eq(t, nCollected, 2, "only the two valid recipients collected")
+    check(t, collected["bankalt-whitemane"] ~= nil, "Bankalt collected")
+    check(t, collected["vault-whitemane"] ~= nil, "Vault-Whitemane collected")
+    check(t, collected["hero-whitemane"] == nil, "self never collected")
+    eq(t, collected["bankalt-whitemane"].faction, "Alliance", "entry attributed with the stamping faction")
+    eq(t, collected["bankalt-whitemane"].realm, "whitemane", "entry attributed with the stamping realm")
+    eq(t, collected["bankalt-whitemane"].name, "Bankalt", "entry keeps the typed spelling")
+
+    -- ── directory stamping: additive, first attribution wins, fills gaps ───────
+    local dir = {}
+    local changed, added = F.StampDirectory(dir, collected, 1000)
+    check(t, changed, "first stamp reports a change")
+    eq(t, added, 2, "two entries added")
+    check(t, not (F.StampDirectory(dir, collected, 2000)), "re-stamping the same entries is a no-op")
+
+    -- A Horde character can never re-attribute an Alliance recipient.
+    F.StampDirectory(dir, { ["bankalt-whitemane"] =
+        { name = "Bankalt", realm = "whitemane", faction = "Horde" } }, 3000)
+    eq(t, dir["bankalt-whitemane"].faction, "Alliance", "first attribution wins (never re-factioned)")
+
+    -- ...but a MISSING attribution is filled in.
+    F.StampDirectory(dir, { ["ghost-whitemane"] = { name = "Ghost", realm = "", faction = nil } }, 4000)
+    local fillChanged = F.StampDirectory(dir, { ["ghost-whitemane"] =
+        { name = "Ghost", realm = "whitemane", faction = "Horde" } }, 5000)
+    check(t, fillChanged, "filling an unknown attribution reports a change")
+    eq(t, dir["ghost-whitemane"].faction, "Horde", "unknown faction filled in")
+    eq(t, dir["ghost-whitemane"].realm, "whitemane", "unknown realm filled in")
+
+    -- ── merge: local always wins, peers fold in deterministically ─────────────
+    local merged = F.MergeDirectories(
+        { ["mine-whitemane"] = { name = "Mine", realm = "whitemane", faction = "Alliance" } },
+        {
+            ["acct-b"] = {
+                ["mine-whitemane"]  = { name = "Mine",  realm = "whitemane", faction = "Horde" },
+                ["their-whitemane"] = { name = "Their", realm = "whitemane", faction = "Alliance" },
+            },
+        })
+    eq(t, merged["mine-whitemane"].faction, "Alliance", "our own attribution beats a peer's")
+    check(t, merged["their-whitemane"] ~= nil, "a peer-only recipient reaches the merged view")
+    check(t, F.MergeDirectories(nil, nil) ~= nil, "nil inputs merge to an empty map, never nil")
+
+    -- ── THE SKIP MATRIX ───────────────────────────────────────────────────────
+    local function mkCtx(over)
+        local c = { enabled = true, me = "Hero", realm = "whitemane", faction = "Alliance",
+                    friends = {}, marked = {}, numFriends = 0, maxFriends = 100 }
+        for k, v in pairs(over or {}) do c[k] = v end
+        return c
+    end
+    local ally = { name = "Bankalt", realm = "whitemane", faction = "Alliance" }
+    local function act(entry, over, key)
+        return (F.Decide(key or "bankalt-whitemane", entry, mkCtx(over)))
+    end
+
+    eq(t, act(ally), "add", "same realm + same faction + not a friend -> add")
+    eq(t, act(ally, { enabled = false }), "skip", "setting off -> skip")
+    eq(t, act({ name = "Hero", realm = "whitemane", faction = "Alliance" }, nil, "hero-whitemane"),
+       "skip", "the current character is never friended")
+    eq(t, act(ally, { marked = { ["bankalt-whitemane"] = true } }), "skip",
+       "a recipient already handled here is never re-added (a deliberate unfriend stands)")
+    eq(t, act({ name = "Bankalt", realm = "faerlina", faction = "Alliance" }), "skip", "other realm -> skip")
+    eq(t, act({ name = "Bankalt", realm = "whitemane", faction = "Horde" }), "skip", "other faction -> skip")
+    eq(t, act(ally, { friends = { bankalt = true } }), "mark",
+       "already on the friends list -> mark only, no add")
+    eq(t, act(ally, { numFriends = 100 }), "cap", "friends list full -> cap")
+    eq(t, act(ally, { numFriends = 100, maxFriends = 150 }), "add", "a higher cap still allows the add")
+    eq(t, act({ name = "Bankalt", realm = "whitemane", faction = nil }), "add",
+       "unknown faction is attempted, not silently dropped")
+    eq(t, act({ name = "Bankalt", realm = "", faction = "Alliance" }), "add",
+       "unknown realm is attempted, not silently dropped")
+    eq(t, act(nil), "skip", "nil entry -> skip, never an error")
+    eq(t, act({ name = "" }), "skip", "empty name -> skip")
+
+    -- ── the plan: deterministic order, cap consumed across a batch ────────────
+    local batch = {}
+    for i = 1, 4 do
+        batch["alt" .. i .. "-whitemane"] =
+            { name = "Alt" .. i, realm = "whitemane", faction = "Alliance" }
+    end
+    local plan = F.Plan(batch, mkCtx({ numFriends = 98 }))
+    eq(t, #plan, 4, "every directory entry appears in the plan")
+    eq(t, plan[1].key, "alt1-whitemane", "plan is sorted by canonical key")
+    eq(t, plan[1].action, "add", "first add fits")
+    eq(t, plan[2].action, "add", "second add fills the last slot")
+    eq(t, plan[3].action, "cap", "third hits the cap")
+    eq(t, plan[4].action, "cap", "and so does the fourth (no doomed AddFriend calls)")
+
+    local plan2 = F.Plan(batch, mkCtx())
+    local adds = 0
+    for _, s in ipairs(plan2) do if s.action == "add" then adds = adds + 1 end end
+    eq(t, adds, 4, "with room, every entry is added")
+    eq(t, #F.Plan(nil, mkCtx()), 0, "a nil directory plans nothing")
+
+    return report(t, verbose)
+end)
+
+-- ── Suite 8: cross-account bridge probe + payload (pure; syncbridge.lua) ───────
+ns:RegisterSelfTest("sync-bridge", function(verbose)
+    local t = newT("sync-bridge")
+    local B = ns.SyncBridge
+
+    -- A minimal v2-shaped Daseeki.Sync surface (the exact functions we call).
+    local function fakeSync(version)
+        return { Daseeki = { Sync = {
+            VERSION = version,
+            RegisterNamespace = function() end,
+            MarkDirty         = function() end,
+            DeliverRemote     = function() end,
+        } } }
+    end
+    local function why(G) return select(2, B.Sync(G)) end
+
+    -- ── the guarded probe: every failure has a readable reason, none error ────
+    check(t, B.Sync({}) == nil, "no Daseeki namespace -> no store")
+    check(t, why({}):find("not installed") ~= nil, "absence gives a readable reason")
+    check(t, B.Sync({ Daseeki = {} }) == nil, "Daseeki without Sync -> no store")
+    check(t, B.Sync({ Daseeki = { Sync = {} } }) == nil, "Sync without the namespace API -> no store")
+
+    local v1 = fakeSync(1)
+    check(t, B.Sync(v1) == nil, "a v1 Sync store is refused")
+    check(t, why(v1):find("v2") ~= nil, "the refusal names the version it needs")
+
+    local v2 = fakeSync(2)
+    check(t, B.Sync(v2) ~= nil, "a v2 Sync store is accepted")
+    check(t, B.Available(v2) == true, "Available() agrees")
+    check(t, B.Available({}) == false, "...and is false with no Nexus at all")
+
+    -- ── payload round-trip ────────────────────────────────────────────────────
+    local dir = {
+        ["bankalt-whitemane"] = { name = "Bankalt", realm = "whitemane", faction = "Alliance", ts = 5 },
+        ["vault-whitemane"]   = { name = "Vault",   realm = "whitemane", faction = "Alliance", ts = 6 },
+        ["junk-whitemane"]    = { name = "",        realm = "whitemane" },   -- unnamed: never ships
+    }
+    local payload = B.BuildPayload(dir, 1700000000)
+    eq(t, payload.v, B.PAYLOAD_VERSION, "payload carries its version")
+    eq(t, payload.ts, 1700000000, "payload carries its stamp")
+    check(t, payload.recipients["junk-whitemane"] == nil, "an unnamed entry never ships")
+
+    local parsed, rejected = B.ParsePayload(payload)
+    check(t, parsed ~= nil and rejected == nil, "our own payload parses back")
+    eq(t, parsed["bankalt-whitemane"].name, "Bankalt", "name survives the round-trip")
+    eq(t, parsed["bankalt-whitemane"].faction, "Alliance", "faction survives the round-trip")
+
+    -- ── a peer cannot smuggle junk (or a future shape) past us ────────────────
+    check(t, B.ParsePayload(nil) == nil, "nil payload refused")
+    check(t, B.ParsePayload("nope") == nil, "non-table payload refused")
+    check(t, B.ParsePayload({ v = 1 }) == nil, "payload without a recipients map refused")
+    check(t, select(2, B.ParsePayload({ v = 99, recipients = {} })):find("newer") ~= nil,
+       "a payload newer than this build reads is refused, not guessed at")
+
+    local dirty = B.ParsePayload({ v = 1, recipients = {
+        ["ok-whitemane"]     = { name = "Ok",  realm = "whitemane", faction = "Alliance" },
+        ["bad-faction"]      = { name = "Bad", realm = "whitemane", faction = "Pirates" },
+        ["noname-whitemane"] = { name = "" },
+        [42]                 = { name = "Numeric" },
+        ["nottable"]         = "nope",
+    } })
+    eq(t, dirty["ok-whitemane"].name, "Ok", "the good entry survives sanitising")
+    check(t, dirty["bad-faction"].faction == nil, "an unknown faction string is dropped to nil")
+    check(t, dirty["noname-whitemane"] == nil, "an unnamed entry is dropped")
+    check(t, dirty[42] == nil, "a non-string key is dropped")
+    check(t, dirty["nottable"] == nil, "a non-table entry is dropped")
+
+    return report(t, verbose)
+end)

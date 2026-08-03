@@ -137,9 +137,15 @@ local function defaultDB()
     return {
         schema        = ns.SCHEMA,
         rules         = {},   -- array of rule tables (see rules.lua for shape)
-        settings      = {},   -- reserved for future global settings
+        settings      = {},   -- global settings (settings.autoFriend — friends.lua)
         disabledChars = {},   -- [charKey] = true
         nextRuleId    = 1,    -- monotonic id source for stable rule ids
+
+        -- Auto-friend (friends.lua). Purely ADDITIVE keys: ensureKeys creates them on
+        -- an existing save without touching anything else, so no schema bump is due.
+        friendDir     = {},   -- [canonicalKey] = { name, realm, faction, ts }
+        friendDirRev  = 1,    -- monotonic revision of friendDir (cross-account gating)
+        friended      = {},   -- [charKey] = { [canonicalKey] = true }
     }
 end
 
@@ -212,6 +218,7 @@ local function printHelp()
     ns:Print("  /conduit disable         - disable Conduit on this character")
     ns:Print("  /conduit enable          - re-enable Conduit on this character")
     ns:Print("  /conduit debug selftest  - run rule/batch/gold self-tests")
+    ns:Print("  /conduit debug friends   - what auto-friend would do on this character")
     ns:Print("  /conduit help            - this list")
 end
 
@@ -245,6 +252,8 @@ local function dispatch(msg)
         sub = (sub or ""):lower()
         if sub == "selftest" or sub == "" then
             ns:RunSelfTests(true)
+        elseif sub == "friends" then
+            if ns.Friends and ns.Friends.Debug then ns:SafeCall(ns.Friends.Debug) end
         else
             ns:Print("unknown debug command: " .. sub)
         end

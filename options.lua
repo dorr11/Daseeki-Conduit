@@ -99,6 +99,16 @@ local function refreshAll()
     if ns.Panel and ns.Panel.Refresh then ns.Panel.Refresh() end
 end
 
+-- A rule's recipient just changed: re-stamp the auto-friend directory (and, when
+-- Nexus is present, republish it to the mesh) so a bank alt added mid-session is
+-- friended without waiting for the next login. Soft-guarded — friends.lua is loaded
+-- before options.lua, but nothing here depends on that.
+local function recipientChanged()
+    if ns.Friends and ns.Friends.OnRecipientChanged then
+        ns.Friends.OnRecipientChanged()
+    end
+end
+
 -- ── Editor visibility + relayout ──────────────────────────────────────────────
 local relayoutEditor, updateEditorVis, populateEditor
 
@@ -216,7 +226,12 @@ local function buildEditor(flow)
     E.recip = E.recipRow:EditBox({ width = FIELD_W, get = function()
         local r = selectedRule(); return r and r.recipient or ""
     end, set = function(v)
-        local r = selectedRule(); if r then r.recipient = (v or ""):match("^%s*(.-)%s*$"); refreshAll() end
+        local r = selectedRule()
+        if r then
+            r.recipient = (v or ""):match("^%s*(.-)%s*$")
+            recipientChanged()
+            refreshAll()
+        end
     end })
     E.recip._fillWidth = false
 
@@ -238,7 +253,7 @@ local function buildEditor(flow)
         set = function(v)
             if v and v ~= "" then
                 local r = selectedRule()
-                if r then r.recipient = v; E.recip.Refresh(); refreshAll() end
+                if r then r.recipient = v; E.recip.Refresh(); recipientChanged(); refreshAll() end
             end
         end,
     })
@@ -575,6 +590,7 @@ function Options.Build(flow)
         copy.id = Rules.NextId()
         copy.name = (r.name or "Rule") .. " Copy"
         table.insert(ns.db.rules, copy); O.selectedId = copy.id
+        recipientChanged()   -- a clone carries the original's recipient
         populateEditor(); refreshAll()
     end })
     crud2:Button({ text = "Rename", width = MGMT_BTN, onClick = function()
@@ -589,6 +605,19 @@ function Options.Build(flow)
         table.insert(ns.db.rules, r); O.selectedId = r.id
         populateEditor(); refreshAll()
     end })
+
+    L:AddSection("Mail Recipients")
+    L:Checkbox({
+        label = "Auto-friend mail recipients",
+        get = function() return ns.Friends and ns.Friends.IsEnabled() end,
+        set = function(v)
+            if ns.Friends then
+                ns.Friends.SetEnabled(v)
+                if v then ns.Friends.OnRecipientChanged() end
+            end
+        end,
+    })
+    L:Hint("Blizzard only asks you to confirm mail to someone who is not on your friends list. Each recipient is added once per character — unfriend one and it stays unfriended.")
 
     L:AddSection("This Character")
     L:Checkbox({

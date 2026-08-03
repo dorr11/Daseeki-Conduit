@@ -14,6 +14,8 @@ rules.lua
 migrate.lua
 network.lua
 mail.lua
+friends.lua
+syncbridge.lua
 panel.lua
 options.lua
 selftest.lua

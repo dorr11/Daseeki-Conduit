@@ -2,6 +2,31 @@
 
 ## [Unreleased] — v1.0.0
 ### Added
+- **Auto-friend mail recipients** (on by default). Blizzard only raises the
+  "are you sure?" confirmation for mail to someone who is not on your friends
+  list, so every recipient you configure is added to the current character's
+  friends list once — and the popup stops appearing for your own bank alts.
+  Each recipient is added at most once per character: unfriend one by hand and
+  Conduit leaves it unfriended and never mentions it again. Recipients on
+  another realm or the other faction are skipped silently, the current character
+  is never friended, and a full friends list produces one explanatory line
+  instead of a wall of failures. Toggle it under Conduit's settings
+  ("Auto-friend mail recipients"); `/conduit debug friends` shows exactly what
+  the pass would do on this character.
+- **Cross-account recipients.** When Daseeki Nexus is installed, Conduit
+  publishes its recipient directory on the shared `Daseeki.Sync` namespace store
+  (namespace `conduit`), so a bank alt configured on one account is auto-friended
+  by characters on every account in the mesh. The namespace is additive: peers
+  running an older build cache the payload harmlessly and replay it the moment
+  they update. Without Nexus, auto-friending simply stays local to this account.
+- A headless self-test harness (`harness/run-selftests.cmd`) — parse gate,
+  clean-room firewall, the shipped pure suites, an additive-SavedVariables gate,
+  and an end-to-end auto-friend drive against a stubbed friends list.
+
+### Changed
+- SavedVariables gained `friendDir`, `friendDirRev`, and `friended`. All three
+  are additive: an existing save gains them on load with rules, settings, and
+  per-character disables untouched, and the schema version is unchanged.
 - Absorbs Raid Prep's Send Consumes — settings migrate automatically. On first
   load, any per-faction bank recipient and hand-picked item selection you had in
   Daseeki Raid Prep become "Send Consumes" rules here (one rule per faction). The
