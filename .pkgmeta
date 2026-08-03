@@ -1,0 +1,13 @@
+package-as: Daseeki-Conduit
+license-output: LICENSE
+ignore:
+  - README.md
+  - CHANGELOG.md
+  - DESCRIPTION.md
+  - .github
+  - harness
+
+manual-changelog: CHANGELOG.md
+
+required-dependencies:
+  - daseeki-core

@@ -1,14 +1,14 @@
-## Interface: 11509
+## Interface: 11507, 11508, 11509
 ## Title: Daseeki Conduit
 ## Notes: Mail, gold & materials automation — rule-based sending at the mailbox.
 ## Author: Daseeki
 ## X-License: All Rights Reserved
-## Version: 0.1.0
+## X-Curse-Project-ID: 1638368
+## Version: 1.0.0
 ## SavedVariables: DaseekiConduitDB
 ## Dependencies: Daseeki-Core
 ## OptionalDeps: Daseeki-Nexus
 ## IconTexture: Interface\Icons\INV_Letter_15
-# ## X-Curse-Project-ID: 000000  (placeholder — set at first CurseForge release)
 
 core.lua
 rules.lua
