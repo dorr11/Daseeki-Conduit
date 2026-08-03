@@ -15,7 +15,8 @@
 --   0        TOC PARSE   loadfile (parse only) every .lua the .toc lists.
 --   FW       FIREWALL    no third-party addon identifier in the repo's text.
 --   SUITES   the shipped pure suites (rules / batches / gold / recipients /
---            mail queue / Raid-Prep migration / auto-friend / sync bridge).
+--            mail queue / Raid-Prep migration / auto-friend / sync bridge /
+--            Nexus alt names).
 --   SV       InitDB adds the auto-friend keys to a PRE-EXISTING save without
 --            touching rules, and without a schema bump (additive-only).
 --   FRIEND   the REAL Friends.RunPass against a stubbed C_FriendList:
@@ -141,7 +142,8 @@ local function chatClear() for i = #CHAT, 1, -1 do CHAT[i] = nil end end
 -- Load the REAL addon files into one shared namespace, in .toc order.
 ----------------------------------------------------------------------
 local ns = {}
-local LOAD = { "core.lua", "rules.lua", "migrate.lua", "friends.lua", "syncbridge.lua", "selftest.lua" }
+local LOAD = { "core.lua", "rules.lua", "migrate.lua", "network.lua",
+               "friends.lua", "syncbridge.lua", "selftest.lua" }
 for _, rel in ipairs(LOAD) do
     local chunk, err = loadfile(P(rel))
     if not chunk then realprint("  FAIL  loadfile " .. rel .. " -> " .. tostring(err)); os.exit(2) end
@@ -164,9 +166,10 @@ else
     end
     ck(chatFind("ALL SUITES PASS") ~= nil, "every registered suite passes")
     -- A suite that silently fails to register would still report ALL PASS, so name
-    -- the two this feature owns.
+    -- the ones whose files this harness loads for their own sake.
     ck(chatFind("auto-friend:") ~= nil, "the auto-friend suite ran")
     ck(chatFind("sync-bridge:") ~= nil, "the sync-bridge suite ran")
+    ck(chatFind("network:") ~= nil, "the network suite ran")
 end
 if FAILS > 0 then realprint("=== GATE SUITES: FAIL ==="); os.exit(1) end
 realprint("=== GATE SUITES: PASS ===\n")

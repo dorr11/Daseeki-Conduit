@@ -464,3 +464,148 @@ ns:RegisterSelfTest("sync-bridge", function(verbose)
 
     return report(t, verbose)
 end)
+
+-- ── Suite 9: alt-name collection off the Nexus store (pure; network.lua) ───────
+--
+-- The picker reads ANOTHER addon's SavedVariables, so every fixture below is a
+-- hand-built fake `G`: the real _G is never touched and no test can depend on
+-- whether Nexus happens to be installed.
+ns:RegisterSelfTest("network", function(verbose)
+    local t = newT("network")
+    local N = ns.Network
+
+    local ME = { name = "Hero", realm = "Whitemane", faction = "Alliance" }
+
+    local function collect(data, me) return N.CollectAltNames({ DaseekiNexusData = data }, me or ME) end
+    local function joined(data, me) return table.concat(collect(data, me), ",") end
+    local function bucket(chars, homeless)
+        return { isSelf = true, characters = chars or {}, homeless = homeless or {},
+                 segments = {}, segmentHashes = {} }
+    end
+    local function inv(owners, schema) return { schema = schema or 1, owners = owners } end
+
+    -- ── absence: no Nexus, or junk where the store should be ──────────────────
+    eq(t, #N.CollectAltNames({}, ME), 0, "no Nexus store -> empty list")
+    eq(t, #N.CollectAltNames(nil, ME), 0, "the live globals carry no Nexus store headless")
+    eq(t, #N.CollectAltNames("nope", ME), 0, "a non-table global environment -> empty")
+    eq(t, #collect("nope"), 0, "a string where the store should be -> empty")
+    eq(t, #collect(42), 0, "a number where the store should be -> empty")
+    eq(t, #collect({}), 0, "a store with neither area -> empty")
+
+    -- ── malformed areas fall through, they never error ────────────────────────
+    eq(t, #collect({ accounts = "nope" }), 0, "accounts not a table -> empty")
+    eq(t, #collect({ accounts = { ["1"] = "nope" } }), 0, "a bucket that is not a table -> empty")
+    eq(t, #collect({ accounts = { ["1"] = { characters = 7, homeless = "x" } } }), 0,
+       "characters / homeless that are not tables -> empty")
+    eq(t, #collect({ inventory = "nope" }), 0, "inventory not a table -> empty")
+    eq(t, #collect({ inventory = { schema = 1, owners = 5 } }), 0, "owners not a table -> empty")
+    eq(t, #collect({ accounts = { ["1"] = bucket({
+        [42] = {}, ["NoHyphen"] = {}, ["-Whitemane"] = {}, ["Trailing-"] = {} }) } }), 0,
+       "non-string and unparseable keys are skipped")
+
+    -- Guild and friend lists are OTHER PEOPLE. They are never alts and never read.
+    eq(t, #collect({ social = { guild = { ["Guildie-Whitemane"] = { faction = "Alliance" } } } }), 0,
+       "the social area is never read")
+
+    -- ── two areas, two independent version gates ──────────────────────────────
+    eq(t, joined({ accounts = { ["1"] = bucket({ ["Nostamp-Whitemane"] = {} }) } }), "Nostamp",
+       "an unstamped graph is read, not refused")
+    eq(t, joined({
+        version   = 99,
+        accounts  = { ["1"] = bucket({ ["Refused-Whitemane"] = {} }) },
+        inventory = inv({ ["Kept-Whitemane"] = { rev = 1, data = {} } }),
+    }), "Kept", "a newer storage version refuses the accounts graph ONLY")
+    eq(t, joined({
+        version   = 1,
+        accounts  = { ["1"] = bucket({ ["Kept-Whitemane"] = {} }) },
+        inventory = inv({ ["Refused-Whitemane"] = { rev = 1, data = {} } }, 99),
+    }), "Kept", "a newer inventory schema refuses that area ONLY")
+
+    -- ── the union, and the dedupe across it ───────────────────────────────────
+    eq(t, joined({
+        version   = 1,
+        accounts  = { ["1"] = bucket({ ["Graphonly-Whitemane"] = {}, ["Shared-Whitemane"] = {} }) },
+        inventory = inv({
+            ["Invonly-Whitemane"] = { rev = 1, updatedAt = 5, data = {} },
+            ["shared-Whitemane"]  = { rev = 1, updatedAt = 5, data = {} },  -- same character, other case
+        }),
+    }), "Graphonly,Invonly,Shared",
+       "both graphs contribute and a name in both appears once (first spelling wins)")
+
+    -- ── every bucket counts, including "" and the homeless table ──────────────
+    eq(t, joined({ accounts = {
+        [""]  = bucket({ ["Orphan-Whitemane"] = {} }),               -- unattributed characters
+        ["7"] = bucket(nil, { ["Drifter-Whitemane"] = {} }),         -- no manifest slot yet
+    } }), "Drifter,Orphan", "the orphan bucket and homeless records both contribute")
+
+    -- ── never offer the current character ─────────────────────────────────────
+    eq(t, joined({ accounts = { ["1"] = bucket({
+        ["hero-Whitemane"] = {}, ["Alt-Whitemane"] = {} }) } }), "Alt",
+       "the current character is excluded whatever its capitalisation")
+
+    -- ── same realm only (a bare-name recipient is same-realm mail) ────────────
+    local twoRealms = { accounts = { ["1"] = bucket({
+        ["Near-Whitemane"] = {}, ["Far-Faerlina"] = {} }) } }
+    eq(t, joined(twoRealms), "Near", "another realm is dropped")
+    eq(t, joined(twoRealms, { name = "Hero", realm = nil, faction = "Alliance" }), "Far,Near",
+       "an unknown player realm skips the realm filter entirely")
+    eq(t, joined({ accounts = { ["1"] = bucket({ ["Pirate-BloodSailBuccaneers"] = {} }) } },
+                 { name = "Hero", realm = "Blood Sail Buccaneers", faction = "Alliance" }), "Pirate",
+       "a spaced player realm matches the space-stripped key realm")
+
+    -- ── faction: only an EXPLICIT conflict excludes ───────────────────────────
+    local mixed = { accounts = { ["1"] = bucket({
+        ["Ally-Whitemane"]    = { faction = "Alliance" },
+        ["Hordie-Whitemane"]  = { faction = "Horde" },
+        ["Unknown-Whitemane"] = {},                        -- no faction field at all
+        ["Garbage-Whitemane"] = { faction = "Pirates" },   -- uncomparable: reads as unknown
+    }) } }
+    eq(t, joined(mixed), "Ally,Garbage,Unknown",
+       "an explicit other faction is dropped; absent/uncomparable is kept")
+    eq(t, joined(mixed, { name = "Hero", realm = "Whitemane", faction = nil }),
+       "Ally,Garbage,Hordie,Unknown", "an unknown player faction filters nothing")
+
+    eq(t, #collect({ inventory = inv({ ["Redside-Whitemane"] = { data = { faction = "Horde" } } }) }), 0,
+       "the inventory graph's faction lives on entry.data")
+    eq(t, joined({ inventory = inv({ ["Noside-Whitemane"] = { rev = 1 } }) }), "Noside",
+       "an inventory entry carrying no payload is unknown-faction, not excluded")
+
+    eq(t, joined({
+        accounts  = { ["1"] = bucket({ ["Split-Whitemane"] = { faction = "Horde" } }) },
+        inventory = inv({ ["Split-Whitemane"] = { data = { faction = "Alliance" } } }),
+    }), "Split", "one matching sighting keeps an entry the other graph disagrees about")
+    eq(t, #collect({
+        accounts  = { ["1"] = bucket({ ["Gone-Whitemane"] = { faction = "Horde" } }) },
+        inventory = inv({ ["Gone-Whitemane"] = { data = { faction = "Horde" } } }),
+    }), 0, "an entry EVERY graph calls other-faction is dropped")
+
+    -- ── output shape: base names, deterministic order ─────────────────────────
+    local ordered = collect({ accounts = { ["1"] = bucket({
+        ["zeta-Whitemane"] = {}, ["Alpha-Whitemane"] = {}, ["mid-Whitemane"] = {} }) } })
+    eq(t, table.concat(ordered, ","), "Alpha,mid,zeta", "sorted case-insensitively, not by byte")
+    local suffixed = false
+    for _, n in ipairs(ordered) do if n:find("-", 1, true) then suffixed = true end end
+    check(t, not suffixed, "every row is a base name (the realm suffix is stripped)")
+
+    -- ── what Available() reads off the same core ──────────────────────────────
+    check(t, #collect({ accounts = { ["1"] = bucket({ ["Someone-Whitemane"] = {} }) } }) > 0,
+       "a populated graph would show the picker")
+    check(t, #N.CollectAltNames({}, ME) == 0, "an absent graph would hide it")
+
+    -- ── the no-error contract, against deliberately hostile junk ──────────────
+    local hostile = {
+        version   = "banana",
+        accounts  = {
+            [1]   = { characters = { [true] = {}, ["A-B"] = 7 }, homeless = 3 },
+            ["x"] = {},
+            [2]   = false,
+        },
+        inventory = { schema = {}, owners = { ["Q-Whitemane"] = 5, [{}] = {} } },
+        social    = { guild = { ["Someone-Whitemane"] = true } },
+    }
+    local okRun, res = pcall(N.CollectAltNames, { DaseekiNexusData = hostile }, ME)
+    check(t, okRun, "a deliberately hostile saved table never errors")
+    check(t, okRun and type(res) == "table", "...and still returns a list")
+
+    return report(t, verbose)
+end)

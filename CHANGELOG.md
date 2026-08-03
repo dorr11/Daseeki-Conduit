@@ -23,6 +23,18 @@
   clean-room firewall, the shipped pure suites, an additive-SavedVariables gate,
   and an end-to-end auto-friend drive against a stubbed friends list.
 
+### Fixed
+- **The rule editor's "Alt" picker now actually appears.** Its Nexus probe looked
+  for globals Daseeki Nexus has never published (`DaseekiNexus` / `DaseekiNetwork`
+  and roster accessors on them), so the dropdown was permanently empty and the row
+  permanently hidden. Conduit now reads the Nexus SavedVariables store directly —
+  the character graph plus the inventory owners graph, unioned — the same read-only,
+  type-guarded pattern the Bags 2.0 bridge uses. The picker offers same-realm
+  characters only, never the current one, and drops an alt only when its record
+  explicitly names the other faction (an unknown faction is still offered). Both
+  areas are version-gated independently, and a missing or malformed Nexus store
+  leaves the row hidden exactly as before.
+
 ### Changed
 - SavedVariables gained `friendDir`, `friendDirRev`, and `friended`. All three
   are additive: an existing save gains them on load with rules, settings, and
