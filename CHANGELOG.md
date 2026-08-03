@@ -2,6 +2,8 @@
 
 ## [Unreleased] — v1.0.0
 ### Added
+- **A LICENSE file — Daseeki Conduit ships All Rights Reserved**, matching the
+  rest of the suite, with the `## X-License` line to say so in the .toc.
 - **Auto-friend mail recipients** (on by default). Blizzard only raises the
   "are you sure?" confirmation for mail to someone who is not on your friends
   list, so every recipient you configure is added to the current character's

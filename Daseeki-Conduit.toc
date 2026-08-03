@@ -2,6 +2,7 @@
 ## Title: Daseeki Conduit
 ## Notes: Mail, gold & materials automation — rule-based sending at the mailbox.
 ## Author: Daseeki
+## X-License: All Rights Reserved
 ## Version: 0.1.0
 ## SavedVariables: DaseekiConduitDB
 ## Dependencies: Daseeki-Core
