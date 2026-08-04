@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- **The rule editor's Alt picker now shows your characters properly.** With Daseeki
+  Nexus installed, the "Alt" dropdown beside Recipient lists the characters on this
+  realm that Nexus knows about, each in its class colour, so setting up a rule is a
+  click instead of remembering how you spelled a bank alt three months ago. You can
+  still type any name you like into Recipient — the picker only saves typing, it
+  never limits who a rule can mail.
+- Changed: the picker no longer hides characters on the **other faction**. Rules are
+  shared by every character on your account, so a rule you write on your Alliance
+  main is one your Horde characters use too — hiding their recipients at the moment
+  you are writing the rule was the wrong call. Other-faction characters are listed
+  with a faction tag instead, and auto-friend keeps quietly skipping them on the
+  characters where they cannot be mailed, exactly as before. Characters on another
+  realm are still left out: a plain name only ever reaches your own realm.
+
 ## 1.0.0 — 2026-08-03
 
 First public release. Daseeki Conduit fills in the Send Mail form for you, so

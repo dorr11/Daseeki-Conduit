@@ -237,13 +237,19 @@ local function buildEditor(flow)
 
     E.altRow = condRow(cflow)
     local al = E.altRow:Label("Alt"); al.uiWidth = LBL_W; al:SetWidth(LBL_W)
-    -- Populate the convenience picker from the optional Nexus alt registry if one is
-    -- present at build time; otherwise it stays a single placeholder (and the whole
-    -- row is hidden by updateEditorVis when no registry is available).
+    -- Populate the convenience picker from the optional Nexus roster if one is present
+    -- at build time; otherwise it stays a single placeholder (and the whole row is
+    -- hidden by updateEditorVis when no roster is available).
+    --
+    -- network.lua owns the whole list — collection, class colour, the cross-faction
+    -- tag and the order — because all of that is pure and therefore gate-covered,
+    -- while this page is not. Every row's VALUE is the bare name, identical to what
+    -- the Recipient field above accepts by hand: the picker never becomes the only
+    -- way to name a recipient, it just saves the typing.
     local altChoices = { { value = "", text = "— alts —" } }
     if ns.Network and ns.Network.Available() then
-        for _, name in ipairs(ns.Network.GetAltNames()) do
-            altChoices[#altChoices + 1] = { value = name, text = name }
+        for _, choice in ipairs(ns.Network.GetAltChoices()) do
+            altChoices[#altChoices + 1] = choice
         end
     end
     E.altDD = E.altRow:Dropdown({
@@ -517,10 +523,10 @@ populateEditor = function()
         if E.mode and E.mode.Refresh then E.mode.Refresh() end
         if E.class and E.class.Refresh then E.class.Refresh() end
         if E.keep and E.keep.Refresh then E.keep.Refresh() end
-        -- Refresh alt dropdown choices if a registry is present.
-        if E.altDD and ns.Network and ns.Network.Available() then
-            -- (choices are static-shaped; recipient is set on select — nothing to sync)
-        end
+        -- The Alt picker has nothing to sync: its rows are built once from the Nexus
+        -- roster when the page is built, it always displays its "— alts —" placeholder
+        -- (get returns ""), and selecting a row writes straight through to the
+        -- Recipient field above, which IS refreshed here.
         rebuildSubGrid(); rebuildItemList()
     end
     if O.ruleList then O.ruleList:SetSelected(O.selectedId) end

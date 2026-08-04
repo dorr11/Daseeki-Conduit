@@ -465,7 +465,8 @@ ns:RegisterSelfTest("sync-bridge", function(verbose)
     return report(t, verbose)
 end)
 
--- ── Suite 9: alt-name collection off the Nexus store (pure; network.lua) ───────
+
+-- ── Suite 9: the Nexus roster read + the Alt picker's rows (pure; network.lua) ─
 --
 -- The picker reads ANOTHER addon's SavedVariables, so every fixture below is a
 -- hand-built fake `G`: the real _G is never touched and no test can depend on
@@ -476,6 +477,7 @@ ns:RegisterSelfTest("network", function(verbose)
 
     local ME = { name = "Hero", realm = "Whitemane", faction = "Alliance" }
 
+    local function alts(data, me) return N.CollectAlts({ DaseekiNexusData = data }, me or ME) end
     local function collect(data, me) return N.CollectAltNames({ DaseekiNexusData = data }, me or ME) end
     local function joined(data, me) return table.concat(collect(data, me), ",") end
     local function bucket(chars, homeless)
@@ -483,6 +485,11 @@ ns:RegisterSelfTest("network", function(verbose)
                  segments = {}, segmentHashes = {} }
     end
     local function inv(owners, schema) return { schema = schema or 1, owners = owners } end
+    -- The one entry a fixture produced, by base name.
+    local function entry(data, name, me)
+        for _, e in ipairs(alts(data, me)) do if e.name == name then return e end end
+        return nil
+    end
 
     -- ── absence: no Nexus, or junk where the store should be ──────────────────
     eq(t, #N.CollectAltNames({}, ME), 0, "no Nexus store -> empty list")
@@ -553,31 +560,67 @@ ns:RegisterSelfTest("network", function(verbose)
                  { name = "Hero", realm = "Blood Sail Buccaneers", faction = "Alliance" }), "Pirate",
        "a spaced player realm matches the space-stripped key realm")
 
-    -- ── faction: only an EXPLICIT conflict excludes ───────────────────────────
+    -- ── FACTION: labelled, never filtered ─────────────────────────────────────
+    --
+    -- DaseekiConduitDB is account-wide and `rules` is a flat array, so a rule
+    -- authored here runs on every character on the account. The editing character's
+    -- faction therefore cannot decide who the rule may name; friends.lua Decide
+    -- makes that call per character at the mailbox ("skip"/"other faction").
     local mixed = { accounts = { ["1"] = bucket({
         ["Ally-Whitemane"]    = { faction = "Alliance" },
         ["Hordie-Whitemane"]  = { faction = "Horde" },
         ["Unknown-Whitemane"] = {},                        -- no faction field at all
         ["Garbage-Whitemane"] = { faction = "Pirates" },   -- uncomparable: reads as unknown
     }) } }
-    eq(t, joined(mixed), "Ally,Garbage,Unknown",
-       "an explicit other faction is dropped; absent/uncomparable is kept")
+    eq(t, joined(mixed), "Ally,Garbage,Unknown,Hordie",
+       "every faction is offered; the explicit other-faction row sorts to the tail")
+    eq(t, entry(mixed, "Hordie").otherFaction, true, "the other-faction row is flagged")
+    eq(t, entry(mixed, "Hordie").faction, "Horde", "...and keeps the faction it was seen with")
+    eq(t, entry(mixed, "Ally").otherFaction, nil, "our own faction is never flagged")
+    eq(t, entry(mixed, "Unknown").otherFaction, nil, "an absent faction is not a conflict")
+    eq(t, entry(mixed, "Unknown").faction, nil, "...and is recorded as unknown, not guessed")
+    eq(t, entry(mixed, "Garbage").faction, nil, "an uncomparable faction string reads as unknown")
     eq(t, joined(mixed, { name = "Hero", realm = "Whitemane", faction = nil }),
-       "Ally,Garbage,Hordie,Unknown", "an unknown player faction filters nothing")
+       "Ally,Garbage,Hordie,Unknown", "an unknown player faction flags nothing, so nothing tails")
 
-    eq(t, #collect({ inventory = inv({ ["Redside-Whitemane"] = { data = { faction = "Horde" } } }) }), 0,
-       "the inventory graph's faction lives on entry.data")
+    eq(t, joined({ inventory = inv({ ["Redside-Whitemane"] = { data = { faction = "Horde" } } }) }),
+       "Redside", "the inventory graph's faction lives on entry.data")
+    eq(t, entry({ inventory = inv({ ["Redside-Whitemane"] = { data = { faction = "Horde" } } }) },
+                "Redside").otherFaction, true, "...and flags from there too")
     eq(t, joined({ inventory = inv({ ["Noside-Whitemane"] = { rev = 1 } }) }), "Noside",
        "an inventory entry carrying no payload is unknown-faction, not excluded")
 
-    eq(t, joined({
+    local split = {
         accounts  = { ["1"] = bucket({ ["Split-Whitemane"] = { faction = "Horde" } }) },
         inventory = inv({ ["Split-Whitemane"] = { data = { faction = "Alliance" } } }),
-    }), "Split", "one matching sighting keeps an entry the other graph disagrees about")
-    eq(t, #collect({
+    }
+    eq(t, entry(split, "Split").faction, "Alliance",
+       "a sighting that matches US wins over one that does not, whichever graph it came from")
+    eq(t, entry(split, "Split").otherFaction, nil, "...so a disputed alt is never mislabelled")
+    local bothOther = {
         accounts  = { ["1"] = bucket({ ["Gone-Whitemane"] = { faction = "Horde" } }) },
         inventory = inv({ ["Gone-Whitemane"] = { data = { faction = "Horde" } } }),
-    }), 0, "an entry EVERY graph calls other-faction is dropped")
+    }
+    eq(t, #alts(bothOther), 1, "an entry EVERY graph calls other-faction is still OFFERED")
+    eq(t, entry(bothOther, "Gone").otherFaction, true, "...and is the one that gets the tag")
+
+    -- ── class token: two graphs, two spellings ────────────────────────────────
+    eq(t, entry({ accounts = { ["1"] = bucket({
+        ["Locky-Whitemane"] = { classTag = "WARLOCK" } }) } }, "Locky").class, "WARLOCK",
+       "the character graph's classTag is read")
+    eq(t, entry({ inventory = inv({
+        ["Sneaky-Whitemane"] = { data = { class = "rogue" } } }) }, "Sneaky").class, "ROGUE",
+       "the inventory payload's `class` is read and normalised upper-case")
+    eq(t, entry({ accounts = { ["1"] = bucket({
+        ["Nameless-Whitemane"] = { classTag = "" } }) } }, "Nameless").class, nil,
+       "an empty class token reads as unknown")
+    eq(t, entry({ accounts = { ["1"] = bucket({
+        ["Weird-Whitemane"] = { classTag = 7, class = {} } }) } }, "Weird").class, nil,
+       "a non-string class token reads as unknown")
+    eq(t, entry({
+        accounts  = { ["1"] = bucket({ ["Both-Whitemane"] = { classTag = "MAGE" } }) },
+        inventory = inv({ ["Both-Whitemane"] = { data = { class = "PRIEST" } } }),
+    }, "Both").class, "MAGE", "the character graph wins the class when both graphs answer")
 
     -- ── output shape: base names, deterministic order ─────────────────────────
     local ordered = collect({ accounts = { ["1"] = bucket({
@@ -586,11 +629,60 @@ ns:RegisterSelfTest("network", function(verbose)
     local suffixed = false
     for _, n in ipairs(ordered) do if n:find("-", 1, true) then suffixed = true end end
     check(t, not suffixed, "every row is a base name (the realm suffix is stripped)")
+    eq(t, entry({ accounts = { ["1"] = bucket({ ["Near-Whitemane"] = {} }) } }, "Near").realm,
+       "Whitemane", "each entry carries the realm its key named")
 
-    -- ── what Available() reads off the same core ──────────────────────────────
-    check(t, #collect({ accounts = { ["1"] = bucket({ ["Someone-Whitemane"] = {} }) } }) > 0,
-       "a populated graph would show the picker")
-    check(t, #N.CollectAltNames({}, ME) == 0, "an absent graph would hide it")
+    -- ── the label layer ───────────────────────────────────────────────────────
+    local PALETTE = {
+        WARLOCK = { colorStr = "ff8787ed" },
+        ROGUE   = { r = 1, g = 0.96, b = 0.41 },
+        DRUID   = { r = "bad", g = 0, b = 0 },
+    }
+    eq(t, N.AltLabel({ name = "Plain" }), "Plain", "no class and no faction -> the bare name")
+    eq(t, N.AltLabel({ name = "Plain" }, { classColors = PALETTE }), "Plain",
+       "an unknown class is not coloured")
+    eq(t, N.AltLabel({ name = "Locky", class = "WARLOCK" }, { classColors = PALETTE }),
+       "|cff8787edLocky|r", "a colorStr palette entry colours the name")
+    eq(t, N.AltLabel({ name = "Sneaky", class = "ROGUE" }, { classColors = PALETTE }),
+       "|cfffff569Sneaky|r", "an r/g/b palette entry is converted to an escape")
+    eq(t, N.AltLabel({ name = "Bear", class = "DRUID" }, { classColors = PALETTE }), "Bear",
+       "a malformed palette entry degrades to plain text")
+    eq(t, N.AltLabel({ name = "Locky", class = "WARLOCK" }), "Locky",
+       "no palette at all (headless / early login) degrades to plain text")
+    eq(t, N.AltLabel({ name = "Hordie", faction = "Horde", otherFaction = true }),
+       "Hordie (Horde)", "a cross-faction row is tagged with the faction it is on")
+    eq(t, N.AltLabel({ name = "Hordie", faction = "Horde", otherFaction = true },
+                     { tagColor = "|cffA79B84" }),
+       "Hordie |cffA79B84(Horde)|r", "the tag takes the muted colour when one is supplied")
+    eq(t, N.AltLabel({ name = "Hordie", faction = "Horde", otherFaction = true },
+                     { tagColor = "not an escape" }),
+       "Hordie (Horde)", "a junk tag colour is ignored, not concatenated")
+    eq(t, N.AltLabel({ name = "Quiet", faction = "Horde" }), "Quiet",
+       "a faction alone never tags -- only an explicit conflict does")
+    eq(t, N.AltLabel({ name = "Nofaction", otherFaction = true }), "Nofaction",
+       "a flag with no faction to name produces no tag")
+    eq(t, N.AltLabel(nil), "", "a nil entry labels as empty, never an error")
+    eq(t, N.AltLabel({ name = 42 }), "", "a non-string name labels as empty")
+    eq(t, N.ClassColorEscape("WARLOCK", nil), "", "no palette -> no escape")
+    eq(t, N.ClassColorEscape(nil, PALETTE), "", "no class -> no escape")
+    eq(t, N.ClassColorEscape("WARLOCK", "nope"), "", "a non-table palette -> no escape")
+
+    -- ── the choice list handed to the dropdown ────────────────────────────────
+    local choices = N.BuildAltChoices(alts(mixed), { classColors = PALETTE })
+    eq(t, #choices, 4, "every collected alt becomes one row")
+    eq(t, choices[1].value, "Ally", "rows carry the BARE NAME as their value...")
+    eq(t, choices[1].text, "Ally", "...and the label as their text")
+    eq(t, choices[4].value, "Hordie", "the cross-faction row is last and still selectable")
+    eq(t, choices[4].text, "Hordie (Horde)", "...carrying its tag")
+    local sameAsTyped = true
+    for _, c in ipairs(choices) do
+        if c.value:find("|", 1, true) or c.value:find("(", 1, true) then sameAsTyped = false end
+    end
+    check(t, sameAsTyped,
+       "no row's value carries decoration -- picking equals typing the same name")
+    eq(t, #N.BuildAltChoices(nil), 0, "a nil entry list builds no rows")
+    eq(t, #N.BuildAltChoices({ "junk", {}, { name = 7 }, { name = "Ok" } }), 1,
+       "junk entries are skipped, real ones survive")
 
     -- ── the no-error contract, against deliberately hostile junk ──────────────
     local hostile = {
@@ -603,9 +695,12 @@ ns:RegisterSelfTest("network", function(verbose)
         inventory = { schema = {}, owners = { ["Q-Whitemane"] = 5, [{}] = {} } },
         social    = { guild = { ["Someone-Whitemane"] = true } },
     }
-    local okRun, res = pcall(N.CollectAltNames, { DaseekiNexusData = hostile }, ME)
+    local okRun, res = pcall(N.CollectAlts, { DaseekiNexusData = hostile }, ME)
     check(t, okRun, "a deliberately hostile saved table never errors")
     check(t, okRun and type(res) == "table", "...and still returns a list")
+    local okBuild, rows = pcall(N.BuildAltChoices, okRun and res or nil, { classColors = hostile })
+    check(t, okBuild and type(rows) == "table",
+       "...and the rows built from it never error either")
 
     return report(t, verbose)
 end)
