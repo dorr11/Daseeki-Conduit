@@ -704,3 +704,62 @@ ns:RegisterSelfTest("network", function(verbose)
 
     return report(t, verbose)
 end)
+
+-- ── Suite 10: mailbox teardown — the panel closes with the mail window ─────────
+--
+-- The owner rule: when the mail window closes, Conduit closes. core.lua's teardown
+-- coordinator is what makes that true for EVERY route out (walking away from the
+-- mailbox, Escape, the mail window's ✕, another panel taking its slot) and for
+-- everything the mailbox owns (the rule panel, an in-flight batch, the confirm
+-- popup). This suite drives the coordinator's two pure halves directly — the latch
+-- and the closer fan-out — so it never fires the LIVE closers and is therefore safe
+-- to run at an open mailbox.
+ns:RegisterSelfTest("mailbox-close", function(verbose)
+    local t = newT("mailbox-close")
+
+    -- ── the latch: exactly one teardown per mailbox visit ─────────────────────
+    local savedOpen = ns.mailboxOpen           -- never disturb a live mailbox
+    check(t, ns.ConsumeMailboxOpen ~= nil, "the coordinator exposes its latch")
+
+    ns.mailboxOpen = false
+    eq(t, ns:ConsumeMailboxOpen(), false, "closing with no mailbox open is a no-op")
+
+    ns:MailboxOpened()
+    eq(t, ns.mailboxOpen, true, "MAIL_SHOW arms the teardown")
+    eq(t, ns:ConsumeMailboxOpen(), true, "the first close signal tears down")
+    eq(t, ns:ConsumeMailboxOpen(), false,
+       "the second signal of the same visit does nothing (MAIL_CLOSED + OnHide collapse)")
+
+    ns:MailboxOpened()
+    eq(t, ns:ConsumeMailboxOpen(), true, "re-opening the mailbox re-arms it")
+    ns.mailboxOpen = savedOpen
+
+    -- ── the fan-out: order, completeness, error isolation ─────────────────────
+    local log = {}
+    local closers = {
+        function(reason) log[#log + 1] = "abort:" .. tostring(reason) end,
+        function() log[#log + 1] = "hidePanel" end,
+    }
+    eq(t, ns.RunClosers(closers, "MAIL_CLOSED"), 2, "every closer runs")
+    eq(t, log[1], "abort:MAIL_CLOSED", "the batch abort runs first (load order = run order)")
+    eq(t, log[2], "hidePanel", "...and the panel hides after it")
+
+    -- The whole point of isolating them: a module that blows up on the way out must
+    -- not leave the panel stranded on screen.
+    local errs, ran = {}, {}
+    local hostile = {
+        function() error("closer one exploded") end,
+        function() ran[#ran + 1] = "panel" end,
+    }
+    eq(t, ns.RunClosers(hostile, "MAIL_CLOSED", function(e) errs[#errs + 1] = e end), 2,
+       "a closer that errors does not stop the rest")
+    eq(t, ran[1], "panel", "the panel still hides after an earlier closer errored")
+    eq(t, #errs, 1, "the error is surfaced, not swallowed")
+
+    -- Defensive shapes: teardown must never be the thing that errors.
+    eq(t, ns.RunClosers(nil, "x"), 0, "a missing closer list is a clean no-op")
+    eq(t, ns.RunClosers({}, "x"), 0, "an empty closer list is a clean no-op")
+    check(t, pcall(ns.RunClosers, closers, nil), "a nil reason never errors")
+
+    return report(t, verbose)
+end)

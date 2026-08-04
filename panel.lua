@@ -2,7 +2,8 @@
     Daseeki Conduit — panel.lua
 
     The mailbox panel: a compact DaseekiUI-styled frame anchored beside the open
-    mail window (shown on MAIL_SHOW, hidden on MAIL_CLOSED). It lists the
+    mail window (shown on MAIL_SHOW, hidden with the mail window by core.lua's
+    mailbox teardown coordinator — MAIL_CLOSED or MailFrame OnHide). It lists the
     configured rules with a per-rule Send button, a Run All button, a live
     progress line, and — during an active run — a "Send Next" button that drives
     each continuation mail (SendMail needs a hardware event, so the click is real).
@@ -328,6 +329,9 @@ end
 function Panel.Show()
     local f = build()
     if not f then return end
+    -- Re-arm the teardown, so a panel re-opened with /conduit show at an already-open
+    -- mailbox still closes with that mailbox (core.lua).
+    ns:MailboxOpened()
     anchorToMail(f)
     f:Show()
     Panel.Refresh()
@@ -338,7 +342,12 @@ function Panel.Hide()
 end
 
 ns:RegisterEvent("MAIL_SHOW", function() ns:SafeCall(Panel.Show) end)
-ns:RegisterEvent("MAIL_CLOSED", function()
-    -- mail.lua aborts any active run on MAIL_CLOSED; we just hide the panel.
-    Panel.Hide()
-end)
+
+-- The panel is furniture of the mail window, so it leaves when the window does —
+-- every route out: walking away from the mailbox, Escape, the mail window's own
+-- close button, or another UI panel taking its slot. core.lua owns the teardown
+-- coordinator that funnels all of those into one call; registering here (rather
+-- than listening for MAIL_CLOSED ourselves) also guarantees mail.lua's closer has
+-- already aborted any in-flight batch and dismissed the confirm popup by the time
+-- the panel goes, since closers run in load order and mail.lua loads first.
+ns:RegisterMailboxCloser(function() Panel.Hide() end)

@@ -170,6 +170,30 @@ else
     ck(chatFind("auto-friend:") ~= nil, "the auto-friend suite ran")
     ck(chatFind("sync-bridge:") ~= nil, "the sync-bridge suite ran")
     ck(chatFind("network:") ~= nil, "the network suite ran")
+    ck(chatFind("mailbox-close:") ~= nil, "the mailbox-teardown suite ran")
+end
+
+----------------------------------------------------------------------
+-- The teardown coordinator's WIRING, which the pure suite cannot see: the panel
+-- and the send engine must actually be ON the live closer list, or "the panel
+-- closes with the mail window" is true only in the test. panel.lua / mail.lua are
+-- not loadable here (DaseekiUI frames + live mail API), so assert the registration
+-- calls exist in the shipped source instead — a regression that drops one back to
+-- its own MAIL_CLOSED handler, or to none at all, fails here.
+----------------------------------------------------------------------
+do
+    local function sourceHas(rel, needle, label)
+        local src = readFile(P(rel))
+        ck(src ~= nil and src:find(needle, 1, true) ~= nil, label)
+    end
+    sourceHas("panel.lua", "ns:RegisterMailboxCloser",
+        "panel.lua registers a mailbox closer (the panel hides with the mail window)")
+    sourceHas("mail.lua", "ns:RegisterMailboxCloser",
+        "mail.lua registers a mailbox closer (the batch aborts with the mail window)")
+    sourceHas("mail.lua", 'StaticPopup_Hide("DASEEKI_CONDUIT_SEND_CONFIRM")',
+        "...and dismisses the send-confirm popup with it")
+    sourceHas("core.lua", 'mf:HookScript("OnHide"',
+        "core.lua hooks MailFrame OnHide as well as MAIL_CLOSED")
 end
 if FAILS > 0 then realprint("=== GATE SUITES: FAIL ==="); os.exit(1) end
 realprint("=== GATE SUITES: PASS ===\n")

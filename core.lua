@@ -130,6 +130,103 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
 end)
 
 ----------------------------------------------------------------------
+-- Mailbox teardown coordinator
+--
+-- EVERYTHING Conduit puts on screen at a mailbox belongs to that mailbox: the
+-- rule panel, an in-flight send batch, and the confirm popup guarding a send.
+-- When the mail window goes, all three go — walking away from the mailbox,
+-- Escape, the mail window's own close button, or another UI panel taking its
+-- slot are all the same event as far as Conduit is concerned.
+--
+-- Modules register a closer here rather than each racing its own MAIL_CLOSED
+-- handler, which buys three things a pile of independent handlers cannot:
+--   * ONE ORDER. Closers run in load order (mail.lua's batch abort before
+--     panel.lua's hide), so teardown is deterministic instead of registration-
+--     order luck.
+--   * ONCE PER VISIT. Several signals feed this (MAIL_CLOSED and MailFrame's
+--     OnHide, which fire in either order); the second one in a visit is a no-op.
+--   * ISOLATION. A closer that errors is surfaced to the error handler and the
+--     remaining closers still run, so one bad module can never strand the panel
+--     on screen.
+----------------------------------------------------------------------
+
+-- Split into two pure pieces (the latch and the fan-out) which CloseWithMailbox
+-- composes, so the self-tests can exercise each without firing the LIVE closers —
+-- running /conduit debug selftest at an open mailbox must never tear the panel down.
+
+local mailboxClosers = {}
+ns.mailboxOpen = false
+
+-- Register fn(reason) to run when the mailbox goes away. Load order is run order.
+function ns:RegisterMailboxCloser(fn)
+    if type(fn) ~= "function" then return end
+    mailboxClosers[#mailboxClosers + 1] = fn
+end
+
+-- Arm the teardown. Called on MAIL_SHOW, and by Panel.Show so that re-opening the
+-- panel with /conduit show at an already-open mailbox re-arms it too.
+function ns:MailboxOpened()
+    ns.mailboxOpen = true
+end
+
+-- The latch. Consumes the armed state, returning true exactly ONCE per arming, so
+-- the several signals that mean "the mailbox is gone" (MAIL_CLOSED and MailFrame's
+-- OnHide, which arrive in either order) collapse into a single teardown.
+function ns:ConsumeMailboxOpen()
+    if not ns.mailboxOpen then return false end
+    ns.mailboxOpen = false
+    return true
+end
+
+-- The fan-out. Runs every closer in order, isolating each: a closer that errors is
+-- reported through onError and the REST STILL RUN, so one bad module can never
+-- strand the panel on screen. Returns how many closers ran.
+function ns.RunClosers(closers, reason, onError)
+    if type(closers) ~= "table" then return 0 end
+    local n = 0
+    for i = 1, #closers do
+        local ok, err = pcall(closers[i], reason)
+        n = n + 1
+        if not ok and onError then onError(err) end
+    end
+    return n
+end
+
+-- Tear down everything that belongs to the mailbox. Returns true if this call did
+-- the work, false if the mailbox was already torn down (a duplicate signal).
+function ns:CloseWithMailbox(reason)
+    if not ns:ConsumeMailboxOpen() then return false end
+    ns.RunClosers(mailboxClosers, reason, geterrorhandler())
+    return true
+end
+
+-- MailFrame's OnHide is the earliest and broadest "the mail window is gone"
+-- signal: MAIL_CLOSED only arrives after CloseMail() round-trips to the server,
+-- and an addon can hide MailFrame outright. FrameXML's own OnHide calls
+-- CloseMail(), so a hidden MailFrame always means a closed mailbox. Hooked
+-- lazily on the first MAIL_SHOW (MailFrame certainly exists by then) and exactly
+-- once; HookScript never displaces FrameXML's handler.
+local hookedMailFrame = false
+local function hookMailFrame()
+    if hookedMailFrame then return end
+    local mf = _G.MailFrame
+    if not (mf and mf.HookScript) then return end
+    hookedMailFrame = true
+    mf:HookScript("OnHide", function()
+        ns:SafeCall(function() ns:CloseWithMailbox("mail window closed") end)
+    end)
+end
+
+ns:RegisterEvent("MAIL_SHOW", function()
+    ns:MailboxOpened()
+    hookMailFrame()
+end)
+
+ns:RegisterEvent("MAIL_CLOSED", function()
+    ns:CloseWithMailbox("MAIL_CLOSED")
+end)
+
+----------------------------------------------------------------------
 -- SavedVariables (schema-versioned)
 ----------------------------------------------------------------------
 

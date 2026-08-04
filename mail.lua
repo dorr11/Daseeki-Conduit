@@ -170,11 +170,16 @@ function Mail.Status()
     return ("Sending %d/%d…"):format(math.min(S.sentMails + 1, total), total)
 end
 
-local function abort(reason)
+-- Stop the run. `mailboxGone` says the mailbox itself has closed under us: in that
+-- case we must NOT touch the Send Mail form on the way out. ClickSendMailItemButton
+-- and SetSendMailMoney are mailbox-gated — calling them once the mailbox is closed
+-- errors — and there is nothing to clean up anyway, because closing the mailbox
+-- already returned the staged attachments and gold to the player.
+local function abort(reason, mailboxGone)
     if not S.active then return end
     local sent = S.sentMails
     resetState()
-    clearForm()
+    if not mailboxGone then clearForm() end
     if reason then
         say(("stopped: %s (%d mail(s) already sent)."):format(reason, sent))
     end
@@ -413,8 +418,18 @@ ns:RegisterEvent("MAIL_FAILED", function()
     if S.active then abort("mail failed — check the recipient name and your gold") end
 end)
 
-ns:RegisterEvent("MAIL_CLOSED", function()
-    if S.active then abort("mailbox closed") end
+-- The mailbox went away (MAIL_CLOSED, or the mail window hidden by any other
+-- route — core.lua's teardown coordinator funnels every one of them here).
+ns:RegisterMailboxCloser(function()
+    -- A confirm popup is an offer to send AT THIS MAILBOX, against the bag and
+    -- wallet snapshot taken when it was raised. Once the mailbox is gone that
+    -- snapshot is stale, so the popup dies with it rather than lingering to fire a
+    -- stale queue at whatever mailbox is opened next. Note this runs whether or not
+    -- a run is active — an un-Accepted popup is exactly the case abort() ignores.
+    if StaticPopup_Hide then StaticPopup_Hide("DASEEKI_CONDUIT_SEND_CONFIRM") end
+    -- Mid-batch: drop the run. The mailbox is closed, so skip the form cleanup —
+    -- see abort()'s mailboxGone note.
+    if S.active then abort("mailbox closed", true) end
 end)
 
 ns:RegisterEvent("UI_ERROR_MESSAGE", function(_, arg1, arg2)

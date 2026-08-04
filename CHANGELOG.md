@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Close the mail window and Conduit closes with it.** The panel now goes away the
+  moment the mail window does, however it went — walking away from the mailbox,
+  pressing Escape, the mail window's own close button, or another window taking its
+  place. If you were part-way through a multi-mail batch when the mailbox closed,
+  the run stops cleanly and tells you how many mails already went, and a
+  confirm-before-send prompt still waiting on screen is dismissed with it, so a
+  "Yes" can never fire a send that was planned at a mailbox you have already left.
+
 - **The rule editor's Alt picker now shows your characters properly.** With Daseeki
   Nexus installed, the "Alt" dropdown beside Recipient lists the characters on this
   realm that Nexus knows about, each in its class colour, so setting up a rule is a
