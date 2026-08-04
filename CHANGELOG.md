@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.1 — 2026-08-04
 
 - **Close the mail window and Conduit closes with it.** The panel now goes away the
   moment the mail window does, however it went — walking away from the mailbox,
