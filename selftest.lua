@@ -761,6 +761,50 @@ ns:RegisterSelfTest("mailbox-close", function(verbose)
     eq(t, ns.RunClosers({}, "x"), 0, "an empty closer list is a clean no-op")
     check(t, pcall(ns.RunClosers, closers, nil), "a nil reason never errors")
 
+    -- ── the OTHER half: MailFrame's hooks install exactly once ────────────────
+    --
+    -- A HookScript cannot be undone, so a second installation is permanent double
+    -- work on every open and close of the player's mail window — and the whole
+    -- OnShow refresh path hangs off this guard. Driven against a STAND-IN frame:
+    -- hooking the real MailFrame from a self-test would leave that hook behind
+    -- forever, and /conduit debug selftest is run at open mailboxes.
+    check(t, ns.HookOnce ~= nil, "the coordinator exposes its install-once guard")
+
+    local installs, state = {}, {}
+    local stand = { HookScript = function(_, ev) installs[#installs + 1] = ev end }
+    local scripts = { { "OnHide", function() end }, { "OnShow", function() end } }
+
+    eq(t, ns.HookOnce(state, stand, scripts), true, "the first call installs")
+    eq(t, #installs, 2, "...both scripts, in one pass")
+    eq(t, installs[1], "OnHide", "OnHide installs first (declared order, not pairs order)")
+    eq(t, installs[2], "OnShow", "...then OnShow, the visibility signal")
+
+    eq(t, ns.HookOnce(state, stand, scripts), false, "the second call is a no-op")
+    eq(t, ns.HookOnce(state, stand, scripts), false, "...and so is every one after it")
+    eq(t, #installs, 2, "no script is ever hooked twice")
+
+    -- A fresh state hooks a fresh target: the latch is per-target, not global.
+    local state2 = {}
+    eq(t, ns.HookOnce(state2, stand, { { "OnShow", function() end } }), true,
+       "an independent guard installs independently")
+
+    -- Defensive shapes: the install must never be the thing that errors.
+    eq(t, ns.HookOnce({}, nil, scripts), false, "a missing target installs nothing")
+    eq(t, ns.HookOnce({}, {}, scripts), false, "a target with no HookScript installs nothing")
+    eq(t, ns.HookOnce({}, stand, nil), true, "no scripts is a clean latch")
+    eq(t, ns.HookOnce(nil, stand, scripts), false, "a missing guard installs nothing")
+
+    -- ── and the refreshers fan out like the closers, WITHOUT the latch ────────
+    -- Refreshers are idempotent redraws: every OnShow must re-ask, so unlike the
+    -- teardown there is nothing here that fires only once per visit.
+    check(t, ns.RegisterMailboxRefresher ~= nil, "the coordinator accepts refreshers")
+    check(t, ns.MailboxShown ~= nil, "...and exposes the fan-out")
+    local redraws = {}
+    local refreshers = { function(reason) redraws[#redraws + 1] = tostring(reason) end }
+    eq(t, ns.RunClosers(refreshers, "mail window shown"), 1, "a refresher runs")
+    eq(t, ns.RunClosers(refreshers, "mail window shown"), 1, "and runs AGAIN on the next show")
+    eq(t, #redraws, 2, "no latch consumes the second redraw")
+
     return report(t, verbose)
 end)
 
@@ -1017,6 +1061,31 @@ ns:RegisterSelfTest("boon-arming", function(verbose)
     check(t, not B.StateShowsButton("off"), "off draws nothing")
     check(t, not B.StateShowsButton("elsewhere"), "elsewhere draws the hint, not the button")
     check(t, not B.StateShowsButton("nomesh"), "nor does the no-data state")
+
+    -- ── the greyed button's tooltip reason (one assertion per state) ──────────
+    -- Every state the matrix can return is pinned here, so a new state added to
+    -- ButtonState without a matching sentence shows up as a silent nil below rather
+    -- than as a mute greyed button in front of the player.
+    eq(t, B.StateReason("nomailbox"), "Open a mailbox to send.",
+       "a greyed no-mailbox button says to open a mailbox")
+    eq(t, B.StateReason("disabled"), "Conduit is disabled on this character.",
+       "a greyed opted-out button names the opt-out")
+    eq(t, B.StateReason("busy"), "A send is already running.",
+       "a greyed mid-send button says a send is running")
+    eq(t, B.StateReason("armed"), nil, "an armed button has nothing to excuse")
+    eq(t, B.StateReason("off"), nil, "a row that is not drawn has no button to explain")
+    eq(t, B.StateReason("elsewhere"), nil, "elsewhere speaks through the hint line, not a tooltip")
+    eq(t, B.StateReason("nomesh"), nil, "so does the no-data state")
+    eq(t, B.StateReason(nil), nil, "an absent state never errors")
+
+    -- The contract that binds the two together: EVERY greyed-but-drawn state must
+    -- carry a reason, and no state that draws nothing may invent one.
+    for _, s in ipairs({ "armed", "nomailbox", "disabled", "busy",
+                         "off", "elsewhere", "nomesh" }) do
+        local drawsGrey = B.StateShowsButton(s) and s ~= "armed"
+        check(t, (B.StateReason(s) ~= nil) == drawsGrey,
+           "reason <-> greyed-button agreement for '" .. s .. "'")
+    end
 
     -- ── mesh readiness ────────────────────────────────────────────────────────
     check(t, not B.MeshReady(nil), "no roster at all -> not ready")

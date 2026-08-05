@@ -365,6 +365,25 @@ function Boons.StateShowsButton(state)
         or state == "disabled" or state == "busy"
 end
 
+-- WHY a drawn button will not fire, in the user's own words.
+--
+-- A greyed button is mute: it says "Replenish Boons", refuses the click, and never
+-- says which of the three gates is shut — which is exactly the report that opened
+-- this fix ("the button is greyed and the panel says Ready"). The tooltip asks
+-- THIS function, and the panel passes it the SAME state string it drew the alpha
+-- from, so the sentence and the greying can never disagree; a second derivation
+-- from the live world could (and did) drift.
+--
+-- nil means "nothing to explain": either the row is armed, or the state draws no
+-- button at all ("off" draws nothing; "elsewhere"/"nomesh" already speak through
+-- the hint line, which is a fuller sentence than a tooltip footnote).
+function Boons.StateReason(state)
+    if state == "nomailbox" then return "Open a mailbox to send." end
+    if state == "disabled"  then return "Conduit is disabled on this character." end
+    if state == "busy"      then return "A send is already running." end
+    return nil
+end
+
 -- ════════════════════════════════════════════════════════════════════════════
 --  THE CONFIRM PREVIEW  (pure text; every colour degrades to plain)
 -- ════════════════════════════════════════════════════════════════════════════

@@ -200,21 +200,86 @@ function ns:CloseWithMailbox(reason)
     return true
 end
 
+----------------------------------------------------------------------
+-- Mailbox VISIBILITY fan-out (the other half of the coordinator)
+--
+-- MAIL_SHOW is not "the mail window is on screen": it is the server telling the
+-- client a mailbox was opened, and FrameXML shows MailFrame from its OWN handler
+-- for the same event. Two frames, one event, no defined order — so a Conduit
+-- handler that reads MailFrame:IsShown() can legitimately be asked the question
+-- one beat before the answer becomes true.
+--
+-- That is a real bug, not a theoretical one: the panel's boon row is drawn from
+-- Boons.State(), which reads MailFrame:IsShown(), and MAIL_SHOW was the only thing
+-- that ever refreshed it. Land on the wrong side of the coin flip and the row
+-- freezes at "nomailbox" — a greyed Replenish Boons button at a wide-open mailbox,
+-- for the whole visit.
+--
+-- The fix is to stop inferring visibility from an event and to observe it: hook
+-- MailFrame's OnShow, which fires when the frame is ACTUALLY shown, and re-run the
+-- registered refreshers. Refreshers are idempotent redraws, so unlike the closers
+-- there is NO latch here — every OnShow re-asks, and asking twice costs a redraw.
+----------------------------------------------------------------------
+
+local mailboxRefreshers = {}
+
+-- Register fn(reason) to run whenever the mail window becomes visible. The handler
+-- must be an idempotent redraw: it can and will run more than once per visit.
+function ns:RegisterMailboxRefresher(fn)
+    if type(fn) ~= "function" then return end
+    mailboxRefreshers[#mailboxRefreshers + 1] = fn
+end
+
+-- The fan-out, reusing the closers' isolation contract: one refresher that errors
+-- is surfaced and the rest still run, so a broken redraw cannot strand the panel
+-- showing a stale answer.
+function ns:MailboxShown(reason)
+    return ns.RunClosers(mailboxRefreshers, reason, geterrorhandler())
+end
+
+-- The install-once guard for a frame we do not own.
+--
+-- Lifted out of hookMailFrame so the self-tests can prove idempotence against a
+-- stand-in: a HookScript CANNOT be undone, so a test that hooked the real
+-- MailFrame would leave that hook on the player's UI forever.
+--
+-- Returns true from the FIRST call that finds a hookable target and installs every
+-- script; every later call with the same `state` table is a no-op returning false.
+-- Scripts are an ORDERED array of {event, handler} — pairs() order is undefined and
+-- installation order is observable.
+function ns.HookOnce(state, target, scripts)
+    if type(state) ~= "table" or state.hooked then return false end
+    if type(target) ~= "table" or type(target.HookScript) ~= "function" then return false end
+    state.hooked = true
+    for _, pair in ipairs(scripts or {}) do
+        target:HookScript(pair[1], pair[2])
+    end
+    return true
+end
+
 -- MailFrame's OnHide is the earliest and broadest "the mail window is gone"
 -- signal: MAIL_CLOSED only arrives after CloseMail() round-trips to the server,
 -- and an addon can hide MailFrame outright. FrameXML's own OnHide calls
--- CloseMail(), so a hidden MailFrame always means a closed mailbox. Hooked
--- lazily on the first MAIL_SHOW (MailFrame certainly exists by then) and exactly
--- once; HookScript never displaces FrameXML's handler.
-local hookedMailFrame = false
+-- CloseMail(), so a hidden MailFrame always means a closed mailbox. Its OnShow is
+-- the matching "the mail window is HERE" signal (see the fan-out above). Both are
+-- hooked lazily on the first MAIL_SHOW (MailFrame certainly exists by then) and
+-- exactly once; HookScript never displaces FrameXML's handlers.
+--
+-- The lazy install is safe on either side of the MAIL_SHOW coin flip. If FrameXML
+-- shows MailFrame BEFORE our handler runs, the hook misses that first OnShow — but
+-- MailFrame is already visible by then, so the panel's own refresh reads it
+-- correctly with no help. If our handler runs FIRST, the hook is installed before
+-- the frame is shown and catches the OnShow that follows.
+local mailFrameHook = {}
 local function hookMailFrame()
-    if hookedMailFrame then return end
-    local mf = _G.MailFrame
-    if not (mf and mf.HookScript) then return end
-    hookedMailFrame = true
-    mf:HookScript("OnHide", function()
-        ns:SafeCall(function() ns:CloseWithMailbox("mail window closed") end)
-    end)
+    return ns.HookOnce(mailFrameHook, _G.MailFrame, {
+        { "OnHide", function()
+            ns:SafeCall(function() ns:CloseWithMailbox("mail window closed") end)
+        end },
+        { "OnShow", function()
+            ns:SafeCall(function() ns:MailboxShown("mail window shown") end)
+        end },
+    })
 end
 
 ns:RegisterEvent("MAIL_SHOW", function()
@@ -319,17 +384,25 @@ local function printHelp()
     ns:Print("  /conduit help            - this list")
 end
 
+-- "Open Conduit's settings" — ONE definition, because there is now more than one
+-- door to it: /conduit, /conduit settings, and the panel header's gear glyph. A
+-- second copy in panel.lua would be a second thing to keep in step with the hub.
+function ns:OpenSettings()
+    if _G.DaseekiSuite and DaseekiSuite.Open then
+        DaseekiSuite:Open("conduit")
+        return true
+    end
+    ns:Print("the Daseeki hub (Daseeki Core) is not available.")
+    return false
+end
+
 local function dispatch(msg)
     msg = msg or ""
     local cmd, rest = msg:match("^%s*(%S*)%s*(.-)%s*$")
     cmd = (cmd or ""):lower()
 
     if cmd == "" or cmd == "settings" or cmd == "config" or cmd == "options" or cmd == "opt" then
-        if _G.DaseekiSuite and DaseekiSuite.Open then
-            DaseekiSuite:Open("conduit")
-        else
-            ns:Print("the Daseeki hub (Daseeki Core) is not available.")
-        end
+        ns:OpenSettings()
     elseif cmd == "disable" then
         ns:SetCharDisabled(true)
         ns:Print("disabled on this character. Rules will not send here until re-enabled.")
