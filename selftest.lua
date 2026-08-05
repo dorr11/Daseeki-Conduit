@@ -763,3 +763,386 @@ ns:RegisterSelfTest("mailbox-close", function(verbose)
 
     return report(t, verbose)
 end)
+
+-- ══════════════════════════════════════════════════════════════════════════════
+--  Suites 11-13: Chronoboon replenishment (pure; boons.lua)
+--
+--  The plan builder is the piece that decides who gets ten scarce consumables and
+--  who gets none, off a snapshot that is always a little bit out of date. It is
+--  therefore the most heavily asserted thing in this addon, AND the harness
+--  mutation-tests it (GATE MUT) — these checks exist to be strong enough to kill
+--  a mutant, not merely to describe the happy path.
+-- ══════════════════════════════════════════════════════════════════════════════
+
+-- One roster row, Network.CollectAlts-shaped, for the fixtures below.
+local function boonChar(name, level, have, opts)
+    opts = opts or {}
+    local e = { name = name, realm = "Whitemane", level = level,
+                faction = opts.faction, class = opts.class }
+    if have ~= nil then
+        e.counts   = { [184937] = have }
+        e.countsAt = opts.at
+    end
+    return e
+end
+
+ns:RegisterSelfTest("boon-plan", function(verbose)
+    local t = newT("boon-plan")
+    local B = ns.Boons
+
+    eq(t, B.ITEM_ID, 184937, "the item is the Chronoboon Displacer (Classic Era id)")
+    eq(t, B.TARGET, 10, "a full pocket is ten")
+    eq(t, B.MIN_LEVEL, 60, "only level 60 is worth stocking")
+
+    local function plan(entries, over)
+        local o = { source = "Bankalt", faction = "Alliance", stock = 999 }
+        for k, v in pairs(over or {}) do o[k] = v end
+        return B.BuildPlan(entries, o)
+    end
+    local function byName(p, name)
+        for _, x in ipairs(p.targets) do if x.name == name then return x end end
+        return nil
+    end
+    local function order(p)
+        local out = {}
+        for _, x in ipairs(p.targets) do out[#out + 1] = x.name .. ":" .. x.send end
+        return table.concat(out, ",")
+    end
+    local function skipKind(p, name)
+        for _, s in ipairs(p.skipped) do if s.name == name then return s.kind end end
+        return nil
+    end
+
+    -- ── THE OWNER'S EXAMPLE, VERBATIM ─────────────────────────────────────────
+    -- "Poonyx has 3, Shalk 9, Orn 0 -> send 7, 1, 10."
+    local mesh = { boonChar("Poonyx", 60, 3), boonChar("Shalk", 60, 9), boonChar("Orn", 60, 0) }
+    local p = plan(mesh)
+    eq(t, #p.targets, 3, "all three characters are in the plan")
+    eq(t, byName(p, "Poonyx").send, 7, "Poonyx has 3 -> send 7")
+    eq(t, byName(p, "Shalk").send,  1, "Shalk has 9 -> send 1")
+    eq(t, byName(p, "Orn").send,   10, "Orn has 0 -> send 10")
+    eq(t, p.totalNeed, 18, "18 boons needed in total")
+    eq(t, p.totalSend, 18, "...and with stock to spare, 18 go")
+    eq(t, p.shortfall, 0, "no shortfall when stock covers it")
+    eq(t, p.mailCount, 3, "three mails, one per character")
+    -- Biggest need first, always: the send ORDER is the rationing rule made visible.
+    eq(t, order(p), "Orn:10,Poonyx:7,Shalk:1", "the plan is ordered by descending need")
+
+    -- ── an absent count is a full ten, not an exclusion ───────────────────────
+    local noData = plan({ boonChar("Ghost", 60, nil) })
+    eq(t, #noData.targets, 1, "a character with no inventory snapshot is still planned for")
+    eq(t, byName(noData, "Ghost").have, 0, "...reading as zero held")
+    eq(t, byName(noData, "Ghost").send, 10, "...and therefore needing a full ten")
+    eq(t, byName(noData, "Ghost").hasData, nil, "...flagged as having no snapshot behind it")
+    eq(t, byName(noData, "Ghost").ageText, nil, "...and no age to show for it")
+
+    -- ── already stocked is not a target ───────────────────────────────────────
+    local full = plan({ boonChar("Full", 60, 10), boonChar("Over", 60, 14) })
+    eq(t, #full.targets, 0, "a character at ten (or over) is not mailed")
+    eq(t, skipKind(full, "Full"), "stocked", "...and is reported as stocked, not silently dropped")
+    eq(t, skipKind(full, "Over"), "stocked", "...over ten too (never a negative send)")
+    eq(t, full.totalNeed, 0, "nothing needed")
+
+    -- ── the three filters ─────────────────────────────────────────────────────
+    local filtered = plan({
+        boonChar("Bankalt",  60, 0),                              -- the source itself
+        boonChar("bankalt2", 60, 0),                              -- NOT the source
+        boonChar("Lowbie",   19, 0),
+        boonChar("Fiftynine",59, 0),
+        boonChar("Sixtyone", 61, 0),                              -- boosted/unusual: still in
+        boonChar("Nolevel",  nil, 0),
+        boonChar("Zerolevel",  0, 0),
+        boonChar("Hordie",   60, 0, { faction = "Horde" }),
+        boonChar("Ally",     60, 0, { faction = "Alliance" }),
+        boonChar("Unknownside", 60, 0),                           -- no faction recorded
+    })
+    eq(t, skipKind(filtered, "Bankalt"), "source", "the source never mails itself")
+    check(t, byName(filtered, "bankalt2") ~= nil,
+       "a DIFFERENT name that merely starts the same is not mistaken for the source")
+    eq(t, skipKind(filtered, "Lowbie"), "level", "a low-level character is skipped")
+    eq(t, skipKind(filtered, "Fiftynine"), "level", "fifty-nine is not sixty")
+    check(t, byName(filtered, "Sixtyone") ~= nil, "above the minimum is still in")
+    eq(t, skipKind(filtered, "Nolevel"), "unknownLevel",
+       "an unrecorded level is EXCLUDED (ten boons on a bank mule is not recoverable)")
+    eq(t, skipKind(filtered, "Zerolevel"), "unknownLevel", "level 0 is Nexus for 'never captured'")
+    eq(t, skipKind(filtered, "Hordie"), "faction", "the other faction cannot be mailed")
+    check(t, byName(filtered, "Ally") ~= nil, "our own faction is in")
+    check(t, byName(filtered, "Unknownside") ~= nil,
+       "an unrecorded faction is INCLUDED (a wrong guess only bounces the mail back)")
+    eq(t, filtered.counts.unknownLevel, 2, "both unknown-level characters are counted")
+    eq(t, filtered.counts.level, 2, "both under-level characters are counted")
+    eq(t, filtered.counts.faction, 1, "the cross-faction character is counted")
+
+    -- A source with no faction of its own filters nobody on faction.
+    local noSide = B.BuildPlan({ boonChar("Hordie", 60, 0, { faction = "Horde" }) },
+                               { source = "Bankalt", faction = nil, stock = 99 })
+    eq(t, #noSide.targets, 1, "an unknown SOURCE faction filters nobody")
+
+    -- The source match is on the base name, case-insensitively, realm suffix or not.
+    eq(t, skipKind(plan({ boonChar("BANKALT", 60, 0) }), "BANKALT"), "source",
+       "the source is matched case-insensitively")
+    eq(t, skipKind(B.BuildPlan({ boonChar("Bankalt", 60, 0) },
+        { source = "Bankalt-Whitemane", faction = "Alliance", stock = 9 }), "Bankalt"), "source",
+       "a realm-qualified source still matches its own row")
+
+    -- ── RATIONING: descending need, and what a shortfall looks like ───────────
+    -- Stock 12 against the owner's 18: Orn's ten, then Poonyx gets the last two.
+    local short = plan(mesh, { stock = 12 })
+    eq(t, order(short), "Orn:10,Poonyx:2,Shalk:0", "the stock walks DOWN the need order")
+    eq(t, short.totalSend, 12, "every boon in the bags is allocated")
+    eq(t, short.shortfall, 6, "the shortfall is stated, not hidden")
+    eq(t, short.remaining, 0, "nothing is left over")
+    eq(t, byName(short, "Poonyx").partial, true, "the boundary character is flagged partial")
+    eq(t, byName(short, "Shalk").partial, nil, "one that got nothing is not 'partial'")
+    check(t, byName(short, "Shalk") ~= nil,
+       "an unfunded character stays IN the plan (an omission is not a report)")
+    eq(t, short.mailCount, 2, "only the funded characters become mails")
+
+    -- Exactly enough, and one short of exactly enough.
+    eq(t, plan(mesh, { stock = 18 }).shortfall, 0, "stock == need -> no shortfall")
+    eq(t, plan(mesh, { stock = 17 }).shortfall, 1, "one under -> a shortfall of one")
+    eq(t, order(plan(mesh, { stock = 17 })), "Orn:10,Poonyx:7,Shalk:0",
+       "...and it is the SMALLEST need that goes without")
+
+    -- No stock at all: a plan of zeros, never a crash and never a phantom mail.
+    local dry = plan(mesh, { stock = 0 })
+    eq(t, dry.totalSend, 0, "no stock sends nothing")
+    eq(t, dry.mailCount, 0, "...and queues no mails")
+    eq(t, dry.shortfall, 18, "...and the whole need is the shortfall")
+    eq(t, #dry.targets, 3, "...while still naming everyone who needed some")
+
+    -- Equal needs sort by name, so the plan never shuffles between sessions.
+    local tie = plan({ boonChar("zeta", 60, 4), boonChar("Alpha", 60, 4), boonChar("mid", 60, 4) })
+    eq(t, order(tie), "Alpha:6,mid:6,zeta:6", "equal needs are ordered by name, case-insensitively")
+
+    -- ── STALENESS is carried, never computed away ─────────────────────────────
+    local NOW = 1700000000
+    local aged = B.BuildPlan({
+        boonChar("Fresh",  60, 1, { at = NOW - 30 }),
+        boonChar("Hourly", 60, 2, { at = NOW - 7200 }),
+        boonChar("Daysold",60, 3, { at = NOW - 86400 * 4 }),
+        boonChar("Nodate", 60, 4),
+    }, { source = "Bankalt", faction = "Alliance", stock = 99, now = NOW })
+    eq(t, byName(aged, "Fresh").ageText,   "just now", "a fresh count says so")
+    eq(t, byName(aged, "Hourly").ageText,  "2h", "a two-hour-old count says so")
+    eq(t, byName(aged, "Daysold").ageText, "4d", "a four-day-old count says so")
+    eq(t, byName(aged, "Nodate").ageText,  nil, "an unstamped count has no age to claim")
+    eq(t, byName(aged, "Fresh").age, 30, "the raw age is carried too")
+    -- With no clock injected there are no ages at all — and no wrong ones.
+    eq(t, byName(plan({ boonChar("X", 60, 1, { at = NOW }) }), "X").ageText, nil,
+       "without a clock, no age is invented")
+
+    eq(t, B.FormatAge(0), "just now", "zero seconds")
+    eq(t, B.FormatAge(89), "just now", "under 90 seconds is still 'just now'")
+    eq(t, B.FormatAge(90), "1m", "ninety seconds is a minute")
+    eq(t, B.FormatAge(3599), "59m", "just under an hour")
+    eq(t, B.FormatAge(3600), "1h", "an hour")
+    eq(t, B.FormatAge(172799), "47h", "under two days is still hours")
+    eq(t, B.FormatAge(172800), "2d", "two days")
+    eq(t, B.FormatAge(-5), "just now", "a clock that ran backwards is not a negative age")
+    eq(t, B.FormatAge(nil), nil, "no age in -> no age out")
+    eq(t, B.FormatAge("soon"), nil, "junk in -> no age out")
+
+    -- ── the no-error contract ─────────────────────────────────────────────────
+    local hostile = { "junk", {}, { name = "" }, { name = 42 },
+                      { name = "Ok", level = "sixty" },
+                      { name = "Weird", level = 60, counts = "nope" },
+                      { name = "Neg", level = 60, counts = { [184937] = -5 } },
+                      { name = "Frac", level = 60, counts = { [184937] = 3.7 } } }
+    local okRun, res = pcall(B.BuildPlan, hostile, { source = "Bankalt", stock = 99 })
+    check(t, okRun, "a hostile roster never errors")
+    check(t, okRun and type(res) == "table", "...and still returns a plan")
+    eq(t, byName(res, "Weird").send, 10, "a junk counts map reads as zero held")
+    eq(t, byName(res, "Neg").send, 10, "a negative count reads as zero held")
+    eq(t, byName(res, "Frac").have, 3, "a fractional count is floored, never rounded up")
+    check(t, byName(res, "Ok") == nil, "a non-numeric level is unknown, and unknown is out")
+    check(t, pcall(B.BuildPlan, nil, nil), "nil inputs plan nothing, and do not error")
+    eq(t, #B.BuildPlan(nil, nil).targets, 0, "...returning an empty plan")
+
+    return report(t, verbose)
+end)
+
+ns:RegisterSelfTest("boon-arming", function(verbose)
+    local t = newT("boon-arming")
+    local B = ns.Boons
+
+    -- `pairs` cannot carry a nil, and "this field is absent" is half the matrix, so
+    -- an override of NIL means "delete the key" rather than "leave the default".
+    local NIL = {}
+    local function ctxOf(over)
+        local c = { source = "Bankalt", me = "Bankalt", mailbox = true,
+                    mesh = true, disabled = false, active = false }
+        for k, v in pairs(over or {}) do c[k] = (v ~= NIL) and v or nil end
+        return c
+    end
+    local function state(over) return (B.ButtonState(ctxOf(over))) end
+    local function hint(over)  return (select(2, B.ButtonState(ctxOf(over)))) end
+
+    -- ── THE MATRIX ────────────────────────────────────────────────────────────
+    eq(t, state(), "armed", "the source, at a mailbox, with mesh data -> armed")
+    eq(t, state({ mailbox = false }), "nomailbox", "the source with no mailbox open -> not armed")
+    eq(t, state({ me = "Someoneelse" }), "elsewhere", "any other character -> not armed")
+    eq(t, state({ source = NIL }), "off", "no source designated -> the row is not drawn")
+    eq(t, state({ source = "" }), "off", "an empty source is no source")
+    eq(t, state({ source = "   " }), "off", "a whitespace source is no source")
+    eq(t, state({ mesh = false }), "nomesh", "no Nexus inventory data -> a hint, never an error")
+    eq(t, state({ disabled = true }), "disabled", "Conduit off on this character -> greyed")
+    eq(t, state({ active = true }), "busy", "a send already in flight -> greyed")
+
+    -- Identity is base-name, case-insensitive: the same character however spelled.
+    eq(t, state({ me = "BANKALT" }), "armed", "capitalisation does not change who you are")
+    eq(t, state({ me = "Bankalt-Whitemane" }), "armed", "nor does a realm suffix on the name")
+    eq(t, state({ source = "Bankalt-Whitemane", me = "Bankalt" }), "armed",
+       "nor one on the stored source")
+    eq(t, state({ me = "Bankalt2" }), "elsewhere", "a different character is a different character")
+    eq(t, state({ me = NIL }), "elsewhere", "an unknown character is never the source")
+
+    -- ── WHO you are is decided before WHAT data exists ────────────────────────
+    eq(t, state({ me = "Someoneelse", mesh = false }), "elsewhere",
+       "the other nine characters are told who sends, not about Nexus")
+
+    -- ── the hints ─────────────────────────────────────────────────────────────
+    check(t, hint({ me = "Someoneelse" }):find("Bankalt", 1, true) ~= nil,
+       "the elsewhere hint NAMES the source")
+    check(t, hint({ mesh = false }):find("Nexus", 1, true) ~= nil,
+       "the no-data hint names what is missing")
+    eq(t, hint(), nil, "an armed row needs no hint")
+    eq(t, hint({ source = NIL }), nil, "a row that is not drawn has nothing to say")
+
+    -- ── which states draw a button at all ─────────────────────────────────────
+    check(t, B.StateShowsButton("armed"), "armed draws the button")
+    check(t, B.StateShowsButton("nomailbox"), "so does a greyed no-mailbox")
+    check(t, B.StateShowsButton("disabled"), "so does a greyed opted-out")
+    check(t, B.StateShowsButton("busy"), "so does a greyed mid-send")
+    check(t, not B.StateShowsButton("off"), "off draws nothing")
+    check(t, not B.StateShowsButton("elsewhere"), "elsewhere draws the hint, not the button")
+    check(t, not B.StateShowsButton("nomesh"), "nor does the no-data state")
+
+    -- ── mesh readiness ────────────────────────────────────────────────────────
+    check(t, not B.MeshReady(nil), "no roster at all -> not ready")
+    check(t, not B.MeshReady({}), "an empty roster -> not ready")
+    check(t, not B.MeshReady({ { name = "A", level = 60 } }), "a roster with no counts -> not ready")
+    check(t, B.MeshReady({ { name = "A" }, { name = "B", counts = {} } }),
+       "one owner carrying an itemCounts map is enough")
+    check(t, not B.MeshReady({ { name = "A", counts = "nope" } }), "junk where counts should be -> not ready")
+
+    return report(t, verbose)
+end)
+
+ns:RegisterSelfTest("boon-queue", function(verbose)
+    local t = newT("boon-queue")
+    local B = ns.Boons
+
+    -- ── stock counting off live bag stacks ────────────────────────────────────
+    local stacks = { { bag = 0, slot = 1, itemID = 184937, count = 10 },
+                     { bag = 0, slot = 5, itemID = 184937, count = 8 },
+                     { bag = 2, slot = 3, itemID = 184937, count = 1 } }
+    eq(t, B.CountStock(stacks, 184937), 19, "stock is the sum of every mailable stack")
+    eq(t, B.CountStock({}, 184937), 0, "no stacks -> no stock")
+    eq(t, B.CountStock(nil, 184937), 0, "nil stacks -> no stock, never an error")
+    eq(t, B.CountStock({ { itemID = 6948, count = 5 } }, 184937), 0, "another item is not stock")
+    eq(t, B.CountStock({ { itemID = 184937, count = "x" },
+                         { itemID = 184937, count = -3 } }, 184937), 0, "junk counts are zero")
+
+    -- ── the queue: one mail per funded target, drawn out of real slots ────────
+    local plan = B.BuildPlan(
+        { { name = "Orn", level = 60, counts = { [184937] = 0 } },
+          { name = "Poonyx", level = 60, counts = { [184937] = 3 } },
+          { name = "Shalk", level = 60, counts = { [184937] = 9 } } },
+        { source = "Bankalt", faction = "Alliance", stock = B.CountStock(stacks, 184937) })
+    local q = B.BuildQueue(plan, stacks, { maxAttach = 12, subject = "Daseeki Conduit" })
+
+    eq(t, #q, 3, "three funded targets -> three mails")
+    eq(t, q[1].recipient, "Orn", "the mails are in plan (descending-need) order")
+    eq(t, q[1].units, 10, "Orn's mail carries ten boons")
+    eq(t, #q[1].stacks, 1, "...out of the one slot that could cover it")
+    eq(t, q[1].stacks[1].count, 10, "...as a whole ten-stack")
+    eq(t, q[2].recipient, "Poonyx", "Poonyx is next")
+    eq(t, q[2].units, 7, "...carrying seven")
+    eq(t, q[2].stacks[1].slot, 5, "...drawn from the NEXT slot, the first being spent")
+    eq(t, q[2].stacks[1].count, 7, "...as a partial split of that stack")
+    eq(t, q[2].stacks[1].exact, true,
+       "...marked exact, which is what tells the engine to SPLIT rather than take it all")
+    eq(t, q[1].stacks[1].exact, true,
+       "even a whole-stack draw is exact — a top-up sends the planned number, never more")
+    eq(t, q[3].units, 1, "Shalk gets the last one")
+    eq(t, q[3].stacks[1].slot, 5, "...out of what Poonyx left in slot 5")
+    eq(t, q[3].stacks[1].count, 1, "...one boon")
+    eq(t, q[1].subject, "Daseeki Conduit", "every mail carries the addon's subject")
+    check(t, q[1].unitLabel and q[1].unitLabel:find("Chronoboon", 1, true) ~= nil,
+       "the mail names its unit, so the engine can say '7 Chronoboon Displacers'")
+
+    -- A need that spans several slots is split across attachments, in bag order.
+    local many = { { bag = 0, slot = 1, itemID = 184937, count = 2 },
+                   { bag = 0, slot = 2, itemID = 184937, count = 3 },
+                   { bag = 0, slot = 3, itemID = 184937, count = 9 } }
+    local one = B.BuildQueue(
+        B.BuildPlan({ { name = "Orn", level = 60, counts = { [184937] = 0 } } },
+                    { source = "S", stock = 14 }), many, {})
+    eq(t, #one, 1, "one target -> one mail")
+    eq(t, #one[1].stacks, 3, "...spanning the three slots it took to fill")
+    eq(t, one[1].stacks[3].count, 5, "...the last of which is a partial draw")
+    eq(t, one[1].units, 10, "...ten boons in total")
+
+    -- Nothing funded -> nothing queued (the confirm popup is never raised on air).
+    eq(t, #B.BuildQueue(B.BuildPlan({ { name = "Orn", level = 60, counts = { [184937] = 0 } } },
+        { source = "S", stock = 0 }), stacks, {}), 0, "an unfunded plan queues no mails")
+    eq(t, #B.BuildQueue(nil, nil, nil), 0, "nil inputs queue nothing, and do not error")
+    eq(t, #B.BuildQueue({ targets = {} }, stacks, {}), 0, "an empty plan queues nothing")
+
+    -- The attachment cap still binds, even here (a need of ten out of ten 1-stacks).
+    local ones = {}
+    for i = 1, 20 do ones[i] = { bag = 0, slot = i, itemID = 184937, count = 1 } end
+    local capped = B.BuildQueue(
+        B.BuildPlan({ { name = "Orn", level = 60, counts = { [184937] = 0 } } },
+                    { source = "S", stock = 20 }), ones, { maxAttach = 4 })
+    eq(t, #capped[1].stacks, 4, "no mail exceeds the attachment cap")
+    eq(t, capped[1].units, 4, "...and the mail reports what it can really carry")
+
+    -- ── the completion line ───────────────────────────────────────────────────
+    local full = B.BuildPlan({ { name = "Orn", level = 60, counts = { [184937] = 0 } } },
+                             { source = "S", stock = 10 })
+    check(t, B.FinishLine(full, { units = 10, mails = 1 }):find("10", 1, true) ~= nil,
+       "the completion line says how many went")
+    check(t, B.FinishLine(full, { units = 10, mails = 1 }):find("short", 1, true) == nil,
+       "...and says nothing about a shortfall when there was none")
+    local part = B.BuildPlan({ { name = "Orn", level = 60, counts = { [184937] = 0 } } },
+                             { source = "S", stock = 4 })
+    check(t, B.FinishLine(part, { units = 4, mails = 1 }):find("6 short", 1, true) ~= nil,
+       "a shortfall is repeated in the completion line, not only in the preview")
+    check(t, pcall(B.FinishLine, nil, nil), "a missing plan never breaks the completion line")
+
+    -- ── the confirm preview names every target, every amount, every age ───────
+    local NOW = 1700000000
+    local previewPlan = B.BuildPlan({
+        { name = "Orn",    level = 60, counts = { [184937] = 0 }, countsAt = NOW - 7200 },
+        { name = "Poonyx", level = 60, counts = { [184937] = 3 }, countsAt = NOW - 60 },
+        { name = "Shalk",  level = 60, counts = { [184937] = 9 } },
+        { name = "Ghost",  level = 60 },
+        { name = "Mystery",level = nil },
+        { name = "Full",   level = 60, counts = { [184937] = 10 } },
+    }, { source = "Bankalt", faction = "Alliance", stock = 12, now = NOW })
+    local text = B.PreviewText(previewPlan)
+    for _, name in ipairs({ "Orn", "Poonyx", "Shalk", "Ghost" }) do
+        check(t, text:find(name, 1, true) ~= nil, "the preview names " .. name)
+    end
+    check(t, text:find("Mystery", 1, true) ~= nil,
+       "...and NAMES the character it left out for an unknown level")
+    check(t, text:find("2h", 1, true) ~= nil, "the preview carries each count's age")
+    check(t, text:find("no inventory data", 1, true) ~= nil,
+       "...and says so outright when there is no snapshot at all")
+    check(t, text:find("short", 1, true) ~= nil, "the shortfall is on the preview")
+    check(t, text:find("biggest need is filled first", 1, true) ~= nil,
+       "...next to the rule that decides who goes without")
+    check(t, text:find("include the bank", 1, true) ~= nil,
+       "the bank caveat is stated where the decision is made")
+    check(t, text:find("1 skipped", 1, true) ~= nil,
+       "the already-stocked character is summarised as a count, not listed name by name")
+    check(t, not text:find("|c", 1, true), "with no colour source, the preview is plain text")
+
+    local wrapped = B.PreviewText(previewPlan, { wrap = function(tok, s) return "<" .. tok .. ">" .. tostring(s) end })
+    check(t, wrapped:find("<text>Orn", 1, true) ~= nil, "a colour source is used when there is one")
+    check(t, pcall(B.PreviewText, B.BuildPlan(nil, nil)), "an empty plan still previews")
+
+    return report(t, verbose)
+end)

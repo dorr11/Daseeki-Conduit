@@ -18,6 +18,16 @@
     attached or sent until Accept. Guards: recipient validation, no self-send,
     soulbound/quest/unmailable exclusion (rules.lua), never hijack an in-progress
     draft, and abort on mailbox close / mail failure / relevant UI error.
+
+    THIS IS THE ONLY SEND PATH IN THE ADDON. A feature that mails something (the
+    rules engine, boons.lua's Chronoboon replenishment) builds a QUEUE and hands it
+    to Mail.RunQueue with its own dry-run text; it does not touch SendMail, the
+    attachment slots, or the confirm popup itself. That is what keeps one copy of
+    the hardware-event dance, one copy of the mailbox-close abort, and one confirm
+    gate that cannot be routed around.
+
+    A queue entry may ask for PART of a bag stack (`count` on a stack descriptor),
+    which is what makes "top this character up to ten" expressible; see attachMail.
 --]]
 
 local ADDON, ns = ...
@@ -35,9 +45,12 @@ local S = {
     sentMails     = 0,
     sentItems     = 0,
     sentGold      = 0,
+    sentUnits     = 0,     -- ITEMS, counted as units rather than as attachments
     awaitingClick = false, -- next mail pre-attached; waiting for a hardware click
     pendingCount  = 0,     -- attachments on the in-flight/prepared mail
+    pendingUnits  = 0,     -- units inside those attachments
     pendingGold   = 0,     -- copper on the in-flight/prepared mail
+    onFinish      = nil,   -- optional per-run completion callback (see RunQueue)
 }
 
 local function notifyPanel()
@@ -106,9 +119,23 @@ end
 -- still matches and lands in an attachment slot. Sets recipient/subject, and money
 -- for gold mails. Returns attachedCount (items) or true (gold). SendMail is NOT
 -- called here — the caller fires it from a hardware event.
+--
+-- PARTIAL STACKS, but only when the plan ASKED for a partial stack. A descriptor
+-- carrying `exact = true` sends its `count` and no more: SplitContainerItem puts
+-- that many on the cursor and leaves the remainder in the slot, which is what lets
+-- one mail carry SEVEN of a stack of ten and a later mail in the same run carry the
+-- other three (boons.lua plans exactly that — top each character up to ten, no more).
+--
+-- WITHOUT that flag the whole stack is picked up, exactly as it always was, and that
+-- is deliberate: a rule saying "send all my herbs" means all of them, including any
+-- that landed in the slot between the scan and the attach. Only a top-up has a
+-- reason to leave some behind, so only a top-up opts in.
+--
+-- The ask is always CLAMPED to what the slot really holds now — bags shift between
+-- the plan and the attach, and asking for more than exists is how a batch stalls.
 local function attachMail(mail)
     clearForm()
-    local attached = 0
+    local attached, units = 0, 0
 
     if mail.stacks then
         local C = C_Container
@@ -117,15 +144,26 @@ local function attachMail(mail)
             local info = Rules.SlotInfo(st.bag, st.slot)
             -- The slot must still hold the SAME itemID and still be mailable.
             if info and info.itemID == st.itemID and Rules.IsMailable(info) then
+                local have = tonumber(info.count) or 1
+                local want = st.exact and tonumber(st.count) or have
+                if not want or want > have then want = have end
+                if want < 1 then want = 1 end
+
                 local nextSlot = attached + 1
                 ClearCursor()
-                if C and C.PickupContainerItem then C.PickupContainerItem(st.bag, st.slot) end
+                if want < have and C and C.SplitContainerItem then
+                    C.SplitContainerItem(st.bag, st.slot, want)
+                elseif C and C.PickupContainerItem then
+                    C.PickupContainerItem(st.bag, st.slot)
+                    want = have
+                end
                 if CursorHasItem() then
                     ClickSendMailItemButton(nextSlot)
                     -- Verify it actually landed; an item the server refuses (conjured,
                     -- etc.) is skipped rather than allowed to stall the batch.
                     if GetSendMailItem and GetSendMailItem(nextSlot) then
                         attached = nextSlot
+                        units = units + want
                     else
                         ClearCursor()
                     end
@@ -147,6 +185,7 @@ local function attachMail(mail)
     end
 
     S.pendingCount = attached
+    S.pendingUnits = units
     return mail.money and true or attached
 end
 
@@ -154,7 +193,8 @@ end
 
 local function resetState()
     S.active, S.queue, S.idx = false, nil, 0
-    S.awaitingClick, S.pendingCount, S.pendingGold = false, 0, 0
+    S.awaitingClick, S.pendingCount, S.pendingUnits, S.pendingGold = false, 0, 0, 0
+    S.onFinish = nil
 end
 
 function Mail.IsActive() return S.active end
@@ -188,13 +228,20 @@ end
 Mail.Abort = abort
 
 local function finish()
-    local mails, items, gold = S.sentMails, S.sentItems, S.sentGold
+    local mails, items, gold, units = S.sentMails, S.sentItems, S.sentGold, S.sentUnits
+    local done = S.onFinish
     resetState()
     if mails > 0 then
         local goldStr = (gold > 0 and GetCoinTextureString) and (" and " .. GetCoinTextureString(gold)) or ""
         say(("done — sent %d mail(s), %d item(s)%s."):format(mails, items, goldStr))
     else
         say("nothing to send.")
+    end
+    -- A caller that supplied its own completion line (RunQueue) gets it AFTER the
+    -- generic one, and only on a clean finish: an aborted run already said why it
+    -- stopped, and a second report of a plan that did not happen is noise.
+    if done then
+        ns:SafeCall(done, { mails = mails, items = items, units = units, gold = gold })
     end
     notifyPanel()
 end
@@ -218,6 +265,12 @@ local function armNext()
             if mail.money and mail.money > 0 then
                 say(("mail %d/%d ready: %s to %s. Click %s.")
                     :format(S.idx, total, GetCoinTextureString and GetCoinTextureString(mail.money) or (mail.money .. "c"), mail.recipient, sendNext))
+            elseif mail.unitLabel then
+                -- A units mail (boons): "3 attachments" is meaningless when what the
+                -- player asked for was seven Chronoboon Displacers, so say the thing
+                -- they asked for.
+                say(("mail %d/%d ready: %d %s to %s. Click %s.")
+                    :format(S.idx, total, S.pendingUnits, mail.unitLabel, mail.recipient, sendNext))
             else
                 say(("mail %d/%d ready: %d item(s) to %s. Click %s.")
                     :format(S.idx, total, S.pendingCount, mail.recipient, sendNext))
@@ -250,7 +303,7 @@ end
 
 -- Begin a confirmed run. Called ONLY from the confirm popup's Accept (hardware
 -- event) so the first SendMail is legal and the confirm gate can't be bypassed.
-local function beginConfirmed(queue)
+local function beginConfirmed(queue, onFinish)
     if S.active then return end
     if type(queue) ~= "table" or #queue == 0 then return end
     if not sendFrameReady() then
@@ -265,8 +318,9 @@ local function beginConfirmed(queue)
     end
 
     S.active, S.queue, S.idx = true, queue, 1
-    S.sentMails, S.sentItems, S.sentGold = 0, 0, 0
+    S.sentMails, S.sentItems, S.sentGold, S.sentUnits = 0, 0, 0, 0
     S.awaitingClick = false
+    S.onFinish = (type(onFinish) == "function") and onFinish or nil
 
     local n = attachMail(queue[1])
     if not ((queue[1].money and queue[1].money > 0) or (type(n) == "number" and n > 0)) then
@@ -288,7 +342,7 @@ StaticPopupDialogs["DASEEKI_CONDUIT_SEND_CONFIRM"] = {
     button1 = YES,
     button2 = CANCEL,
     OnAccept = function(_, data)
-        if data and data.queue then beginConfirmed(data.queue) end
+        if data and data.queue then beginConfirmed(data.queue, data.onFinish) end
     end,
     timeout = 0, whileDead = true, hideOnEscape = true, showAlert = true,
     preferredIndex = 3,  -- avoid taint from the default StaticPopup pool
@@ -330,10 +384,11 @@ end
 
 -- ── Public entry points (called by the panel) ────────────────────────────────
 
--- Start a run for a specific list of rules (single rule, or all enabled). Builds
--- the queue, runs the guards, and shows the mandatory confirm popup. Returns
--- true if a popup was shown, false + reason otherwise.
-function Mail.RunForRules(rules)
+-- The gate every run passes, whoever built the queue: not already sending, not
+-- opted out here, a mailbox with a usable Send tab, and a Send Mail form we are
+-- not about to trample. Factored out so a second FEATURE can ride the one send
+-- engine without a second copy of its safety checks drifting away from this one.
+local function readyToSend()
     if S.active then
         say("already sending — finish or close the mailbox first.")
         return false, "busy"
@@ -350,6 +405,37 @@ function Mail.RunForRules(rules)
         say("the Send Mail form already has a recipient, subject, body, or attachment. Clear it first.")
         return false, "draft"
     end
+    return true
+end
+
+-- Run an ALREADY-BUILT queue behind the same mandatory confirm popup, with the
+-- caller's own dry-run text as the popup body. This is the seam a feature uses to
+-- reach the send engine — the confirm gate, the one-mail-per-click stepping, the
+-- postage-aware attach, the mailbox-close abort and the MAIL_FAILED handling all
+-- come with it, and none of them may be reimplemented anywhere else.
+--
+--   opts = { onFinish = function(stats) end }   -- stats: mails/items/units/gold
+--
+-- Returns true if a popup was shown, false + reason otherwise.
+function Mail.RunQueue(queue, text, opts)
+    local ok, why = readyToSend()
+    if not ok then return false, why end
+    if type(queue) ~= "table" or #queue == 0 then
+        say("nothing to send.")
+        return false, "empty"
+    end
+    opts = (type(opts) == "table") and opts or {}
+    StaticPopup_Show("DASEEKI_CONDUIT_SEND_CONFIRM", text or "Send?", nil,
+        { queue = queue, onFinish = opts.onFinish })
+    return true
+end
+
+-- Start a run for a specific list of rules (single rule, or all enabled). Builds
+-- the queue, runs the guards, and shows the mandatory confirm popup. Returns
+-- true if a popup was shown, false + reason otherwise.
+function Mail.RunForRules(rules)
+    local okReady, whyReady = readyToSend()
+    if not okReady then return false, whyReady end
 
     local me = UnitName and UnitName("player") or ""
     local money = GetMoney and GetMoney() or 0
@@ -409,8 +495,9 @@ ns:RegisterEvent("MAIL_SEND_SUCCESS", function()
     if not S.active then return end
     S.sentMails = S.sentMails + 1
     S.sentItems = S.sentItems + (S.pendingCount or 0)
+    S.sentUnits = S.sentUnits + (S.pendingUnits or 0)
     S.sentGold  = S.sentGold  + (S.pendingGold or 0)
-    S.pendingCount, S.pendingGold = 0, 0
+    S.pendingCount, S.pendingUnits, S.pendingGold = 0, 0, 0
     armNext()
 end)
 

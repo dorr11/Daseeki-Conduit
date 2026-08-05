@@ -181,7 +181,18 @@ end
 -- Class is first-explicit-wins, which favours the character graph: the collector
 -- walks accounts before inventory, and the character record is the more current of
 -- the two (the inventory payload is a snapshot taken at a bag scan).
-local function fold(acc, order, key, rec, ctx)
+--
+-- Level is HIGHEST-WINS rather than first-wins, because in Classic Era a level only
+-- ever goes up: whichever graph carries the bigger number is the more recent truth,
+-- and 0 / absent / non-numeric is UNKNOWN and never overwrites a real level.
+--
+-- Item counts come only from the inventory graph, and the NEWEST STAMP wins (an
+-- unstamped payload fills an empty slot but never displaces a stamped one). The map
+-- is kept BY REFERENCE and never copied — this file's contract is read-only on
+-- another addon's saved table, so a reference costs nothing and no reader of it is
+-- permitted to write. `stamp` is the owning entry's `updatedAt`, which lives on the
+-- wrapper rather than on the payload, hence the extra argument.
+local function fold(acc, order, key, rec, ctx, stamp)
     local name, realm = Network.SplitKey(key)
     if not name then return end
     if ctx.realm ~= "" and normRealm(realm) ~= ctx.realm then return end
@@ -206,6 +217,22 @@ local function fold(acc, order, key, rec, ctx)
     end
 
     if slot.class == nil then slot.class = classToken(rec) end
+
+    if type(rec) == "table" then
+        local lvl = tonumber(rec.level)
+        if lvl and lvl > 0 and (slot.level == nil or lvl > slot.level) then
+            slot.level = math.floor(lvl)
+        end
+
+        if type(rec.itemCounts) == "table" then
+            local at = tonumber(stamp) or tonumber(rec.ts)
+            if slot.counts == nil then
+                slot.counts, slot.countsAt = rec.itemCounts, at
+            elseif at and (slot.countsAt == nil or at > slot.countsAt) then
+                slot.counts, slot.countsAt = rec.itemCounts, at
+            end
+        end
+    end
 end
 
 -- The one collector. `G` defaults to the live globals; `me` is
@@ -217,8 +244,14 @@ end
 --       realm   = "Whitemane",   -- as the Nexus key spelled it (space-stripped)
 --       faction = "Horde"|nil,   -- nil = unknown, and unknown is never labelled
 --       class   = "WARLOCK"|nil, -- upper-case token, for the class colour
+--       level   = 60|nil,        -- highest sighting; nil = never recorded
+--       counts  = <table>|nil,   -- Nexus's itemCounts map, BY REFERENCE, read-only
+--       countsAt= <epoch>|nil,   -- when that map was stamped (its staleness)
 --       otherFaction = true|nil} -- explicit conflict with `me` — the ONLY flag the
 --                                -- label layer is allowed to act on
+--
+-- The label layer reads only name/class/faction; level and counts exist for the
+-- boon planner (boons.lua), which needs to know WHO is 60 and WHAT they hold.
 -- Order: same-faction-and-unknown first, then the explicit cross-faction tail, each
 -- group sorted case-insensitively with the raw string as tiebreak (pairs() order is
 -- not reproducible, so two spellings that fold together must still sort the same way
@@ -268,7 +301,8 @@ function Network.CollectAlts(G, me)
             if type(owners) == "table" then
                 for key, entry in pairs(owners) do
                     local payload = (type(entry) == "table") and entry.data or nil
-                    fold(acc, order, key, payload, ctx)
+                    local stamp   = (type(entry) == "table") and tonumber(entry.updatedAt) or nil
+                    fold(acc, order, key, payload, ctx, stamp)
                 end
             end
         end
@@ -298,6 +332,32 @@ function Network.CollectAltNames(G, me)
     local out = {}
     for _, e in ipairs(Network.CollectAlts(G, me)) do out[#out + 1] = e.name end
     return out
+end
+
+-- How many of `itemID` an entry's Nexus snapshot says that character holds.
+--
+-- ZERO IS THE ANSWER FOR "NO SNAPSHOT" as well as for "a snapshot that says none",
+-- and the two are NOT the same thing: `countsAt` is what tells them apart, and any
+-- caller that acts on a count is expected to show its age. Guarded end to end, so a
+-- junk map in another addon's saved table reads as zero rather than erroring.
+function Network.ItemCount(entry, itemID)
+    if type(entry) ~= "table" or type(entry.counts) ~= "table" then return 0 end
+    local n = tonumber(entry.counts[itemID])
+    if not n or n ~= n or n < 0 then return 0 end
+    return math.floor(n)
+end
+
+-- The roster row for a base name (case-insensitive, realm suffix ignored), or nil.
+function Network.FindEntry(entries, name)
+    if type(entries) ~= "table" or type(name) ~= "string" then return nil end
+    local want = (name:match("^([^-]+)") or name):match("^%s*(.-)%s*$"):lower()
+    if want == "" then return nil end
+    for _, e in ipairs(entries) do
+        if type(e) == "table" and type(e.name) == "string" and e.name:lower() == want then
+            return e
+        end
+    end
+    return nil
 end
 
 -- ════════════════════════════════════════════════════════════════════════════
@@ -418,6 +478,26 @@ end
 -- The ready-to-hand choice list for the rule editor's Alt dropdown.
 function Network.GetAltChoices()
     return Network.BuildAltChoices(Network.GetAlts(), {
+        classColors = _G.RAID_CLASS_COLORS,
+        tagColor    = mutedEscape(),
+    })
+end
+
+-- The same-realm roster INCLUDING the logged-in character.
+--
+-- The Alt picker must never offer you yourself — mail to self is refused, so the row
+-- would only ever be a trap. A SOURCE picker is the opposite case: the bank alt you
+-- are designating is very often the character you are sitting on while you designate
+-- it, and leaving it out would make the setting impossible to complete from there.
+-- Same collector, same store reads, same class colours; only `me.name` is withheld.
+function Network.GetRoster()
+    local me = whoAmI()
+    return Network.CollectAlts(_G, { name = nil, realm = me.realm, faction = me.faction })
+end
+
+-- The roster as dropdown rows (bare name as value, decorated label as text).
+function Network.GetRosterChoices()
+    return Network.BuildAltChoices(Network.GetRoster(), {
         classColors = _G.RAID_CLASS_COLORS,
         tagColor    = mutedEscape(),
     })

@@ -32,6 +32,14 @@ click at any open mailbox — no more manual alt-shuffling.
   skipped silently; a full friends list gets one explanatory line. With
   **Daseeki-Nexus** installed the recipient list travels the mesh, so a bank alt
   configured on one account is friended by characters on every account.
+- **Chronoboon replenishment** (needs **Daseeki-Nexus**) — nominate one character
+  as the boon source; at a mailbox on that character one button tops every
+  level-60 character in the mesh up to 10 Chronoboon Displacers, one mail each,
+  exactly the amount each is short. The confirm screen shows every character, the
+  amount, what they were last known to hold and **how old that count is**. When
+  bags cannot cover everybody the biggest need is filled first and the shortfall
+  is stated before you accept and again when the run ends. Counts come from Nexus
+  and include the bank.
 
 ## Usage
 
@@ -52,5 +60,7 @@ click at any open mailbox — no more manual alt-shuffling.
 
 - `harness/run-selftests.cmd` runs the headless gates under real Lua 5.1: parse
   every file the `.toc` lists, the clean-room firewall, the shipped pure
-  self-test suites, SavedVariables additivity, and an end-to-end auto-friend
-  drive against a stubbed friends list. Exit 0 = all pass.
+  self-test suites, SavedVariables additivity, an end-to-end auto-friend
+  drive against a stubbed friends list, and a MUTATION TEST of the boon plan
+  builder (twelve one-operator mutants, all of which must be killed by the
+  suites). Exit 0 = all pass.

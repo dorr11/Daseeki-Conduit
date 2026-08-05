@@ -22,6 +22,9 @@
 --   FRIEND   the REAL Friends.RunPass against a stubbed C_FriendList:
 --            adds once, marks, never re-adds — including after the user
 --            deliberately unfriends — and stops cleanly at the list cap.
+--   MUT      MUTATION TEST of the boon plan builder: twelve one-operator
+--            mutants of boons.lua, every one of which must be killed by the
+--            checks. A survivor is a rule the suite only appears to cover.
 --
 -- Usage:  lua5.1 run-selftests.lua [CONDUIT_DIR]   (exit 0 = ALL PASS)
 -- =====================================================================
@@ -142,7 +145,7 @@ local function chatClear() for i = #CHAT, 1, -1 do CHAT[i] = nil end end
 -- Load the REAL addon files into one shared namespace, in .toc order.
 ----------------------------------------------------------------------
 local ns = {}
-local LOAD = { "core.lua", "rules.lua", "migrate.lua", "network.lua",
+local LOAD = { "core.lua", "rules.lua", "migrate.lua", "network.lua", "boons.lua",
                "friends.lua", "syncbridge.lua", "selftest.lua" }
 for _, rel in ipairs(LOAD) do
     local chunk, err = loadfile(P(rel))
@@ -171,6 +174,9 @@ else
     ck(chatFind("sync-bridge:") ~= nil, "the sync-bridge suite ran")
     ck(chatFind("network:") ~= nil, "the network suite ran")
     ck(chatFind("mailbox-close:") ~= nil, "the mailbox-teardown suite ran")
+    ck(chatFind("boon-plan:") ~= nil, "the boon plan-builder suite ran")
+    ck(chatFind("boon-arming:") ~= nil, "the boon arming-matrix suite ran")
+    ck(chatFind("boon-queue:") ~= nil, "the boon queue/preview suite ran")
 end
 
 ----------------------------------------------------------------------
@@ -194,6 +200,20 @@ do
         "...and dismisses the send-confirm popup with it")
     sourceHas("core.lua", 'mf:HookScript("OnHide"',
         "core.lua hooks MailFrame OnHide as well as MAIL_CLOSED")
+    -- THERE IS ONE SEND PATH. Boon replenishment must ride mail.lua's confirm-first
+    -- engine, not grow a second one; a regression that reaches for SendMail from
+    -- boons.lua (or skips the confirm popup) fails right here.
+    sourceHas("boons.lua", "ns.Mail.RunQueue",
+        "boons.lua sends through the shared mail engine")
+    do
+        local src = readFile(P("boons.lua")) or ""
+        ck(src:find("SendMail", 1, true) == nil,
+           "...and never calls SendMail itself (the confirm gate cannot be routed around)")
+        ck(src:find("StaticPopup_Show", 1, true) == nil,
+           "...nor raises its own send popup")
+    end
+    sourceHas("mail.lua", "SplitContainerItem",
+        "mail.lua can attach PART of a stack (a top-up to ten is not a whole stack)")
 end
 if FAILS > 0 then realprint("=== GATE SUITES: FAIL ==="); os.exit(1) end
 realprint("=== GATE SUITES: PASS ===\n")
@@ -363,6 +383,152 @@ ck(tostring(ns.SyncBridge._lastReject):find("newer") ~= nil, "(l) ...with a read
 realprint("=== GATE FRIEND: " .. (FAILS == 0 and "PASS" or "FAIL") .. " ===\n")
 
 ----------------------------------------------------------------------
+-- GATE MUT: MUTATION-TEST THE BOON PLAN BUILDER
+--
+-- The plan builder decides who receives ten scarce consumables and who receives
+-- none, off a snapshot that is always a little out of date. "The suite is green"
+-- is not evidence that the suite would NOTICE a broken builder, so this gate
+-- proves it: each mutant below is boons.lua with one operator flipped, and every
+-- one of them MUST be killed by the checks. A surviving mutant means a rule the
+-- tests only appear to cover, and it fails the build.
+--
+-- The checks below deliberately duplicate the shipped suite's core assertions
+-- rather than calling into it: the shipped suite prints through ns:Print and
+-- reports pass/fail counts, whereas a mutation gate needs one boolean per mutant.
+----------------------------------------------------------------------
+realprint("=== GATE MUT: mutation-test the boon plan builder ===")
+do
+    local ITEM = 184937
+    local function ch(name, level, have, extra)
+        local e = { name = name, level = level }
+        if have ~= nil then e.counts = { [ITEM] = have } end
+        for k, v in pairs(extra or {}) do e[k] = v end
+        return e
+    end
+    -- The load-bearing behaviour, as one boolean. Any error counts as a kill.
+    local function planChecks(B)
+        local function run()
+            local function P(entries, over)
+                local o = { source = "Bankalt", faction = "Alliance", stock = 999, itemID = ITEM }
+                for k, v in pairs(over or {}) do o[k] = v end
+                return B.BuildPlan(entries, o)
+            end
+            local function at(p, i) return p.targets[i] end
+            local function order(p)
+                local out = {}
+                for _, x in ipairs(p.targets) do out[#out + 1] = x.name .. ":" .. x.send end
+                return table.concat(out, ",")
+            end
+
+            -- the owner's example, verbatim
+            local mesh = { ch("Poonyx", 60, 3), ch("Shalk", 60, 9), ch("Orn", 60, 0) }
+            local p = P(mesh)
+            if #p.targets ~= 3 then return false end
+            if order(p) ~= "Orn:10,Poonyx:7,Shalk:1" then return false end
+            if p.totalNeed ~= 18 or p.totalSend ~= 18 or p.shortfall ~= 0 then return false end
+
+            -- rationing under a shortfall
+            local s = P(mesh, { stock = 12 })
+            if order(s) ~= "Orn:10,Poonyx:2,Shalk:0" then return false end
+            if s.totalSend ~= 12 or s.shortfall ~= 6 or s.remaining ~= 0 then return false end
+
+            -- filters
+            -- Zerolevel is here on purpose: Nexus writes level 0 for "never
+            -- captured", so 0 must land in unknownLevel and NOT in under-level.
+            local f = P({ ch("Bankalt", 60, 0), ch("Lowbie", 30, 0), ch("Nolevel", nil, 0),
+                          ch("Zerolevel", 0, 0),
+                          ch("Hordie", 60, 0, { faction = "Horde" }), ch("Keep", 60, 0),
+                          ch("Stocked", 60, 10) })
+            if #f.targets ~= 1 or at(f, 1).name ~= "Keep" then return false end
+            if f.counts.source ~= 1 or f.counts.level ~= 1 or f.counts.unknownLevel ~= 2
+               or f.counts.faction ~= 1 or f.counts.stocked ~= 1 then return false end
+
+            -- an absent count is a full ten
+            local g = P({ ch("Ghost", 60, nil) })
+            if #g.targets ~= 1 or at(g, 1).send ~= 10 or at(g, 1).have ~= 0 then return false end
+
+            -- equal needs are ordered by name
+            if order(P({ ch("zeta", 60, 4), ch("Alpha", 60, 4) })) ~= "Alpha:6,zeta:6" then return false end
+
+            -- ages
+            if B.FormatAge(89) ~= "just now" or B.FormatAge(90) ~= "1m" then return false end
+            if B.FormatAge(3600) ~= "1h" or B.FormatAge(172800) ~= "2d" then return false end
+            local NOW = 1700000000
+            local a = B.BuildPlan({ ch("Aged", 60, 1, { countsAt = NOW - 7200 }) },
+                                  { source = "S", stock = 99, itemID = ITEM, now = NOW })
+            if at(a, 1).ageText ~= "2h" then return false end
+            return true
+        end
+        local okRun, res = pcall(run)
+        return okRun and res == true
+    end
+
+    local SRC = readFile(P("boons.lua"))
+    ck(SRC ~= nil, "boons.lua is readable")
+
+    -- Sanity: the REAL builder must pass the very checks the mutants must fail.
+    ck(planChecks(ns.Boons), "the shipped plan builder passes the mutation checks")
+
+    -- name, exact source fragment, replacement. Each fragment must appear ONCE.
+    local MUTANTS = {
+        { "source filter inverted",      "if lower == srcName then",
+                                         "if lower ~= srcName then" },
+        { "faction filter inverted",     "side ~= srcSide then",
+                                         "side == srcSide then" },
+        { "unknown level admitted",      "elseif not lvl or lvl <= 0 then",
+                                         "elseif not lvl or lvl < 0 then" },
+        { "level boundary off by one",   "elseif lvl < minLevel then",
+                                         "elseif lvl <= minLevel then" },
+        { "need arithmetic flipped",     "local need = target - have",
+                                         "local need = target + have" },
+        { "stocked boundary off by one", "if need <= 0 then",
+                                         "if need < 0 then" },
+        { "rationing order reversed",    "if a.need ~= b.need then return a.need > b.need end",
+                                         "if a.need ~= b.need then return a.need < b.need end" },
+        { "name tiebreak reversed",      "if la ~= lb then return la < lb end\n        return a.name < b.name",
+                                         "if la ~= lb then return la > lb end\n        return a.name < b.name" },
+        { "stock clamp removed",         "if give > remaining then give = remaining end",
+                                         "if give > remaining then give = give end" },
+        { "stock never consumed",        "remaining = remaining - give",
+                                         "remaining = remaining - 0" },
+        { "shortfall sign flipped",      "plan.shortfall  = plan.totalNeed - plan.totalSend",
+                                         "plan.shortfall  = plan.totalSend - plan.totalNeed" },
+        { "age threshold moved",         'if n < 90 then return "just now" end',
+                                         'if n < 900 then return "just now" end' },
+    }
+
+    local survivors = 0
+    for _, m in ipairs(MUTANTS) do
+        local name, from, to = m[1], m[2], m[3]
+        local head, tail = SRC:find(from, 1, true)
+        if not head then
+            fail("MUTANT '" .. name .. "': its source fragment no longer exists (stale mutation)")
+        elseif SRC:find(from, tail + 1, true) then
+            fail("MUTANT '" .. name .. "': fragment is not unique (the mutation is ambiguous)")
+        else
+            local mutated = SRC:sub(1, head - 1) .. to .. SRC:sub(tail + 1)
+            local chunk, cerr = loadstring(mutated, "@mutant:" .. name)
+            if not chunk then
+                ok("MUTANT killed at compile: " .. name .. " (" .. tostring(cerr) .. ")")
+            else
+                local mutNs = { Network = ns.Network }
+                local loaded = pcall(chunk, ADDON_NAME, mutNs)
+                if not loaded or type(mutNs.Boons) ~= "table" then
+                    ok("MUTANT killed at load: " .. name)
+                elseif planChecks(mutNs.Boons) then
+                    survivors = survivors + 1
+                    fail("MUTANT SURVIVED: " .. name .. " — the checks do not cover this rule")
+                else
+                    ok("MUTANT killed: " .. name)
+                end
+            end
+        end
+    end
+    ck(survivors == 0, "every mutant of the plan builder is killed")
+end
+realprint("=== GATE MUT: " .. (FAILS == 0 and "PASS" or "FAIL") .. " ===\n")
+
+----------------------------------------------------------------------
 realprint("############################################################")
 realprint("# Daseeki-Conduit self-tests")
 realprint("#   GATE 0      toc parse             : PASS")
@@ -370,6 +536,7 @@ realprint("#   GATE FW     clean-room firewall   : PASS")
 realprint("#   GATE SUITES shipped pure suites   : PASS")
 realprint("#   GATE SV     additive SavedVariables : " .. (FAILS == 0 and "PASS" or "FAIL"))
 realprint("#   GATE FRIEND real auto-friend pass : " .. (FAILS == 0 and "PASS" or "FAIL"))
+realprint("#   GATE MUT    boon plan mutations  : " .. (FAILS == 0 and "PASS" or "FAIL"))
 realprint("#")
 realprint("#   RESULT: " .. (FAILS == 0 and "ALL PASS" or (FAILS .. " FAILURE(S) — RED")))
 realprint("############################################################")

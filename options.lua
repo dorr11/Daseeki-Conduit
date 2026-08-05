@@ -625,6 +625,39 @@ function Options.Build(flow)
     })
     L:Hint("Blizzard only asks you to confirm mail to someone who is not on your friends list. Each recipient is added once per character — unfriend one and it stays unfriended.")
 
+    -- ── Chronoboon replenishment ──────────────────────────────────────────────
+    -- One setting: WHO sends. Everything else about the feature is derived — who
+    -- needs boons comes from Nexus, how many can go comes from that character's
+    -- bags at the mailbox. The picker is the SAME roster machinery as the rule
+    -- editor's Alt dropdown (network.lua: one collector, one set of class colours,
+    -- one cross-faction tag), differing in exactly one way: it offers the
+    -- logged-in character too, because the bank alt is usually the one you are
+    -- standing on while you set this up.
+    L:AddSection("Chronoboon Replenishment")
+    local boonChoices = { { value = "", text = "— none —" } }
+    if ns.Network and ns.Network.GetRosterChoices then
+        for _, choice in ipairs(ns.Network.GetRosterChoices()) do
+            boonChoices[#boonChoices + 1] = choice
+        end
+    end
+    -- A source configured on another realm (or before Nexus saw that character)
+    -- must still show as the current value rather than silently reading "none".
+    local savedSource = ns.Boons and ns.Boons.GetSource()
+    if savedSource then
+        local seen = false
+        for _, c in ipairs(boonChoices) do if c.value == savedSource then seen = true end end
+        if not seen then boonChoices[#boonChoices + 1] = { value = savedSource, text = savedSource } end
+    end
+    L:Dropdown({
+        label = "Sends from", width = 200, choices = boonChoices,
+        get = function() return (ns.Boons and ns.Boons.GetSource()) or "" end,
+        set = function(v)
+            if ns.Boons then ns.Boons.SetSource(v) end
+            refreshAll()
+        end,
+    })
+    L:Hint("At a mailbox on that character, one click tops every level-60 character in your Nexus mesh up to 10 Chronoboon Displacers — biggest need first when there are not enough to go round. You see every character and amount before anything sends. Counts come from Nexus and include the bank, so a character with boons banked reads as stocked.")
+
     L:AddSection("This Character")
     L:Checkbox({
         label = "Disable Conduit on this character",

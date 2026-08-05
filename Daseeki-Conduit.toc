@@ -14,6 +14,7 @@ core.lua
 rules.lua
 migrate.lua
 network.lua
+boons.lua
 mail.lua
 friends.lua
 syncbridge.lua

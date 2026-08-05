@@ -8,6 +8,11 @@
     progress line, and — during an active run — a "Send Next" button that drives
     each continuation mail (SendMail needs a hardware event, so the click is real).
 
+    Above Run All sits the optional BOON ROW (Chronoboon replenishment): the button
+    on the designated source character, a muted one-liner naming that character
+    everywhere else, and nothing at all until a source has been designated. All of
+    the deciding is boons.lua's ButtonState — this file only draws the answer.
+
     Style-guide compliance: DaseekiUI tokens only (no hardcoded colors/fonts),
     every frame sets BOTH dimensions at creation, compact/labeled layout, no
     Sushi/Poncho. Errors surface via geterrorhandler (ns:SafeCall), never swallowed.
@@ -27,6 +32,7 @@ local HEADER_H  = 22
 local ROW_H     = 34
 local SEND_W    = 54
 local FOOT_H    = 78   -- footer band: Run All + Send Next + progress
+local BOON_H    = 28   -- the boon row's extra footer height, when it is drawn at all
 
 local frame       -- the panel frame (lazy)
 local rowPool = {}
@@ -108,7 +114,7 @@ local function build()
         t:SetPoint("TOPRIGHT", f, "TOPRIGHT", -1, -1)
         t:SetHeight(PAD + HEADER_H)
     end)
-    flatBacker(function(t)
+    f.footBacker = flatBacker(function(t)
         t:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 1, 1)
         t:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -1, 1)
         t:SetHeight(FOOT_H + PAD)
@@ -234,6 +240,52 @@ local function build()
     sendNext:Hide()
     f.sendNext = sendNext
 
+    -- ── The boon row (Chronoboon replenishment) ───────────────────────────────
+    --
+    -- One row, three possible faces, and MOST OF THE TIME NONE OF THEM: the whole
+    -- band is drawn only when a boon source has been designated, so a panel nobody
+    -- configured for this looks exactly as it did before the feature existed
+    -- (boons.lua ButtonState "off"). Where it does draw it is either the button —
+    -- on the source character, greyed when it cannot fire, exactly like Run All —
+    -- or one muted line saying who does the sending. Refresh() decides; see
+    -- layoutFooter for the height the decision costs.
+    local boonBtn = UI.MakeButton(f, { text = "Replenish Boons", width = PANEL_W - PAD * 2, height = 24 })
+    boonBtn:ClearAllPoints()
+    boonBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", PAD, PAD + 30 + BOON_H)
+    boonBtn:SetScript("OnClick", function()
+        ns:SafeCall(function() if ns.Boons then ns.Boons.Run() end end)
+    end)
+    -- The one caveat the numbers cannot state themselves: Nexus's per-character
+    -- counts are carried+bank+mail, so an alt with a drawer full of boons in the
+    -- BANK reads as stocked and is left out of the plan on purpose.
+    boonBtn:SetScript("OnEnter", function(self)
+        if not GameTooltip then return end
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:AddLine("Replenish Boons")
+        GameTooltip:AddLine("Tops every level-60 character in the mesh up to "
+            .. tostring(ns.Boons and ns.Boons.TARGET or 10) .. " Chronoboon Displacers,"
+            .. " biggest need first.", 1, 1, 1, true)
+        GameTooltip:AddLine("Counts come from Daseeki Nexus and include the bank — a"
+            .. " character with boons banked reads as stocked.", 1, 0.82, 0, true)
+        GameTooltip:AddLine("You will see every character and amount before anything sends.",
+            1, 0.82, 0, true)
+        GameTooltip:Show()
+    end)
+    boonBtn:SetScript("OnLeave", function() if GameTooltip then GameTooltip:Hide() end end)
+    boonBtn:Hide()
+    f.boonBtn = boonBtn
+
+    local boonHint = f:CreateFontString(nil, "OVERLAY")
+    boonHint:SetFontObject(UI.fonts.small)
+    boonHint:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", PAD, PAD + 30 + BOON_H + 4)
+    boonHint:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -PAD, PAD + 30 + BOON_H + 4)
+    boonHint:SetJustifyH("LEFT")
+    boonHint:SetHeight(24)
+    boonHint:SetWordWrap(true)
+    UI.Skin(boonHint, function(self) self:SetTextColor(UI.Color("muted")) end)
+    boonHint:Hide()
+    f.boonHint = boonHint
+
     local prog = f:CreateFontString(nil, "OVERLAY")
     prog:SetFontObject(UI.fonts.small)
     prog:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", PAD, PAD)
@@ -246,6 +298,20 @@ local function build()
 
     frame = f
     return f
+end
+
+-- The footer band grows by one row when the boon feature has something to show,
+-- and the rules list gives the space back. Both dimensions are still set at
+-- creation (build); this only re-anchors the list's bottom edge and re-heights the
+-- footer's flat backer, so an unconfigured panel is pixel-identical to 1.0.1's.
+local function layoutFooter(f, extra)
+    local h = FOOT_H + extra
+    if f._footH == h then return end
+    f._footH = h
+    f.listHost:ClearAllPoints()
+    f.listHost:SetPoint("TOPLEFT", f, "TOPLEFT", PAD, -(PAD + HEADER_H + 8))
+    f.listHost:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -PAD, h + PAD)
+    if f.footBacker then f.footBacker:SetHeight(h + PAD) end
 end
 
 -- ── Refresh (rebuild rows + sync footer/progress state) ───────────────────────
@@ -298,6 +364,30 @@ function Panel.Refresh()
     end
     f.child:SetHeight(math.max(1, y))
     f.empty:SetShown(shown == 0)
+
+    -- The boon row. Mid-batch (`awaiting`) it is hidden outright rather than
+    -- greyed: the footer belongs to Send Next while a run is stepping, and the row
+    -- comes back the moment the run ends.
+    local boonState, boonHint = "off", nil
+    if ns.Boons and not awaiting then boonState, boonHint = ns.Boons.State() end
+
+    if boonState == "off" then
+        f.boonBtn:Hide()
+        f.boonHint:Hide()
+        layoutFooter(f, 0)
+    elseif ns.Boons.StateShowsButton(boonState) then
+        f.boonHint:Hide()
+        f.boonBtn:Show()
+        local canBoon = (boonState == "armed")
+        f.boonBtn:SetEnabled(canBoon)
+        f.boonBtn:SetAlpha(canBoon and 1 or 0.4)
+        layoutFooter(f, BOON_H)
+    else
+        f.boonBtn:Hide()
+        f.boonHint:SetText(boonHint or "")
+        f.boonHint:Show()
+        layoutFooter(f, BOON_H)
+    end
 
     -- Footer buttons.
     if awaiting then

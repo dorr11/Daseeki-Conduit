@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased — 1.1.0
+
+- **Chronoboon replenishment.** Nominate one character as your boon source, and at
+  any mailbox on that character a single button tops every level-60 character in
+  your Nexus mesh back up to ten Chronoboon Displacers. It works out who is short
+  from the counts Nexus already keeps — one has three, one has nine, one has none,
+  so seven, one and ten go out — and mails each of them exactly what they are
+  missing, in one mail apiece.
+
+  Nothing leaves without you seeing it first. The confirm screen lists every
+  character, the amount going to each, what they were last known to be holding,
+  and **how old that count is**, because a character you have not logged into for
+  four days may have burned every boon since. A character Nexus has never seen the
+  bags of says so in as many words rather than quietly reading as empty.
+
+  If your bags cannot cover everybody, the character on zero is filled before the
+  character on nine, the shortfall is stated on the confirm screen before you
+  accept and again when the run finishes, and nobody is dropped from the list just
+  because there was nothing left for them. Counts come from Nexus and include the
+  bank, so a character with a drawer full of boons banked reads as stocked — the
+  button's tooltip and the settings hint both say so.
+
+  Set the source under **Chronoboon Replenishment** in `/conduit`; the picker lists
+  your characters in their class colours, the same as the rule editor's Alt picker,
+  and includes the character you are standing on. On every other character the
+  panel simply says who does the sending. Without Daseeki Nexus, or before it has
+  scanned anything, the feature says what it needs instead of guessing. Until you
+  nominate a source, the panel looks exactly as it did before.
+
 ## 1.0.1 — 2026-08-04
 
 - **Close the mail window and Conduit closes with it.** The panel now goes away the
