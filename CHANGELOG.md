@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.2.3 — 2026-08-05
 
 - **Found it. The game was attaching whole stacks, and never said so.** The log you
   sent back settled three rounds of guessing in one read. Every attempt in it was
