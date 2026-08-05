@@ -695,11 +695,23 @@ end
 -- with ages, which is the piece a user cannot otherwise see and the one that
 -- silently suppresses top-ups while it holds an entry.
 function Boons.Debug(arg)
-    if type(arg) == "string" and arg:lower():match("^clear") then
+    local sub = (type(arg) == "string") and arg:lower() or ""
+    if sub:match("^clear") then
         local n = ns.Ledger and ns.Ledger.Clear() or 0
         ns:Print(("outbound ledger cleared (%d entr%s dropped)."):format(n, n == 1 and "y" or "ies"))
         return
     end
+    if sub:match("^tracec") or sub:match("^clear%s*trace") then
+        local n = ns.Trace and ns.Trace.Clear() or 0
+        ns:Print(("attach trace cleared (%d entr%s dropped)."):format(n, n == 1 and "y" or "ies"))
+        return
+    end
+
+    -- THE BUILD, FIRST AND ALWAYS. Two rounds of field diagnosis were spent on
+    -- theories that assumed the running code was the code we had just written. One
+    -- glance at this line settles that before anything else is discussed.
+    ns:Print(("build %s (version %s)"):format(tostring(ns.BUILD), tostring(ns.VERSION)))
+
     local src = Boons.GetSource()
     ns:Print(("boon source: %s"):format(src or "not set"))
     local entries = roster()
@@ -741,6 +753,16 @@ function Boons.Debug(arg)
         ns:Print(("  form counts: %s   disagreements with the bag delta: %d   unreadable: %d")
             :format(cal and ("read from return #" .. cal) or "not calibrated yet",
                     d.formBagDisagree, d.formUnreadable))
+        ns:Print(("  form re-learned: %d time(s); form vetoes ignored: %d")
+            :format(d.decalibrations, d.formVetoDropped))
+    end
+
+    -- THE TRACE. One line here; the detail lives in SavedVariables
+    -- (DaseekiConduitDB.attachTrace) where it can be read after the fact.
+    if ns.Trace then
+        ns:Print("  " .. ns.Trace.Summary(ns.Trace.Ring(false), ns.Trace.CAP))
+        ns:Print("  (full per-draw detail is saved to DaseekiConduitDB.attachTrace —"
+            .. " /reload or log out to flush it, then send the file.)")
     end
 end
 

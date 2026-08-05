@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+- **The mails go out.** Two rounds of fixes did not stop boon mails being refused
+  with "the form holds 0", and the reason both rounds missed it is worth stating
+  plainly: the engine was asking the game a question it had not finished answering.
+
+  After putting items on the Send Mail form, the engine re-read the bag slot it had
+  just taken them from, one statement later, to check how many had moved. **This
+  client does not update bag counts that quickly** — it defers them to its next bag
+  event, the same way it defers releasing the slot locks. So the re-read returned
+  the number from *before* the split, the engine concluded that nothing had moved,
+  and it refused a mail whose items were sitting correctly on the form. Instantly,
+  every mail, first mail included, on perfectly still bags. An entire run confirmed
+  nothing.
+
+  The measurement now waits for your bags to agree before it judges anything, and
+  asks about the whole mail at once instead of one slot at a time. Nothing is sent
+  until what actually left your bags matches what the preview promised — the
+  guarantee is unchanged, it is simply no longer being checked against a number the
+  game had not written yet.
+
+- **A log you can send me.** Following the owner's ask — "do we need to enable some
+  sort of log to catch the issue so we dont continue to iterate on ghost fixes?" —
+  Conduit now records the last 40 attach attempts to its saved variables: which bag
+  slots it drew from, what each held, whether they were locked, which game call it
+  used and what came back, what the form reported (every value, so the shape of an
+  undocumented call is settled once and for all), what the bags said, and the
+  verdict with its reason. **Every entry is stamped with the build that produced
+  it**, so a run on stale code is obvious at a glance instead of costing a round of
+  theories. `/conduit debug boons` prints the build and a one-line summary; the
+  detail lives in the saved-variables file.
+
+- **The engine stops trusting a guess it cannot check.** The position of the stack
+  count in the game's send-slot read is undocumented on this client, so Conduit
+  infers it. That inference can now be *wrong* — when it disagrees with the bag
+  arithmetic it is discarded and re-learned, rather than being allowed to overrule
+  the arithmetic. Previously one bad inference, made once, would quietly refuse
+  every mail for the rest of the session.
+
+- **An attach that comes away empty is retried, not skipped.** It used to be
+  dropped on the spot, which is precisely wrong for a mail that attached nothing
+  only because the bags had not caught up yet.
+
 - **Mails stopped arriving empty.** The first live hands-free boon run refused its
   whole tail: "Daseeki's mail should carry 3 Chronoboon Displacer but the form
   holds 0", and the same for the two after it, all inside one second. The safety

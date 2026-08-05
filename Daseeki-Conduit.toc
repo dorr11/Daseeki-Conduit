@@ -4,7 +4,7 @@
 ## Author: Daseeki
 ## X-License: All Rights Reserved
 ## X-Curse-Project-ID: 1638368
-## Version: 1.2.1
+## Version: 1.2.2
 ## SavedVariables: DaseekiConduitDB
 ## Dependencies: Daseeki-Core
 ## OptionalDeps: Daseeki-Nexus
@@ -15,6 +15,7 @@ rules.lua
 migrate.lua
 network.lua
 ledger.lua
+trace.lua
 boons.lua
 mail.lua
 friends.lua
