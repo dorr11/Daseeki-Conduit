@@ -147,7 +147,7 @@ local function chatClear() for i = #CHAT, 1, -1 do CHAT[i] = nil end end
 -- Load the REAL addon files into one shared namespace, in .toc order.
 ----------------------------------------------------------------------
 local ns = {}
-local LOAD = { "core.lua", "rules.lua", "migrate.lua", "network.lua", "ledger.lua", "trace.lua",
+local LOAD = { "core.lua", "rules.lua", "migrate.lua", "network.lua", "ledger.lua", "trace.lua", "staging.lua",
                "boons.lua", "friends.lua", "syncbridge.lua", "selftest.lua" }
 for _, rel in ipairs(LOAD) do
     local chunk, err = loadfile(P(rel))
@@ -218,8 +218,23 @@ do
         ck(src:find("StaticPopup_Show", 1, true) == nil,
            "...nor raises its own send popup")
     end
-    sourceHas("mail.lua", "SplitContainerItem",
-        "mail.lua can attach PART of a stack (a top-up to ten is not a whole stack)")
+    -- 1.2.3: THE SPLIT MOVED OUT OF THE ATTACH. Splitting onto the send form
+    -- delivers the whole stack on 11509 (the owner's capture), so the split lives in
+    -- staging.lua and happens bag-to-bag; mail.lua only ever picks stacks up whole.
+    sourceHas("staging.lua", "C.SplitContainerItem(job.bag, job.slot, job.count)",
+        "staging.lua splits BAG TO BAG, where the client behaves")
+    sourceHas("staging.lua", "C.PickupContainerItem(job.destBag, job.destSlot)",
+        "...and places the part-stack in an empty bag slot")
+    do
+        local m = readFile(P("mail.lua")) or ""
+        local attachFrom = m:find("local function attachMail", 1, true)
+        local attachTo   = m:find("local function verifyAttach", 1, true)
+        local body = (attachFrom and attachTo) and m:sub(attachFrom, attachTo) or m
+        ck(body:find("SplitContainerItem", 1, true) == nil,
+           "mail.lua's attach never splits a stack onto the send form (the 11509 defect)")
+        ck(m:find("local function pickupWhole", 1, true) ~= nil,
+           "...it takes whole stacks, or nothing")
+    end
 
     -- The 1.2.0 contract, pinned where a later edit cannot quietly walk it back.
     -- GATE ATTACH and GATE RUN drive all of this for real; these are the one-line
@@ -243,17 +258,20 @@ do
            "...before every re-arm, not just the first")
         ck(m:find("Rules.AnySlotLocked", 1, true) ~= nil,
            "...and a locked bag slot counts as 'still moving'")
-        ck(m:find("Rules.DrawExact(live, mail.units, ns.MAX_ATTACH)", 1, true) ~= nil,
-           "draws are re-derived from a fresh scan at arm time (coordinates go stale)")
-        ck(m:find('return "async"', 1, true) ~= nil,
-           "a split that took from the slot but not onto the cursor is never re-asked")
-        -- The over-attach itself: a whole-stack pickup that then REWRITES the ask to
-        -- match what it took. The clamp `if want > have then want = have end` is the
-        -- opposite operation (down, never up) and is meant to be there.
-        ck(m:find("C.PickupContainerItem(st.bag, st.slot)\n                        want = have", 1, true) == nil,
-           "...and never rewrites the ask to match a whole stack it picked up (the over-attach)")
-        ck(m:find("if want > have then want = have end", 1, true) ~= nil,
-           "...while the ask is still clamped DOWN to what the slot really holds")
+        ck(m:find("Rules.ComposeWhole(live, wantN, ns.MAX_ATTACH)", 1, true) ~= nil,
+           "draws are re-derived from a fresh scan at arm time, out of WHOLE stacks only")
+        -- The over-attach itself: an exact ask that gets rounded up to whatever the
+        -- slot happened to hold. It may only ever be REFUSED.
+        ck(m:find("if st.exact and want ~= have then", 1, true) ~= nil,
+           "...and an exact ask that is not a whole stack is refused, never rounded up")
+        ck(m:find("units    = units + have", 1, true) ~= nil,
+           "...with the units counted from the stack that was picked up, not from the ask")
+        -- 1.2.3: the bag subtraction reads zero on this client while an attachment is
+        -- on the form, so it may corroborate but must not be the authority.
+        ck(m:find("if planned and moved ~= nil and moved ~= 0 and moved ~= planned then", 1, true) ~= nil,
+           "a bag delta of ZERO means 'still in your bags', not 'nothing attached'")
+        ck(m:find("D.bagsRetained = D.bagsRetained + 1", 1, true) ~= nil,
+           "...and is counted, so a capture names the client behaviour")
         ck(m:find('ns:RegisterEvent("MAIL_SUCCESS"', 1, true) ~= nil,
            "the send ack keys on MAIL_SUCCESS")
         ck(m:find('ns:RegisterEvent("MAIL_SEND_SUCCESS"', 1, true) == nil,
@@ -753,7 +771,7 @@ local Sim = assert(loadfile(HARNESS_DIR .. "/mailsim.lua"))()
 local ITEM = 184937
 
 local ENGINE_FILES = { "rules.lua", "migrate.lua", "network.lua", "ledger.lua", "trace.lua",
-                       "boons.lua", "mail.lua" }
+                       "staging.lua", "boons.lua", "mail.lua" }
 
 -- Load a FRESH addon namespace against `sim`, optionally with a patched mail.lua
 -- (used to reconstruct the pre-fix engine for the red half of GATE ATTACH).
@@ -871,28 +889,25 @@ do
     local MAIL_SRC = readFile(P("mail.lua"))
     ck(MAIL_SRC ~= nil, "mail.lua is readable")
 
-    -- The pre-fix (1.2.0) engine, reconstructed from the shipped source by three
-    -- edits: the whole-stack fallback when a partial draw will not split, the
-    -- accounting that trusted the plan instead of the world, and the plan-time bag
-    -- coordinates that 1.2.1 now re-derives.
+    -- The pre-fix (1.2.0) engine, reconstructed from the shipped source by four
+    -- edits — the same four defects, re-expressed against 1.2.3's shape:
+    --   * an exact draw that is not a whole stack is TAKEN rather than refused
+    --     (that is the over-attach: ask for one, get the stack of ten);
+    --   * the accounting counts the ASK instead of what was picked up, so nothing
+    --     downstream can notice;
+    --   * plan-time bag coordinates, never re-derived;
+    --   * no staging pass, because in 1.2.0 there was none.
     local LEGACY = {
-        { [[    D.splitFailed = D.splitFailed + 1
-    return "nothing", "split"
-end]],
-          [[    D.splitFailed = D.splitFailed + 1
-    if C and C.PickupContainerItem then
-        C.PickupContainerItem(bag, slot)
-        if CursorHasItem() then return "delivered", "pickup" end
-    end
-    return "nothing", "split"
-end]] },
+        { "                if st.exact and want ~= have then", "                if false then" },
+        { "                            units    = units + have", "                            units    = units + want" },
         { "            if mail.itemID and tonumber(mail.units) and Rules.ScanStacksForItem then",
           "            if false then" },
+        { "    if ns.Staging then\n        notifyPanel()", "    if false then\n        notifyPanel()" },
     }
     local NO_GUARD = {
-        { "    if planned and moved ~= nil and moved ~= planned then",
-          "    if false then" },
-        { "    if planned and moved == nil and S.pendingUnits ~= planned then",
+        { "    if planned and staged ~= planned then", "    if false then" },
+        { "    if planned and onForm ~= nil and onForm ~= planned then", "    if false then" },
+        { "    if planned and moved ~= nil and moved ~= 0 and moved ~= planned then",
           "    if false then" },
     }
 
@@ -947,7 +962,7 @@ end]] },
         local src, err = bothEdits(MAIL_SRC, LEGACY, NO_GUARD)
         ck(src ~= nil, "(red) the pre-fix engine can be reconstructed" .. (src and "" or (" — " .. tostring(err))))
         if src then
-            local sim, _, erroSend = runFixture(src, { noSplit = true })
+            local sim, _, erroSend = runFixture(src)
             ck(erroSend ~= nil, "(red) the pre-fix engine sent Erro's mail")
             ck(erroSend and erroSend.units == 20,
                "(red) ...carrying 20 units — the live defect, reproduced ("
@@ -957,20 +972,26 @@ end]] },
         end
     end
 
-    -- GREEN A: the shipped attach, on a client whose split works, sends exactly 7.
+    -- GREEN A: the shipped engine, on the PROVEN client, sends exactly 7 — having
+    -- made the stacks it needed in the bags first.
     do
         local sim, n, erroSend = runFixture(nil)
         ck(erroSend ~= nil, "(green) the shipped engine sends Erro's mail")
         ck(erroSend and erroSend.units == 7,
            "(green) ...carrying exactly 7 — the plan, not the stacks (" .. tostring(erroSend and erroSend.desc) .. ")")
-        -- 1.2.1 re-derives the draws from a fresh scan at arm time, and DrawExact
-        -- takes the largest bite each slot can give — so the seven now come out of
-        -- one stack in ONE attachment instead of two. Fewer attachments is also
-        -- less postage; the number that matters is still the seven.
-        ck(erroSend and erroSend.attachments == 1,
-           "(green) ...in a single attachment, drawn fresh rather than from stale coordinates")
+        -- Every attachment is a WHOLE stack. That is the property that matters now,
+        -- not how many of them there are: a partial on the form comes back as ten.
+        local wholeOnly = true
+        for _, d in ipairs(n.Trace.Records(n.Trace.Ring(false))) do
+            for _, dr in ipairs(d.draws or {}) do
+                if dr.path == "pickup" and dr.want ~= dr.pre then wholeOnly = false end
+            end
+        end
+        ck(wholeOnly, "(green) ...and every attachment was a whole stack, never a split-to-form")
         ck(sim:BagUnits(ITEM) == 13, "(green) 13 boons left in the bags (20 - 7)")
         ck(chatFind("skipping Poonyx") ~= nil, "(green) the failing recipient is skipped, not sent to")
+        ck(n.Staging.Diagnostics().staged >= 1,
+           "(green) ...the exact amount was made in the bags, not on the form")
     end
 
     -- GREEN B: even with the pre-fix ATTACH restored, the guard alone refuses.
@@ -979,27 +1000,372 @@ end]] },
         local src = patch(MAIL_SRC, LEGACY)
         ck(src ~= nil, "(guard) the pre-fix attach can be restored on its own")
         if src then
-            local sim = runFixture(src, { noSplit = true })
+            local sim = runFixture(src)
             local overSent = false
             for _, m in ipairs(sim.sent) do if m.units > 7 then overSent = true end end
             ck(not overSent, "(guard) a poisoned attach is REFUSED — nothing over-planned is sent")
             ck(chatFind("not sending it") ~= nil, "(guard) ...and says so in plain language")
-            ck(chatFind("20 left your bags") ~= nil,
-               "(guard) ...naming what really moved (the settled bag arithmetic caught it)")
+            ck(chatFind("the form holds 20") ~= nil,
+               "(guard) ...naming what is really on the form (the witness that works on this client)")
             ck(sim:BagUnits(ITEM) == 20, "(guard) every boon is still in the bags")
         end
     end
 
-    -- And the same guard against a client that hands back MORE than was asked for.
+    -- And the same guard against a client that hands back MORE than was asked for
+    -- when STAGING splits a stack: a mis-sized staged stack never becomes a send.
     do
         local sim = runFixture(nil, { poison = function(_, _, n) return n + 2 end })
         local over = false
         for _, m in ipairs(sim.sent) do if m.units > 7 then over = true end end
         ck(not over, "(guard) a split that over-delivers is refused too, not sent")
     end
+
+    -- THE SPEC-BEHAVING CLIENT is kept as a secondary profile, and must still work:
+    -- a client that splits onto the form honestly, and empties the bag slot when it
+    -- does, is served by exactly the same pre-split path.
+    do
+        local sim = Sim.New(bagsOf({ 10, 10 }),
+            { behaviour = poonyxFails, formWholeStack = false, retainBags = false })
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, mesh(ROSTER))
+        sim:Advance(300)
+        local erro
+        for _, m in ipairs(sim.sent) do if m.recipient == "Erro" then erro = m end end
+        ck(erro and erro.units == 7, "(spec client) exactly 7 on a spec-behaving client too")
+        ck(sim:BagUnits(ITEM) == 13, "(spec client) ...and the bags are down by exactly 7")
+    end
 end
 local V_ATTACH = (FAILS == ATTACH_BEFORE)
 realprint("=== GATE ATTACH: " .. (V_ATTACH and "PASS" or "FAIL") .. " ===\n")
+
+----------------------------------------------------------------------
+-- GATE STAGE: PRE-SPLIT STAGING, AND THE OWNER'S RUN AS A RED FIXTURE
+--
+-- THE EVIDENCE. DaseekiConduitDB.attachTrace, build 1.2.2+attach-trace.1, the
+-- owner's live hands-free boon run. Every attempt in the ring identical:
+--
+--     draw { bag = 4, slot = 1, pre = 10, locked = false, want = 7, exact = true,
+--            path = "split", cursor = true, click = true, post = 10, formSlot = 1 }
+--     raw  { "Chronoboon Displacer", "184937", "133879", "10", "1" }
+--     quiet = true, units = 0, verdict = "refused"
+--
+-- Three facts fall straight out of that, and they are what this gate encodes:
+--
+--   1. SPLIT-TO-FORM DELIVERS THE WHOLE STACK. Asked for 7 out of 10, one
+--      attachment came back holding 10 — on an unlocked slot, on quiet bags,
+--      every time. The owner saw it too ("the mail populated full stacks each
+--      time"). This is the 1.2.0 over-attach and every refusal since.
+--   2. THE BAGS DO NOT MOVE WHILE IT SITS THERE. `units = 0` is the whole-mail
+--      measurement, taken on settled bags, with an attachment verifiably on the
+--      form. A witness that reads zero however much landed is not a strict guard.
+--      That is why 1.2.2 refused eight correct mails in a row and the outbox was
+--      empty.
+--   3. THE COUNT IS RETURN #4. `raw` settles the shape of GetSendMailItem on 11509
+--      permanently: name, itemID, texture, count, quality.
+--
+-- Both behaviours are now the simulator's DEFAULT profile (see mailsim.lua), so a
+-- build that only works on a spec-behaving client cannot pass this harness again.
+--
+-- THE FIX UNDER TEST: never split onto the form. Make the exact stack in the BAGS
+-- (staging.lua), then attach it whole.
+----------------------------------------------------------------------
+local STAGE_BEFORE = FAILS
+realprint("=== GATE STAGE: pre-split staging, and the owner's run ===")
+do
+    local Staging = ns.Staging
+    ck(Staging ~= nil, "staging.lua loaded into the shared namespace")
+
+    -- ── (a) THE PLAN, PURE, ROW BY ROW ───────────────────────────────────────
+    local function stacksOf(list)
+        local out = {}
+        for i, c in ipairs(list) do out[i] = { bag = 0, slot = i, itemID = ITEM, count = c } end
+        return out
+    end
+    local function freeOf(n)
+        local out = {}
+        for i = 1, n do out[i] = { bag = 0, slot = 90 + i } end
+        return out
+    end
+
+    do  -- the exact-stack shortcut: nothing to do, and no slot spent
+        local p = Staging.Plan(stacksOf({ 10, 7, 10 }), { { key = 1, count = 7 } }, freeOf(3))
+        ck(#p.jobs == 0, "(a) a stack that is already exactly right is used as it is")
+        ck(p.rows[1].ready and p.rows[1].reuse, "(a) ...the row is ready with no split")
+        ck(p.freeUsed == 0, "(a) ...and no empty bag slot is spent on it")
+    end
+    do  -- whole stacks that ADD UP are equally free — 4 + 3 for a seven
+        local p = Staging.Plan(stacksOf({ 5, 4, 3 }), { { key = 1, count = 7 } }, freeOf(3))
+        ck(#p.jobs == 0, "(a) whole stacks that add up need no split either (4 + 3 = 7)")
+        ck(p.rows[1].parts and #p.rows[1].parts == 2, "(a) ...drawn from the two of them")
+    end
+    do  -- take what fits, split the remainder off the SMALLEST stack that covers it
+        local p = Staging.Plan(stacksOf({ 10, 8, 2 }), { { key = 1, count = 7 } }, freeOf(3))
+        ck(#p.jobs == 1, "(a) otherwise exactly ONE split is planned")
+        local j = p.jobs[1]
+        ck(j.count == 5, "(a) ...for the remainder after the whole stacks that fit (2 of the 7)")
+        ck(j.slot == 2, "(a) ...taken from the SMALLEST stack that can cover it, not a pristine ten")
+        ck(j.destBag == 0 and j.destSlot == 91, "(a) ...into the first empty bag slot")
+    end
+    do  -- the leftover stays available to later mails
+        local p = Staging.Plan(stacksOf({ 10 }), { { key = 1, count = 7 }, { key = 2, count = 3 } },
+                               freeOf(3))
+        ck(#p.jobs == 1, "(a) the remainder a split leaves behind serves the next mail whole")
+        ck(p.rows[2].ready and p.rows[2].reuse, "(a) ...with no second split")
+    end
+    do  -- free slots are handed out in SEND ORDER, and the shortfall is named
+        local p = Staging.Plan(stacksOf({ 10, 10, 10 }),
+                               { { key = 1, count = 7 }, { key = 2, count = 6 }, { key = 3, count = 4 } },
+                               freeOf(1))
+        ck(#p.jobs == 1, "(a) with one empty slot, one mail is prepared")
+        ck(p.jobs[1].key == 1, "(a) ...the FIRST one, in send order")
+        ck(p.freeShort == 2, "(a) ...and the two it could not prepare are counted, not hidden")
+        ck(p.rows[2].why == "nofree" and not p.rows[2].ready, "(a) ...naming want-of-a-slot as the reason")
+    end
+    do  -- not enough of it in the bags at all is a different answer
+        local p = Staging.Plan(stacksOf({ 2 }), { { key = 1, count = 7 } }, freeOf(3))
+        ck(p.rows[1].why == "short" and #p.jobs == 0,
+           "(a) too few in the bags is a shortfall, never a split that cannot help")
+    end
+    do  -- and it never plans a split that would EMPTY the source (that is a whole
+        -- stack wearing a disguise, and whole stacks are free)
+        local p = Staging.Plan(stacksOf({ 7 }), { { key = 1, count = 7 } }, freeOf(3))
+        ck(#p.jobs == 0, "(a) a split that would empty its source is never planned")
+    end
+
+    -- ── (b) THE OWNER'S RUN, END TO END ──────────────────────────────────────
+    --
+    -- Eight characters short 10, 9, 8, 7, 6, 5, 4 and 3 boons; six full stacks of
+    -- ten in the bags. The exact shape of the run whose outbox came back empty.
+    local ROSTER8 = mesh({
+        { "T1", 60, 0 }, { "T2", 60, 1 }, { "T3", 60, 2 }, { "T4", 60, 3 },
+        { "T5", 60, 4 }, { "T6", 60, 5 }, { "T7", 60, 6 }, { "T8", 60, 7 },
+    })
+    local WANT8 = { T1 = 10, T2 = 9, T3 = 8, T4 = 7, T5 = 6, T6 = 5, T7 = 4, T8 = 3 }
+    local PROFILE = { asyncBags = true, asyncCounts = true, settleDelay = 0.5 }
+    local MAIL_SRC = readFile(P("mail.lua"))
+
+    local function patchAll(src, edits)
+        for _, e in ipairs(edits) do
+            local head, tail = src:find(e[1], 1, true)
+            if not head then return nil, "fragment missing: " .. e[1]:sub(1, 70) end
+            if src:find(e[1], tail + 1, true) then return nil, "fragment not unique" end
+            src = src:sub(1, head - 1) .. e[2] .. src:sub(tail + 1)
+        end
+        return src
+    end
+
+    -- THE 1.2.2 ENGINE, reconstructed from the shipped source: it split part of a
+    -- stack straight onto the form, and it made the bag subtraction the authority
+    -- on what had been attached. Everything else — the settlement waits, the trace,
+    -- the retry budget — is exactly as shipped, because none of those was the fault.
+    local AS_122 = {
+        { "                if st.exact and want ~= have then", "                if false then" },
+        { "                    local outcome, path = pickupWhole(st.bag, st.slot)",
+          [[                    local outcome, path
+                    if st.exact and want < have and C_Container and C_Container.SplitContainerItem then
+                        ClearCursor()
+                        C_Container.SplitContainerItem(st.bag, st.slot, want)
+                        outcome, path = (CursorHasItem() and "delivered" or "nothing"), "split"
+                    else
+                        outcome, path = pickupWhole(st.bag, st.slot)
+                    end]] },
+        { "                draws, total = Rules.ComposeWhole(live, wantN, ns.MAX_ATTACH)",
+          "                draws, total = Rules.DrawExact(live, wantN, ns.MAX_ATTACH)" },
+        { "    if ns.Staging then\n        notifyPanel()", "    if false then\n        notifyPanel()" },
+        { "        if moved == 0 and (S.pendingUnits or 0) > 0 then",
+          [[        if (tonumber(mail.money) or 0) <= 0 then S.pendingUnits = moved end
+        if moved == 0 and (S.pendingUnits or 0) > 0 then]] },
+        { "    if planned and staged ~= planned then", "    if false then" },
+        { "    if planned and onForm ~= nil and onForm ~= planned then", "    if false then" },
+        { "    if planned and moved ~= nil and moved ~= 0 and moved ~= planned then",
+          "    if planned and moved ~= nil and moved ~= planned then" },
+        { [[        local onForm = formTotal()
+        if onForm ~= nil then return onForm == planned end
+        if not bagsQuiet() then return false end
+        local delta = before - bagUnitsFor(ids)
+        return delta == planned or delta == 0]],
+          "        return (before - bagUnitsFor(ids)) == planned" },
+    }
+
+    do  -- RED: the shipped 1.2.2 engine, on the client that produced the capture.
+        local src, err = patchAll(MAIL_SRC, AS_122)
+        ck(src ~= nil, "(b) the 1.2.2 engine can be reconstructed" .. (src and "" or (" — " .. tostring(err))))
+        if src then
+            local sim = Sim.New(bagsOf({ 10, 10, 10, 10, 10, 10 }), PROFILE)
+            local n = newEngine(sim, src)
+            chatClear()
+            startRun(n, sim, ROSTER8)
+            sim:Advance(600)
+            ck(#sim.sent == 0, "(b) RED: not one of the eight mails is sent")
+            ck(#n.Ledger.Entries() == 0, "(b) ...an EMPTY OUTBOX, exactly as captured")
+            ck(chatFind("0 left your bags") ~= nil,
+               "(b) ...every mail refused because nothing appeared to leave the bags")
+            ck(sim:BagUnits(ITEM) == 60, "(b) ...and all sixty boons are still at home")
+            -- ...and the trace records what the owner's did: a whole stack on the
+            -- form for a partial ask.
+            local sawWholeStack = false
+            for _, r in ipairs(n.Trace.Records(n.Trace.Ring(false))) do
+                for _, d in ipairs(r.draws or {}) do
+                    if d.path == "split" and d.want and d.pre and d.want < d.pre then
+                        for _, raw in ipairs(d.raw or {}) do
+                            if raw == tostring(d.pre) then sawWholeStack = true end
+                        end
+                    end
+                end
+            end
+            ck(sawWholeStack,
+               "(b) ...with the form reporting the WHOLE stack for a partial ask, as the capture shows")
+            ck(n.Mail.Diagnostics().settleWaits >= 8,
+               "(b) ...one fruitless measurement wait per mail (the owner's 'very slow')")
+        end
+    end
+
+    do  -- GREEN: the shipped 1.2.3 engine, same client, same fixture.
+        local sim = Sim.New(bagsOf({ 10, 10, 10, 10, 10, 10 }), PROFILE)
+        local n = newEngine(sim, nil)
+        chatClear()
+        local queued = startRun(n, sim, ROSTER8)
+        sim:Advance(600)
+        ck(queued == 8, "(b) GREEN: eight mails planned")
+        ck(#sim.sent == 8, "(b) ...eight mails sent")
+        ck(#n.Ledger.Entries() == 8, "(b) ...EIGHT OUTBOX ROWS — the acceptance criterion")
+        local allExact = true
+        for _, m in ipairs(sim.sent) do
+            if m.units ~= WANT8[m.recipient] then allExact = false end
+        end
+        ck(allExact, "(b) ...each carrying exactly what its recipient was short")
+        ck(sim:BagUnits(ITEM) == 8, "(b) ...and the bags are down by exactly 52")
+        ck(chatFind("left your bags") == nil and chatFind("form holds") == nil,
+           "(b) ...with not one refusal along the way")
+        -- Every attachment a whole stack: the property the whole branch exists for.
+        local partialSeen = false
+        for _, r in ipairs(n.Trace.Records(n.Trace.Ring(false))) do
+            if not r.stage then
+                for _, d in ipairs(r.draws or {}) do
+                    if d.click and d.want and d.pre and d.want ~= d.pre then partialSeen = true end
+                end
+            end
+        end
+        ck(not partialSeen, "(b) ...and no attachment was ever a partial stack")
+        ck(n.Mail.Diagnostics().bagsRetained > 0,
+           "(b) ...on a client whose bags never moved while the goods were on the form")
+        -- WALL CLOCK, measured off the virtual clock at the moment each mail was
+        -- handed to SendMail. This is the number the owner feels.
+        local last = sim.sent[#sim.sent]
+        realprint(("        (b) wall clock: staging + eight mails posted by %.1fs"):format(last.at))
+        ck(last.at < 15,
+           "(b) ...the eighth mail is posted inside 15s, where 1.2.2 never posted a first")
+    end
+
+    -- ── (c) STAGING IS SKIPPED ENTIRELY WHEN THE BAGS ARE ALREADY RIGHT ──────
+    do
+        -- Three characters short 3, 4 and 5; three stacks of exactly those sizes.
+        local sim = Sim.New(bagsOf({ 3, 4, 5 }), PROFILE)
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, mesh({ { "Aaa", 60, 7 }, { "Bbb", 60, 6 }, { "Ccc", 60, 5 } }))
+        sim:Advance(300)
+        ck(#sim.sent == 3, "(c) all three mails go out")
+        ck(n.Staging.Diagnostics().splits == 0,
+           "(c) ...and not one stack was split — the bags were already exactly right")
+        ck(sim:BagUnits(ITEM) == 0, "(c) ...every boon went")
+    end
+
+    -- ── (d) NO EMPTY BAG SLOT: honest degradation, in send order ─────────────
+    do
+        -- A bag with exactly as many slots as it has stacks. Nowhere to put a split.
+        local sim = Sim.New({ [0] = { size = 2, [1] = { itemID = ITEM, count = 10 },
+                                             [2] = { itemID = ITEM, count = 10 } } }, PROFILE)
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, mesh({ { "Aaa", 60, 3 } }))     -- needs 7, has only tens
+        sim:Advance(300)
+        ck(#sim.sent == 0, "(d) a mail that cannot be prepared is not sent")
+        ck(chatFind("no empty bag slot") ~= nil,
+           "(d) ...and the refusal names the reason and the fix")
+        ck(sim:BagUnits(ITEM) == 20, "(d) ...with every boon still in the bags")
+        ck(n.Staging.Diagnostics().noFreeSlot > 0, "(d) ...counted in the diagnostics")
+    end
+    do
+        -- ...but a run that runs out of slots part-way through recovers, because the
+        -- mails that HAVE gone freed theirs up again.
+        local layout = { [0] = { size = 5 } }
+        for i = 1, 4 do layout[0][i] = { itemID = ITEM, count = 10 } end
+        local sim = Sim.New(layout, PROFILE)   -- 4 stacks, ONE empty slot
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, mesh({ { "Aaa", 60, 3 }, { "Bbb", 60, 4 }, { "Ccc", 60, 5 } }))
+        sim:Advance(600)
+        local by = {}
+        for _, m in ipairs(sim.sent) do by[m.recipient] = m.units end
+        ck(by["Aaa"] == 7 and by["Bbb"] == 6 and by["Ccc"] == 5,
+           "(d) one spare slot still serves a three-mail run, one staging at a time")
+        ck(sim:BagUnits(ITEM) == 22, "(d) ...and the arithmetic holds (40 - 18)")
+    end
+
+    -- ── (e) THE CLIENT WILL NOT SPLIT BAG-TO-BAG EITHER ──────────────────────
+    --
+    -- The graceful stop the owner asked for: never attach what was not planned, say
+    -- what is wrong, and say what to do instead.
+    for _, case in ipairs({ { noSplit = true, label = "has no split call at all" },
+                            { splitRefuses = true, label = "refuses the split in silence" } }) do
+        local sim = Sim.New(bagsOf({ 10, 10 }),
+            { asyncBags = true, asyncCounts = true, settleDelay = 0.5,
+              noSplit = case.noSplit, splitRefuses = case.splitRefuses })
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, mesh({ { "Aaa", 60, 3 }, { "Bbb", 60, 4 } }))
+        sim:Advance(600)
+        ck(#sim.sent == 0, "(e) a client that " .. case.label .. " sends NOTHING")
+        ck(chatFind("will not split stacks") ~= nil,
+           "(e) ...and is told so, with the manual way round")
+        ck(sim:BagUnits(ITEM) == 20, "(e) ...every boon still in the bags, none over-mailed")
+        ck(n.Staging.IsBlocked(), "(e) ...and staging gives up rather than asking once per mail")
+    end
+
+    -- ── (f) SETTLEMENT BETWEEN STAGE AND ATTACH ──────────────────────────────
+    --
+    -- A staged stack that has not landed yet must never be attached: the pickup
+    -- would take a locked slot, or the wrong count. The verification is on the
+    -- DESTINATION slot, on settled state.
+    do
+        local sim = Sim.New(bagsOf({ 10, 10 }),
+            { asyncBags = true, asyncCounts = true, settleDelay = 1.2 })
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, mesh({ { "Aaa", 60, 3 } }))
+        -- Mid-staging: the split has been asked for but the client has not caught up.
+        sim:Advance(0.2)
+        ck(#sim.sent == 0, "(f) nothing is attached while the staged stack is in mid-air")
+        sim:Advance(600)
+        ck(#sim.sent == 1 and sim.sent[1].units == 7,
+           "(f) ...and once it has landed the mail carries exactly its plan")
+        ck(n.Staging.Diagnostics().staged == 1, "(f) ...one verified staged stack")
+    end
+
+    -- ── (g) NOTHING IS EVER CREATED OR LOST ──────────────────────────────────
+    do
+        local sim = Sim.New(bagsOf({ 10, 10, 10 }), PROFILE)
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, mesh({ { "Aaa", 60, 3 }, { "Bbb", 60, 4 }, { "Ccc", 60, 8 } }))
+        sim:Advance(600)
+        local sent = 0
+        for _, m in ipairs(sim.sent) do sent = sent + m.units end
+        -- On the proven profile an ATTACHED stack is still counted in the bags (that
+        -- is the whole point), so the conservation identity is bags + sent, taken
+        -- with the form empty at the end of the run.
+        ck(sim:AttachedUnits() == 0, "(g) the form is empty when the run ends")
+        ck(sim:BagUnits(ITEM) + sent + (sim.cursor and sim.cursor.count or 0) == 30,
+           "(g) every boon is either sent or still in a bag — never duplicated, never lost")
+        ck(sent == 7 + 6 + 2, "(g) ...and exactly what the plan asked for went out")
+        ck(chatFind("split in your bags") ~= nil,
+           "(g) the run says the bags were rearranged, so a tidy player is not surprised")
+    end
+end
+local V_STAGE = (FAILS == STAGE_BEFORE)
+realprint("=== GATE STAGE: " .. (V_STAGE and "PASS" or "FAIL") .. " ===\n")
 
 ----------------------------------------------------------------------
 -- GATE RUN: the hands-free runner's state machine, driven for real.
@@ -1230,6 +1596,11 @@ do
           [[            newTimer(FAILURE_SPACING, thisRun(armCurrent))]] },
         { "            awaitMeasured(S.armIds, S.armBefore, tonumber(mail.units), verifyAndFire)",
           "            verifyAndFire()" },
+        -- ...including 1.2.3's "the stack is locked, not missing" wait, which is the
+        -- same settlement discipline wearing a different hat.
+        { [[                elseif not draws and Rules.AnySlotLocked and Rules.AnySlotLocked()
+                       and S.attempts < RETRY_BUDGET then]],
+          "                elseif false then" },
     }
 
     -- Daseeki 3, Senche 3, Zaan 2 — behind Aaa, whose successful send is what sets
@@ -1306,7 +1677,10 @@ do
     end
 
     -- A split that takes from the slot but hands the stack over a frame later must
-    -- never be asked a second time — that would draw a second helping.
+    -- never be asked a second time — that would draw a second helping. Since 1.2.3
+    -- the ONLY split in the addon is staging's, so this is staging's problem now: it
+    -- waits for the cursor to arrive instead of re-asking, and hands the stack to an
+    -- empty bag slot when it does.
     do
         local sim, n, by = liveRun(nil, { splitAsync = true })
         local over = false
@@ -1315,8 +1689,8 @@ do
             if want and m.units > want then over = true end
         end
         ck(not over, "(async split) no mail carries more than its plan")
-        ck(n.Mail.Diagnostics().splitAsync > 0,
-           "(async split) ...and the engine recognised the take-but-not-hand-over case")
+        ck(n.Staging.Diagnostics().splits > 0,
+           "(async split) ...staging did ask this client to split")
         ck(not n.Mail.IsActive(),
            "(async split) ...and the run ends rather than hanging on a client that never delivers")
         local inHand = sim.cursor and sim.cursor.count or 0
@@ -1333,6 +1707,12 @@ do
         n.Mail.SetStepMode(true)
         chatClear()
         startRun(n, sim, TAIL)
+        -- 1.2.3: the run opens with ONE staging pass that makes every exact stack in
+        -- the bags. It has to finish before the first mail can be offered, in step
+        -- mode exactly as in hands-free — and it is the only wait the player pays
+        -- twice for nothing.
+        sim:Advance(3.0)
+        ck(n.Mail.IsAwaitingClick(), "(step) the first mail is offered once staging has run")
         n.Mail.ContinueClick(); sim:Advance(0.35)
         ck(#sim.sent == 1, "(step) the first mail went")
         ck(not n.Mail.IsAwaitingClick(),
@@ -1438,8 +1818,13 @@ do
         startRun(n, sim, mesh({ { "Aaa", 60, 0 }, { "Bbb", 60, 2 }, { "Ccc", 60, 5 } }))
         sim:Advance(120)
         local ring = n.Trace.Ring(false)
-        ck(ring ~= nil and #ring == 3, "(c) one trace entry per attach attempt")
         local recs = n.Trace.Records(ring)
+        local attempts, stages = 0, 0
+        for _, r in ipairs(recs) do
+            if r.stage then stages = stages + 1 else attempts = attempts + 1 end
+        end
+        ck(attempts == 3, "(c) one trace entry per attach attempt")
+        ck(stages >= 1, "(c) ...and the staging pass is in the same ring, marked as one")
         ck(recs[1].verdict == "sent", "(c) a delivered mail is recorded as sent")
         ck(recs[1].build == n.BUILD and n.BUILD ~= nil,
            "(c) every entry carries the BUILD that produced it (" .. tostring(n.BUILD) .. ")")
@@ -1495,31 +1880,30 @@ do
     -- from `viaForm or viaBag` — where a form that reports zero WINS, because zero
     -- is truthy in Lua — and take no whole-mail measurement afterwards.
     local PRE_FIX = {
+        -- ...judging each draw the instant it is clicked,
         { [[                        if slotAttached(nextSlot) then
                             -- It is ON THE FORM. That much is observable right now
                             -- and needs no deferred number to confirm.
                             attached = nextSlot
-                            units    = units + want]],
-          [[                        local landed = viaForm or viaBag
-                        if slotAttached(nextSlot) and landed == want then
+                            units    = units + have]],
+          [[                        local landed = viaForm or (have - left)
+                        if slotAttached(nextSlot) and landed == have then
                             attached = nextSlot
                             units    = units + landed
                         elseif slotAttached(nextSlot) then
                             detach(nextSlot)
                             ClearCursor()
                             refused = refused + 1]] },
+        -- ...calibrating from the BAG DELTA rather than from the stack it just
+        -- picked up, which is the difference between a key that always exists and
+        -- one this client never provides,
+        { "                        calibrateFormCount(nextSlot, have)",
+          "                        calibrateFormCount(nextSlot, have - left)" },
+        -- ...taking no whole-mail measurement afterwards,
         { "    if S.armIds and S.armBefore then", "    if false then" },
-        -- ...and the 1.2.1 refusal to revisit a bad calibration.
-        { [[                        if viaForm ~= nil and viaForm ~= viaBag then
-                            D.formBagDisagree = D.formBagDisagree + 1
-                            D.decalibrations  = D.decalibrations + 1
-                            decalibrateFormCount()
-                            td.outcome = (td.outcome or "") .. "+recalibrate"
-                            viaForm = nil
-                        end]],
-          [[                        if viaForm ~= nil and viaForm ~= viaBag then
-                            D.formBagDisagree = D.formBagDisagree + 1
-                        end]] },
+        -- ...and refusing to revisit a bad calibration.
+        { [[                        if viaForm ~= nil and viaForm ~= have then]],
+          [[                        if false then]] },
     }
     local function patchOne(src, edits)
         for _, e in ipairs(edits) do
@@ -1530,8 +1914,12 @@ do
         return src
     end
 
+    -- The SPEC-behaving bag profile on purpose: this fixture is about a form that
+    -- misreports, and it needs a client whose bag counts DO move so that the 1.2.1
+    -- reconstruction can calibrate off the first landing at all. The proven client's
+    -- retained bags are exercised in (a2) and in GATE STAGE.
     local function badFormRun(mailSrc)
-        local sim = Sim.New(bagsOf({ 10, 10 }), { formBadAfter = 1 })
+        local sim = Sim.New(bagsOf({ 10, 10 }), { formBadAfter = 1, retainBags = false })
         local n = newEngine(sim, mailSrc)
         chatClear()
         startRun(n, sim, ROSTER)
@@ -1640,19 +2028,26 @@ do
            "(a2) ...with not one refusal along the way")
     end
 
-    -- (g) the form can no longer VETO a send it merely disagrees with.
+    -- (g) A FORM THAT CANNOT BE READ MUST NOT STOP A CORRECT MAIL.
+    --     1.2.3 promotes the form to a witness that can refuse, which is only safe
+    --     because a form that disagrees with a stack the engine watched itself pick
+    --     up whole is DISCARDED at the draw and never gets as far as the guard. This
+    --     is that property, driven: a client whose form goes silent after the first
+    --     attachment still sends all three mails.
     do
         local sim = Sim.New(bagsOf({ 10, 10 }), { formBadAfter = 1 })
         local n = newEngine(sim, nil)
         chatClear()
         startRun(n, sim, ROSTER)
         sim:Advance(200)
-        ck(n.Mail.Diagnostics().formVetoDropped >= 0, "(g) the veto counter exists")
-        ck(#sim.sent == 3, "(g) a disagreeing form total does not stop a correct mail")
+        ck(n.Mail._FormCalibration() == nil,
+           "(g) a form that stopped making sense is not trusted")
+        ck(#sim.sent == 3, "(g) ...and a disagreeing form total does not stop a correct mail")
+        ck(n.Mail.Diagnostics().decalibrations > 0, "(g) ...the guess was thrown away, not obeyed")
     end
 
-    -- (h) ...but the BAG arithmetic still refuses an over-attach. The 1.2.0 defect
-    --     must stay dead: dropping the form veto may not weaken the real guard.
+    -- (h) ...but the guard still refuses an over-attach. The 1.2.0 defect must stay
+    --     dead: a staged stack that came out the wrong size never becomes a send.
     do
         local sim = Sim.New(bagsOf({ 10, 10 }), {
             poison = function(_, _, want) return want + 2 end })
@@ -1886,6 +2281,7 @@ realprint("#   GATE FRIEND real auto-friend pass : " .. (FAILS == 0 and "PASS" o
 realprint("#   GATE MUT    boon plan mutations  : " .. (FAILS == 0 and "PASS" or "FAIL"))
 realprint("#   GATE HDR    header control cluster : " .. (V_HDR and "PASS" or "FAIL"))
 realprint("#   GATE ATTACH over-attach repro+fix : " .. (V_ATTACH and "PASS" or "FAIL"))
+realprint("#   GATE STAGE  pre-split staging     : " .. (V_STAGE and "PASS" or "FAIL"))
 realprint("#   GATE RUN    hands-free state machine : " .. (V_RUN and "PASS" or "FAIL"))
 realprint("#   GATE SETTLE attach vs bag settlement : " .. (V_SETTLE and "PASS" or "FAIL"))
 realprint("#   GATE TRACE  attach trace + measured-0 : " .. (V_TRACE and "PASS" or "FAIL"))

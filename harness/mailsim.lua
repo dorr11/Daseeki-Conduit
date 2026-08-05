@@ -1,6 +1,32 @@
 -- =====================================================================
 -- Daseeki-Conduit harness — CLASSIC ERA MAILBOX SIMULATOR
 --
+-- ── THE DEFAULT PROFILE IS THE OWNER'S CLIENT, NOT THE SPEC ──────────────────
+--
+-- Every headless build before 1.2.3 passed while the live one failed, and the
+-- reason is that this file modelled a mailbox that behaves the way the API
+-- documentation implies. The owner's attach trace (build 1.2.2+attach-trace.1)
+-- settled what his 11509 client actually does, and the two behaviours below are now
+-- the DEFAULT here, because a simulator that is kinder than reality is not a gate:
+--
+--   formWholeStack  Splitting a stack and clicking it onto the Send Mail form
+--                   attaches the WHOLE STACK. Asked for 7 out of 10, the form comes
+--                   back holding 10. Deterministic, unlocked slot, quiet bags.
+--                   (`raw` in the capture: name, itemID, texture, "10", quality.)
+--   retainBags      An attachment does NOT leave the bags. The stack stays visible
+--                   in its slot until the mail is actually SENT, so a bag
+--                   subtraction across an attach measures ZERO however much landed
+--                   on the form. That is why the owner's every mail read "0 left
+--                   your bags" and why his outbox was empty after a whole run.
+--
+-- Bag-to-bag splitting is NOT affected by either: it works, here and in the field
+-- (the owner splits stacks by hand every day), which is the entire premise of the
+-- pre-split staging strategy.
+--
+-- Pass `formWholeStack = false` / `retainBags = false` for the SPEC-behaving client,
+-- which is kept as a secondary profile so a regression can be told apart from a
+-- client difference.
+--
 -- mail.lua is the one file the old harness could not load: it is nothing BUT live
 -- API. That is also where the send bugs live, so this stands the API up in plain
 -- Lua and lets the REAL engine drive it:
@@ -10,10 +36,10 @@
 --     returning an item merges into a partial stack of the same item, which is how
 --     the live client behaves and how a "stale" bag slot comes back to life);
 --   * the Send Mail form: twelve attachment slots that report their stack COUNT
---     through GetSendMailItem's fourth return, a money field, and a detach that
---     puts the stack back in the bags — because attaching takes the item OUT of
---     the bag, which is exactly why the send engine's evidence check has to count
---     bags plus form rather than bags alone;
+--     through GetSendMailItem's fourth return (the position the owner's capture
+--     settled), a money field, and a detach that gives the stack back — which under
+--     the default `retainBags` profile means simply forgetting the reservation,
+--     because the stack never left the bag in the first place;
 --   * a SendMail that consumes the form and answers on a VIRTUAL CLOCK, so every
 --     timeout, retry delay and repeating ticker in the engine can be driven
 --     deterministically and instantly;
@@ -46,6 +72,10 @@ function M.New(layout, opts)
         -- attach poisoning: return an override count for a requested split
         poison = opts.poison,
         noSplit = opts.noSplit,
+        -- A client that HAS C_Container.SplitContainerItem and silently does nothing
+        -- with it — the failure mode staging has to be able to give up on, because
+        -- it looks exactly like a slow client until the ceiling expires.
+        splitRefuses = opts.splitRefuses,
         splitAsync = opts.splitAsync,
         formBadAfter = opts.formBadAfter,
         formBadValue = opts.formBadValue,
@@ -59,6 +89,9 @@ function M.New(layout, opts)
         -- later. A locked slot refuses SplitContainerItem silently, exactly as the
         -- client does.
         asyncBags = opts.asyncBags,
+        -- THE PROVEN CLIENT, ON BY DEFAULT. See the header.
+        formWholeStack = (opts.formWholeStack ~= false),
+        retainBags     = (opts.retainBags ~= false),
         settleDelay = opts.settleDelay or 0.4,
         locks = {},          -- [bag] = { [slot] = true }
         pendingSettle = nil,
@@ -197,6 +230,66 @@ function M:flushDeferred()
     for i = 1, #d do d[i]() end
 end
 
+-- ── the cursor, and WHEN the bags actually change ─────────────────────────────
+--
+-- Taking something out of a slot puts it on the cursor NOW; the bag arithmetic that
+-- goes with it is carried along as a pending COMMIT, because when it lands depends
+-- on where the thing ends up:
+--
+--   into another BAG SLOT (staging's bag-to-bag split)  -> commit runs immediately
+--                                                          (deferred by one tick if
+--                                                          asyncCounts is on).
+--   onto the MAIL FORM                                  -> with retainBags, the
+--                                                          commit is HELD until the
+--                                                          mail is sent. The stack
+--                                                          stays visible in the bag,
+--                                                          which is what makes a bag
+--                                                          subtraction across an
+--                                                          attach measure zero.
+--   back to the BAGS (ClearCursor)                      -> the commit is DROPPED:
+--                                                          nothing ever left, so
+--                                                          nothing comes back.
+--
+-- Units are conserved on every path, which is what the harness's conservation
+-- checks are for.
+function M:takeToCursor(bag, slot, take)
+    local b = self.bags[bag]
+    local s = b and b[slot]
+    if not s then return end
+    local have = s.count
+    if take > have then take = have end
+    local apply = function()
+        if b[slot] ~= s then return end
+        s.count = s.count - take
+        if s.count <= 0 then b[slot] = nil end
+    end
+    -- Clearing the whole source slot, whatever it holds by then. Used when the
+    -- client swallows a partial split and attaches the WHOLE stack instead.
+    local applyAll = function()
+        if b[slot] ~= s then return end
+        b[slot] = nil
+    end
+    self.cursor = { itemID = s.itemID, count = take,
+                    srcBag = bag, srcSlot = slot, srcCount = have,
+                    partial = (take < have),
+                    commit = apply, commitAll = applyAll }
+    if self.retainBags then
+        -- The count does not move yet — only the lock does.
+        self:disturbSlot(bag, slot)
+    else
+        self.cursor.commit = nil
+        self:deferBag(apply, bag, slot)
+    end
+end
+
+-- Run a held commit (if any) through the normal deferral machinery.
+function M:commitCursor(c, bag, slot)
+    if not (c and c.commit) then return end
+    local fn = c.commit
+    c.commit, c.commitAll = nil, nil
+    self:deferBag(fn, bag or c.srcBag, slot or c.srcSlot)
+end
+
 -- ── bags ──────────────────────────────────────────────────────────────────────
 function M:returnToBags(item)
     for bag = 0, 4 do
@@ -285,28 +378,43 @@ function M:Install(G)
                      isBound = s.isBound and true or false,
                      isLocked = sim:isLocked(bag, slot) }
         end,
+        HasContainerItem = function(bag, slot)
+            local b = sim.bags[bag]; return (b and b[slot]) and true or false
+        end,
+        GetContainerNumFreeSlots = function(bag)
+            local b = sim.bags[bag]
+            if not b then return 0, 0 end
+            local n = 0
+            for slot = 1, b.size do if not b[slot] then n = n + 1 end end
+            return n, (sim.bagFamily and sim.bagFamily[bag]) or 0
+        end,
         PickupContainerItem = function(bag, slot)
             local b = sim.bags[bag]; local s = b and b[slot]
             if sim:isLocked(bag, slot) then return end
             if sim.cursor then
-                if not s then b[slot] = sim.cursor; sim.cursor = nil
-                else b[slot], sim.cursor = sim.cursor, s end
+                -- PLACING. This is staging's bag-to-bag move, and it is the moment
+                -- the source's arithmetic finally lands.
+                local c = sim.cursor
+                if not s then
+                    b[slot] = { itemID = c.itemID, count = c.count }
+                    sim.cursor = nil
+                    sim:commitCursor(c)
+                    sim:disturbSlot(bag, slot)
+                else
+                    b[slot], sim.cursor = { itemID = c.itemID, count = c.count }, s
+                    sim:commitCursor(c)
+                end
                 return
             end
             if not s then return end
-            local took = s.count
-            sim.cursor = { itemID = s.itemID, count = took }
-            sim:deferBag(function()
-                if b[slot] ~= s then return end
-                s.count = s.count - took
-                if s.count <= 0 then b[slot] = nil end
-            end, bag, slot)
+            sim:takeToCursor(bag, slot, s.count)
         end,
         SplitContainerItem = function(bag, slot, n)
             local b = sim.bags[bag]; local s = b and b[slot]
             -- A LOCKED SLOT REFUSES SILENTLY. No error, no cursor, nothing — this
             -- one line is the whole live 1.2.0 failure.
             if sim:isLocked(bag, slot) then return end
+            if sim.splitRefuses then return end
             -- A split that takes from the slot but hands the stack over a frame
             -- later. Asking again would take a second helping — which is the whole
             -- reason the engine has to tell this apart from a no-op.
@@ -327,19 +435,7 @@ function M:Install(G)
             -- Attach poisoning: a client that hands back a different amount than
             -- was asked for is the whole reason the engine verifies at all.
             if sim.poison then n = sim.poison(bag, slot, n, s.count) or n end
-            local have = s.count
-            local take = (n >= have) and have or n
-            sim.cursor = { itemID = s.itemID, count = take }
-            -- The ITEMS move now; the COUNT the client reports may not.
-            --
-            -- A DELTA, not a remembered absolute. Between this call and the flush a
-            -- detached attachment can merge back into this very slot; writing back
-            -- a snapshot would erase whatever arrived meanwhile. Deltas compose.
-            sim:deferBag(function()
-                if b[slot] ~= s then return end
-                s.count = s.count - take
-                if s.count <= 0 then b[slot] = nil end
-            end, bag, slot)
+            sim:takeToCursor(bag, slot, n)
         end,
     }
     -- A client with no partial-stack API at all. This is the condition the pre-fix
@@ -356,7 +452,13 @@ function M:Install(G)
     -- recover: its own cleanup re-locks the slots it is about to draw from.
     G.ClearCursor = function()
         if sim.cursor then
-            sim:returnToBags(sim.cursor); sim.cursor = nil
+            local c = sim.cursor
+            sim.cursor = nil
+            -- A HELD COMMIT means the bags never actually lost this: putting it
+            -- "back" is simply forgetting the arithmetic. Anything else really did
+            -- leave a slot and has to find a home again.
+            if c.commit then c.commit, c.commitAll = nil, nil
+            else sim:returnToBags(c) end
             sim:disturbBags(nil)
         end
     end
@@ -374,20 +476,43 @@ function M:Install(G)
             count = sim.formBadValue or 0
         end
         if sim.formShape == "noID" then
-            return "Item" .. a.itemID, nil, count, 1        -- name, texture, count, quality
+            return "Item" .. a.itemID, 133879, count, 1       -- name, texture, count, quality
         end
-        return "Item" .. a.itemID, a.itemID, nil, count, 1  -- name, id, texture, count, quality
+        -- The owner's capture, exactly: name, itemID, texture, count, quality.
+        --   { "Chronoboon Displacer", "184937", "133879", "10", "1" }
+        return "Item" .. a.itemID, a.itemID, 133879, count, 1
     end
     G.ClickSendMailItemButton = function(i, clear)
         if not sim.mailboxOpen then error("mailbox closed: ClickSendMailItemButton") end
         if clear then
             local a = sim.attach[i]
-            if a then sim.attach[i] = nil; sim:returnToBags(a); sim:disturbBags(nil) end
+            if a then
+                sim.attach[i] = nil
+                if a.commit then a.commit, a.commitAll = nil, nil   -- never left the bags
+                else sim:returnToBags(a) end
+                sim:disturbBags(nil)
+            end
             return
         end
         if sim.cursor then
             local old = sim.attach[i]
-            sim.attach[i] = sim.cursor
+            local c = sim.cursor
+            -- THE PROVEN 11509 BEHAVIOUR. A PARTIAL stack clicked onto the send form
+            -- takes the WHOLE stack with it — the owner asked for 7 out of 10 and
+            -- the form came back holding 10, every time. The remainder is swallowed
+            -- along with it, so the commit becomes "clear the source slot".
+            if sim.formWholeStack and c.partial and c.srcCount then
+                c.count  = c.srcCount
+                c.commit = c.commitAll or c.commit
+                if not sim.retainBags then
+                    -- No retention: the slot empties on the usual deferred tick.
+                    local fn = c.commit
+                    c.commit, c.commitAll = nil, nil
+                    sim:deferBag(fn, c.srcBag, c.srcSlot)
+                end
+                c.partial = false
+            end
+            sim.attach[i] = c
             sim.cursor = old
             sim.attachClicks = (sim.attachClicks or 0) + 1
         else
@@ -479,7 +604,15 @@ function M:Install(G)
         sim:schedule(sim.latency, function()
             sim.unresolved = sim.unresolved - 1
             if mode ~= "noevidence" then
-                for i = 1, sim.MAXATT do sim.attach[i] = nil end
+                for i = 1, sim.MAXATT do
+                    local a = sim.attach[i]
+                    -- THE MAIL GOES, SO NOW THE BAGS DO. On a retaining client this
+                    -- is the ONLY moment an attached stack leaves the bags — which is
+                    -- why the send engine's evidence check ("the form emptied and the
+                    -- units did not come back") is the one that still works.
+                    if a and a.commit then local fn = a.commit; a.commit = nil; fn() end
+                    sim.attach[i] = nil
+                end
                 sim.wallet = sim.wallet - (rec.money or 0) - 30
                 sim.money = 0
             end
@@ -517,9 +650,16 @@ end
 function M:CloseMailbox(ns)
     for i = 1, self.MAXATT do
         local a = self.attach[i]
-        if a then self.attach[i] = nil; self:returnToBags(a) end
+        if a then
+            self.attach[i] = nil
+            if a.commit then a.commit, a.commitAll = nil, nil   -- never left the bags
+            else self:returnToBags(a) end
+        end
     end
-    if self.cursor then self:returnToBags(self.cursor); self.cursor = nil end
+    if self.cursor then
+        local c = self.cursor; self.cursor = nil
+        if c.commit then c.commit, c.commitAll = nil, nil else self:returnToBags(c) end
+    end
     self.money = 0
     if _G.SendMailNameEditBox then _G.SendMailNameEditBox:SetText("") end
     if _G.SendMailSubjectEditBox then _G.SendMailSubjectEditBox:SetText("") end

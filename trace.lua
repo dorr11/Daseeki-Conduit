@@ -91,7 +91,11 @@ function Trace.NewDraw(d)
     local raw
     if type(d.raw) == "table" then
         raw = {}
-        for i = 1, math.min(#d.raw, Trace.MAX_RAW) do
+        -- `n` when the capture counted its own returns, because a nil in the middle
+        -- of a varargs table makes `#` a lottery — and the whole point of this field
+        -- is to record an UNDOCUMENTED call's shape faithfully, holes included.
+        local last = tonumber(d.raw.n) or #d.raw
+        for i = 1, math.min(last, Trace.MAX_RAW) do
             raw[i] = Trace.Str(d.raw[i])
         end
         -- An all-empty raw array carries no information; drop it.
@@ -104,12 +108,18 @@ function Trace.NewDraw(d)
         locked   = bool(d.locked),
         want     = num(d.want),
         exact    = bool(d.exact),
-        path     = Trace.Str(d.path),    -- "split" | "legacy" | "pickup" | "skip"
-        outcome  = Trace.Str(d.outcome), -- "delivered" | "async" | "nothing" | ...
+        path     = Trace.Str(d.path),    -- "pickup" | "stage" | "skip" | ...
+        outcome  = Trace.Str(d.outcome), -- "delivered" | "placed" | "no-cursor" | ...
         cursor   = bool(d.cursor),       -- did anything reach the cursor?
         click    = bool(d.click),        -- was ClickSendMailItemButton issued?
         post     = num(d.post),          -- units left in the slot after the click
         formSlot = num(d.formSlot),      -- which attachment slot it went to
+        -- STAGING (staging.lua): a bag-to-bag split records where it was trying to
+        -- put the part-stack and whether it got there. Same ring as the attach,
+        -- because "why did this mail not go out?" spans both halves.
+        destBag  = num(d.destBag),
+        destSlot = num(d.destSlot),
+        placed   = bool(d.placed),
         viaForm  = num(d.viaForm),       -- units the FORM reported
         viaBag   = num(d.viaBag),        -- units the BAG says left the slot
         cal      = num(d.cal),           -- calibration index at read time
@@ -138,12 +148,16 @@ function Trace.NewEntry(e)
         itemID   = num(e.itemID),
         quiet    = bool(e.quiet),        -- were the bags settled when we armed?
         redrawn  = bool(e.redrawn),      -- were the draws re-derived here?
+        stage    = bool(e.stage),        -- a STAGING pass, not an attach attempt
+        retained = bool(e.retained),     -- the bags did not shrink while attached
         draws    = draws,
         units    = num(e.units),         -- units the attach believes it staged
         count    = num(e.count),         -- attachments staged
         formSum  = num(e.formSum),       -- what the FORM totalled, if readable
         cal      = num(e.cal),           -- calibration index at verify time
-        verdict  = Trace.Str(e.verdict), -- "sent" | "refused" | "skipped" | "armed"
+        -- "sent" | "refused" | "skipped" | "armed" | "failed"
+        -- ...or, for a staging pass, "staged" | "stage-failed".
+        verdict  = Trace.Str(e.verdict),
         why      = Trace.Str(e.why, Trace.MAX_REASON),
     }
 end

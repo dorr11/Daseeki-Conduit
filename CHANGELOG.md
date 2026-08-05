@@ -2,6 +2,63 @@
 
 ## Unreleased
 
+- **Found it. The game was attaching whole stacks, and never said so.** The log you
+  sent back settled three rounds of guessing in one read. Every attempt in it was
+  identical: Conduit asked the game to split *seven* boons out of a stack of ten
+  onto the mail — an unlocked slot, still bags, nothing racing — and the mail came
+  back holding **ten**. Exactly what you described watching happen: "the mail
+  populated full stacks each time."
+
+  That single behaviour is the whole saga. It is the original over-attach (a
+  seven-boon top-up that arrived as two full stacks), and it is every refusal since:
+  the safety net was doing its job perfectly, refusing a mail that did not match its
+  plan, over and over, on a plan the game could not be made to honour.
+
+  **Conduit no longer asks the mail form to split anything.** It makes the exact
+  amount in your *bags* first — where splitting works, the same way you do it by
+  hand — and then attaches that stack whole. Whole stacks are the one thing this
+  client has always got right; every incident attached them faithfully.
+
+- **One preparation pass, not one per mail.** Everything a run needs is split up
+  front in a single sweep, so the mails themselves go straight out afterwards. An
+  eight-mail run now posts its last mail in seconds rather than grinding through a
+  three-second wait per mail on the way to a refusal.
+
+  Preparation is also skipped entirely where it is not needed: a stack that is
+  already the right size is used as it is, and so is any set of stacks that simply
+  adds up (a four and a three make a seven, no splitting required).
+
+- **Your bags will look slightly rearranged afterwards, and the run says so.** The
+  leftovers from a split stay in your bags as their own stacks — still yours, just
+  in new slots. The completion line now mentions it rather than leaving you to
+  notice.
+
+- **It stops honestly when it cannot prepare an amount**, and always tells you the
+  way round:
+    - no empty bag slot to split into → it says so, and which mails it could not
+      prepare;
+    - the game refusing to split in your bags either → it stops the whole run once,
+      with "put a stack of exactly N in your bags and run again", instead of asking
+      once per mail and never posting anything.
+  In every case the boons stay in your bags. Nothing that was not planned is ever
+  attached, and nothing is ever rounded up to a full stack to make a mail go.
+
+- **The send guard now watches the thing that is actually being sent.** The previous
+  build judged a mail by how much had left your bags — and your log proves the bags
+  do not move at all while an attachment is sitting on the form. That witness read
+  zero however much had landed, which is why eight perfectly good mails were refused
+  and your outbox came back empty. Conduit now checks what it picked up and what the
+  mail form reports (whose shape your log also settled once and for all), and treats
+  a bag total that has not moved as "still in your bags" rather than as "nothing
+  happened". The guarantee is unchanged and if anything stricter: nothing is sent
+  unless what is on the form is exactly what the preview promised.
+
+- **The log covers the new half too.** Every preparation attempt is recorded in the
+  same place as the attaches — which slot it split, how much, where it put it,
+  whether it landed — so if the bag-to-bag split ever misbehaves the way the
+  mail-form one did, the next capture names it immediately instead of costing
+  another round.
+
 - **The mails go out.** Two rounds of fixes did not stop boon mails being refused
   with "the form holds 0", and the reason both rounds missed it is worth stating
   plainly: the engine was asking the game a question it had not finished answering.
