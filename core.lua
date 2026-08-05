@@ -17,7 +17,7 @@ local ADDON, ns = ...
 
 ns.ADDON    = ADDON
 ns.DISPLAY  = "Daseeki Conduit"
-ns.VERSION  = "1.2.2"
+ns.VERSION  = "1.2.3"
 ns.CHAT_TAG_TEXT = "Daseeki Conduit"
 -- Static fallback used only when Daseeki Core (DaseekiUI) is absent; when present the
 -- chat tag derives from the live "brand" token (Field Ledger rollout, BRAND_SPEC §2).
@@ -32,7 +32,7 @@ ns.SCHEMA = 1
 -- every attach-trace entry. Its whole job is to make a STALE-CODE run self-evident:
 -- when a field capture and the shipped source disagree about what the engine should
 -- have done, this says which of them is wrong before anyone theorises.
-ns.BUILD = "1.2.2+attach-trace.1"
+ns.BUILD = "1.2.3+presplit.1"
 
 -- Mail constants. ATTACHMENTS_MAX_SEND is a FrameXML constant (12 in Classic Era);
 -- fall back defensively so a client that omits it still batches correctly.

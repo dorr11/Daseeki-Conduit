@@ -4,6 +4,21 @@
     The send engine. Turns a mail QUEUE (built by rules.lua or boons.lua) into
     actual mails: preview -> ONE Accept -> the whole run, hands-free.
 
+    ── What changed in 1.2.3, and why (read this first) ──────────────────────────
+
+    THE ATTACH NEVER SPLITS A STACK ANY MORE. On Classic Era 11509,
+    C_Container.SplitContainerItem followed by ClickSendMailItemButton puts the
+    WHOLE stack on the send form — proved from the owner's attach trace, every
+    attempt identical, and corroborated by his own eyes ("the mail populated full
+    stacks each time"). Exact amounts are therefore made in the BAGS first
+    (staging.lua) and attached whole. See the long note above pickupWhole.
+
+    And the send guard's witnesses were reordered for the same reason: the bag
+    subtraction 1.2.2 made authoritative reads ZERO on this client for as long as an
+    attachment sits on the form, so it refused eight correct mails in a row. What the
+    engine picked up, and what the form reports, are now the evidence; a bag delta
+    is believed only when it is non-zero. See verifyAttach.
+
     ── What changed in 1.2.0, and why ────────────────────────────────────────────
 
     1) SENDMAIL DOES NOT NEED A HARDWARE EVENT. The old engine believed it did and
@@ -140,17 +155,18 @@ local D = {
     mails            = 0,   -- mails armed
     redrawn          = 0,   -- mails whose draws were re-derived from a fresh scan
     staleCoords      = 0,   -- plan-time slots that no longer held the item
-    splitAttempted   = 0,
-    splitDelivered   = 0,   -- C_Container.SplitContainerItem put it on the cursor
-    splitAsync       = 0,   -- ...took it from the slot but not onto the cursor
-    splitFellBack    = 0,   -- the legacy global delivered instead
-    splitFailed      = 0,   -- nothing delivered
+    pickups          = 0,   -- C_Container.PickupContainerItem put a stack on the cursor
+    pickupFellBack   = 0,   -- the legacy global delivered instead
+    pickupFailed     = 0,   -- nothing delivered
+    partialRefused   = 0,   -- an exact draw that was not a whole stack — never split
+    composeFailed    = 0,   -- no set of whole stacks adds up to what was planned
+    stagedMails      = 0,   -- mails whose stacks had to be made by a staging pass
     lockedSlots      = 0,   -- draws skipped because the slot was mid-operation
     drawsRefused     = 0,
     formUnreadable   = 0,   -- GetSendMailItem would not yield a usable count
-    formBagDisagree  = 0,   -- the form and the bag subtraction did not match
+    formBagDisagree  = 0,   -- the form disagreed with the stack we picked up whole
     decalibrations   = 0,   -- ...and the form's calibration was thrown away for it
-    formVetoDropped  = 0,   -- a form total that disagreed was ignored, not obeyed
+    bagsRetained     = 0,   -- an attach that left the bag totals UNCHANGED (see below)
     settleWaits      = 0,
     settleTimeouts   = 0,
 }
@@ -230,17 +246,32 @@ end
 -- "the fourth return is the count" would be a guess, and a wrong guess here reads
 -- an item quality as a stack size.
 --
--- So the position is CALIBRATED instead of assumed. The bag subtraction (how much
--- left the slot we drew from) is a fact we already have and cannot be wrong about;
--- the first draw that lands unambiguously tells us which return position carried
--- that same number, and from then on the FORM is the authority and the bag
--- subtraction is a cross-check whose disagreements are counted.
+-- So the position is CALIBRATED instead of assumed — and 1.2.3 finally has a fact
+-- to calibrate it AGAINST that cannot be deferred, delayed or retained.
+--
+-- Until now the known quantity was the bag subtraction, which on this client is
+-- worth nothing at attach time (see verifyAndFire's note on retained bags). Now
+-- that the engine only ever picks up WHOLE stacks, the size of the thing it just
+-- put on the form is a number it read off a settled bag slot one instant earlier:
+-- pick up a stack of seven and the form is holding seven, or the client is lying.
+-- Every single draw therefore carries its own calibration key, instead of one
+-- lucky first landing having to serve the whole session.
+--
+-- The owner's field trace also settles the shape outright — GetSendMailItem
+-- returned { "Chronoboon Displacer", "184937", "133879", "10", "1" } for a stack of
+-- ten, so the count is return #4 on 11509. The calibration still runs rather than
+-- hard-coding 4, because a hard-coded guess cannot notice being wrong and this one
+-- can (see decalibrateFormCount).
 local formCountIndex   -- nil until calibrated
 
 local function formReturns(i)
     if not GetSendMailItem then return nil end
     local r = { GetSendMailItem(i) }
     if r[1] == nil then return nil end
+    -- COUNT THE RETURNS, do not measure them. A nil anywhere in the middle (an item
+    -- with no texture, say) makes `#r` undefined, and this table's entire job is to
+    -- record the shape of an undocumented call exactly as it came back.
+    r.n = select("#", GetSendMailItem(i))
     return r
 end
 
@@ -390,75 +421,68 @@ end
 --     S.pendingUnits still read seven. Nothing downstream could notice, so SendMail
 --     fired on a form the engine had never looked at.
 --
--- THE RULE NOW: the only number that counts is the one the WORLD moved — how much
--- actually left the bag slot — and a draw that does not move EXACTLY what was asked
--- for is put straight back. There is no rounding up. A top-up that cannot be split
--- exactly sends nothing rather than sending a whole stack: leaving boons behind is
--- recoverable, posting ten of them to the wrong character is not.
+-- ── 1.2.3: THE ATTACH NO LONGER SPLITS ANYTHING ───────────────────────────────
 --
--- The measurement is deliberately a subtraction on the bag slot rather than a read
--- of the attachment's own fields. It needs no assumption about which return of
--- GetSendMailItem carries the stack count, and it cannot be fooled by a client that
--- reports one thing and does another.
+-- THE PROOF. The attach trace shipped in 1.2.2 caught the real defect in one
+-- capture. Every attempt in the owner's run was byte-for-byte the same:
 --
--- Sets S.pendingCount / S.pendingUnits / S.pendingGold from the FORM, and returns
--- attached, units, refused (refused = a draw the form would not honour exactly).
--- Get `want` units out of (bag, slot) onto the cursor, or fail honestly.
+--     draw { bag = 4, slot = 1, pre = 10, locked = false, want = 7, exact = true,
+--            path = "split", cursor = true, click = true, post = 10, formSlot = 1 }
+--     raw  { "Chronoboon Displacer", "184937", "133879", "10", "1" }
+--
+-- ONE attachment, holding TEN, having asked for SEVEN — on an unlocked slot, on
+-- quiet bags, deterministically. The owner saw it too: "the mail populated full
+-- stacks each time."
+--
+-- So on Classic Era 11509, C_Container.SplitContainerItem(bag, slot, n) followed by
+-- ClickSendMailItemButton puts the WHOLE STACK on the send form. That is the
+-- original 1.2.0 over-attach (two stacks of ten on a seven-unit plan) and every
+-- refusal since. Not the fallback branch, not the locks, not the measurement —
+-- those were all real defects, all independently reproduced, and all still fixed.
+-- This is the one that was doing the damage.
+--
+-- THE RULE NOW: the attach only ever picks up stacks it wants ALL of. There is no
+-- partial for the client to reinterpret, because there is no partial. Making the
+-- exact-sized stack is staging.lua's job and it happens BAG TO BAG, where splitting
+-- demonstrably works (the owner splits stacks by hand every day).
+--
+-- An exact draw that is NOT a whole stack is therefore refused rather than
+-- rounded up. There is no rounding up. A top-up that could not be staged sends
+-- nothing: leaving boons in the bags is recoverable, posting ten of them to a
+-- character who needed three is not.
+--
+-- Sets S.pendingCount / S.pendingUnits / S.pendingGold, and returns
+-- attached, units, refused.
+
+-- Get the WHOLE stack in (bag, slot) onto the cursor, or fail honestly.
 --
 -- THE 11509 FACTS, from the API catalog (build 1.15.9.68808):
---   * C_Container.SplitContainerItem(bag, slot, amount) EXISTS. The 1.2.0 theory
---     that the whole-stack fallback was firing because the function was missing is
---     therefore dead — the function is there, so any failure is one of DELIVERY,
---     not of absence.
---   * there is NO bare SplitContainerItem/PickupContainerItem global on this
---     client, so the "fall back to the legacy global" belt-and-braces below has
---     nothing to catch it here. It is kept for other clients and, more usefully,
---     so the diagnostics can say which door actually opened.
+--   * C_Container.PickupContainerItem(bag, slot) exists and is the whole-stack
+--     door. With something already on the cursor it is also the PLACE call, which
+--     is what staging.lua uses to drop a split part-stack into an empty slot.
+--   * there is NO bare PickupContainerItem global on this client, so the "fall back
+--     to the legacy global" belt-and-braces below has nothing to catch it here. It
+--     is kept for other clients and, more usefully, so the diagnostics can say
+--     which door actually opened.
 --
--- Delivery has three distinguishable outcomes, and telling them apart is the whole
--- point — two of them look identical from the cursor alone:
 --   DELIVERED  the cursor holds it. Proceed.
---   ASYNC      the cursor is empty but the SLOT SHRANK: the split happened, the
---              client just has not handed it over yet. Calling split again here
---              would take a SECOND helping. So: take nothing, and let the
---              settlement wait re-read the world before the retry.
---   NOTHING    cursor empty and the slot untouched — a genuine no-op (a locked
---              slot is the common cause). Safe to try the legacy door.
-local function pickupExactly(bag, slot, want, have)
+--   FELLBACK   ...through the legacy global instead.
+--   NOTHING    cursor empty — a genuine no-op (a locked slot is the common cause).
+local function pickupWhole(bag, slot)
     local C = C_Container
     ClearCursor()
-
-    if want >= have then
-        if C and C.PickupContainerItem then C.PickupContainerItem(bag, slot) end
-        if CursorHasItem() then return "delivered", "pickup" end
-        if _G.PickupContainerItem then _G.PickupContainerItem(bag, slot) end
-        return (CursorHasItem() and "fellback" or "nothing"), "pickup-legacy"
+    if C and C.PickupContainerItem then C.PickupContainerItem(bag, slot) end
+    if CursorHasItem() then
+        D.pickups = D.pickups + 1
+        return "delivered", "pickup"
     end
-
-    D.splitAttempted = D.splitAttempted + 1
-    if C and C.SplitContainerItem then
-        C.SplitContainerItem(bag, slot, want)
-        if CursorHasItem() then
-            D.splitDelivered = D.splitDelivered + 1
-            return "delivered", "split"
-        end
-        local after = Rules.SlotInfo(bag, slot)
-        local left  = (after and after.count) or 0
-        if left < have then
-            -- It left the slot but not onto the cursor. Do NOT ask again.
-            D.splitAsync = D.splitAsync + 1
-            return "async", "split"
-        end
+    if _G.PickupContainerItem then _G.PickupContainerItem(bag, slot) end
+    if CursorHasItem() then
+        D.pickupFellBack = D.pickupFellBack + 1
+        return "fellback", "pickup-legacy"
     end
-    if _G.SplitContainerItem then
-        _G.SplitContainerItem(bag, slot, want)
-        if CursorHasItem() then
-            D.splitFellBack = D.splitFellBack + 1
-            return "fellback", "legacy"
-        end
-    end
-    D.splitFailed = D.splitFailed + 1
-    return "nothing", "split"
+    D.pickupFailed = D.pickupFailed + 1
+    return "nothing", "pickup"
 end
 
 -- `draws` overrides mail.stacks when the caller has re-derived them from a fresh
@@ -495,64 +519,74 @@ local function attachMail(mail, draws)
                 td.path, td.outcome = "skip", "locked"
             elseif Rules.IsMailable(info) then
                 local have = tonumber(info.count) or 0
-                -- A descriptor carrying `exact` sends its `count` and NO MORE; one
-                -- without it means "all of this stack" (a rule saying "send my
-                -- herbs" means all of them). The ask is only ever clamped DOWN to
-                -- what the slot really holds.
+                -- A descriptor carrying `exact` names the amount this recipient is
+                -- owed; one without it means "all of this stack" (a rule saying
+                -- "send my herbs" means all of them).
+                --
+                -- AND THE ONLY WAY TO HONOUR AN EXACT ASK IS FOR THE STACK TO
+                -- ALREADY BE THAT SIZE. Splitting onto the form delivers the whole
+                -- stack on this client, so an exact ask that does not match the slot
+                -- is refused here and staged (staging.lua) rather than taken. The
+                -- draws armCurrent hands over are composed of whole stacks, so this
+                -- refusal is the backstop for a bag that moved between the compose
+                -- and the pickup — not the normal path.
                 local want = have
                 if st.exact then
                     want = tonumber(st.count) or 0
-                    if want > have then want = have end
                 end
 
-                if want >= 1 then
+                if st.exact and want ~= have then
+                    D.partialRefused = D.partialRefused + 1
+                    refused = refused + 1
+                    td.want = want
+                    td.path, td.outcome = "skip", "not-a-whole-stack"
+                elseif want >= 1 then
                     local nextSlot = attached + 1
                     td.want = want
-                    local outcome, path = pickupExactly(st.bag, st.slot, want, have)
+                    local outcome, path = pickupWhole(st.bag, st.slot)
                     td.path, td.outcome = path, outcome
                     td.cursor = CursorHasItem and CursorHasItem() or false
 
                     if outcome == "delivered" or outcome == "fellback" then
                         ClickSendMailItemButton(nextSlot)
                         td.click, td.formSlot = true, nextSlot
-                        -- WHAT FOLLOWS IS OBSERVATION, NOT JUDGEMENT.
+                        -- THE KNOWN QUANTITY IS `have`, AND IT IS KNOWN BEFOREHAND.
                         --
-                        -- Re-reading the bag slot HERE, one statement after the
-                        -- click, asks the client for a number it has not written
-                        -- yet: this client defers container updates to its next bag
-                        -- event (which is exactly why the arm has to wait for one),
-                        -- and a deferred COUNT reads back as the pre-split value. An
-                        -- immediate `have - left` therefore measures ZERO on a draw
-                        -- that worked perfectly, and judging the draw on it refuses
-                        -- every mail — instantly, on quiet bags, first mail included.
+                        -- A whole-stack pickup moves exactly what the slot held, and
+                        -- the slot's count was read off SETTLED bags one instant ago
+                        -- (armCurrent only gets here on quiet bags). So the size of
+                        -- the thing now sitting on the form is not a number that has
+                        -- to be waited for, deferred, retained or inferred — it is
+                        -- `have`, and it is the calibration key for the form read.
                         --
-                        -- So these numbers are recorded for the trace and nothing
-                        -- else. The quantity that decides whether this mail may fly
-                        -- is measured ONCE, for the whole mail, AFTER the bags have
-                        -- flushed — see verifyAndFire.
-                        -- TWO MEASUREMENTS, and the bag one is the FACT.
-                        --   the BAGS — how much left the slot we drew from. This is
-                        --     arithmetic on a value the client already gave us and
-                        --     it cannot be misread.
-                        --   the FORM — what the send slot reports. Corroboration,
-                        --     and only once its shape has been worked out.
-                        -- When they disagree the CALIBRATION is what is wrong, so it
-                        -- is thrown away and re-learned rather than being allowed to
-                        -- veto a draw. That veto is what turned one bad guess into a
-                        -- session where every mail read "the form holds 0".
+                        -- The bag re-read below is OBSERVATION FOR THE TRACE ONLY.
+                        -- On this client it reads back as the pre-pickup value (the
+                        -- container update is deferred), and on this client it stays
+                        -- that way for as long as the attachment sits on the form —
+                        -- which is exactly what the owner's capture shows: pre 10,
+                        -- post 10, nothing moved, attachment present. Judging a draw
+                        -- on it refuses every mail, and did.
                         local after  = Rules.SlotInfo(st.bag, st.slot)
                         local left   = (after and after.itemID == st.itemID)
                                        and (tonumber(after.count) or 0) or 0
-                        local viaBag = have - left
                         td.post   = left
-                        td.viaBag = viaBag
-                        calibrateFormCount(nextSlot, viaBag)
+                        td.viaBag = have - left
+                        -- CALIBRATE FROM WHAT WE PICKED UP, not from a bag delta.
+                        -- Every draw carries its own key now, so a session can no
+                        -- longer be poisoned by one unlucky first landing.
+                        calibrateFormCount(nextSlot, have)
                         local viaForm = formCount(nextSlot)
                         td.cal     = formCountIndex
                         td.viaForm = viaForm
                         td.raw     = formReturns(nextSlot)
                         if viaForm == nil then D.formUnreadable = D.formUnreadable + 1 end
-                        if viaForm ~= nil and viaForm ~= viaBag then
+                        if viaForm ~= nil and viaForm ~= have then
+                            -- The form disagrees with a stack we watched ourselves
+                            -- pick up whole. The INFERENCE about which return holds
+                            -- the count is what is wrong, so it is thrown away and
+                            -- re-learned rather than allowed to veto the draw — one
+                            -- bad guess held for a session is what turned every mail
+                            -- into "the form holds 0" in 1.2.1.
                             D.formBagDisagree = D.formBagDisagree + 1
                             D.decalibrations  = D.decalibrations + 1
                             decalibrateFormCount()
@@ -563,7 +597,7 @@ local function attachMail(mail, draws)
                             -- It is ON THE FORM. That much is observable right now
                             -- and needs no deferred number to confirm.
                             attached = nextSlot
-                            units    = units + want
+                            units    = units + have
                         else
                             -- Nothing landed — an item the server refuses (conjured,
                             -- and so on). It does not travel.
@@ -572,10 +606,10 @@ local function attachMail(mail, draws)
                             td.outcome = (td.outcome or "") .. "+not-on-form"
                         end
                     else
-                        -- "async" (already taken from the slot, cursor not yet) or
-                        -- "nothing". Either way this draw does not travel now; the
-                        -- settlement wait before the retry is what makes the second
-                        -- attempt see a world that has stopped moving.
+                        -- The pickup came away with nothing (a locked slot is the
+                        -- usual cause). This draw does not travel now; the settlement
+                        -- wait before the retry is what makes the second attempt see
+                        -- a world that has stopped moving.
                         ClearCursor()
                         refused = refused + 1
                         td.click = false
@@ -606,20 +640,49 @@ end
 -- refused in plain language and the run re-arms or skips — it never sends.
 --
 -- Returns ok, reason.
--- `moved` is the units that LEFT THE BAGS across this whole attach, measured after
--- the client flushed its container updates. It is the authority: it is arithmetic
--- on two totals the client itself reported, taken at moments when the client had
--- finished writing them.
+--
+-- THREE WITNESSES, AND WHY THE ORDER CHANGED IN 1.2.3.
+--
+--   STAGED  what the engine put on the form, summed from the stack sizes it read
+--           off settled bag slots immediately before picking each one up whole.
+--           Since 1.2.3 the attach never asks for a partial, so this is not an
+--           intention — it is an observation, and it is the primary number.
+--   FORM    what GetSendMailItem reports across the send slots. Direct evidence
+--           about the very thing that is going to be posted, now that the owner's
+--           capture has settled its shape (count is return #4 on 11509) and every
+--           draw re-calibrates against a stack it watched itself pick up.
+--   BAGS    how much the bag totals fell by. THIS ONE STOPPED BEING THE AUTHORITY.
+--
+-- The bag subtraction was made authoritative in 1.2.2 on the reasoning that it is
+-- arithmetic on numbers the client itself reported and therefore cannot be misread.
+-- The reasoning was sound and the premise was wrong: the owner's trace shows the
+-- bag totals DO NOT MOVE while an attachment sits on the form on this client. Every
+-- attempt in his run measured zero having correctly attached a stack — pre 10, post
+-- 10, one attachment present, `units = 0`, refused. A witness that reads zero no
+-- matter what happened is not a strict guard, it is a broken one, and it refused
+-- eight good mails in a row.
+--
+-- So a bag delta of ZERO now means "this client keeps attachments in the bags until
+-- the mail is sent" and is recorded rather than believed. A NON-ZERO delta is still
+-- held to the plan exactly — that is what keeps the 1.2.0 over-attach dead on any
+-- client that does empty the slot.
 local function verifyAttach(mail, moved)
     local planned = tonumber(mail.units)
-    if planned and moved ~= nil and moved ~= planned then
+    local staged  = S.pendingUnits
+    local onForm  = formTotal()
+    S.traceFormSum = onForm
+
+    if planned and staged ~= planned then
+        return false, ("%s's mail should carry %d %s but %d would go on the form — not sending it.")
+            :format(tostring(mail.recipient), planned, mail.unitLabel or "item(s)", staged or 0)
+    end
+    if planned and onForm ~= nil and onForm ~= planned then
+        return false, ("%s's mail should carry %d %s but the form holds %d — not sending it.")
+            :format(tostring(mail.recipient), planned, mail.unitLabel or "item(s)", onForm)
+    end
+    if planned and moved ~= nil and moved ~= 0 and moved ~= planned then
         return false, ("%s's mail should carry %d %s but %d left your bags — not sending it.")
             :format(tostring(mail.recipient), planned, mail.unitLabel or "item(s)", moved)
-    end
-    if planned and moved == nil and S.pendingUnits ~= planned then
-        return false, ("%s's mail should carry %d %s but the form holds %d — not sending it.")
-            :format(tostring(mail.recipient), planned,
-                    mail.unitLabel or "item(s)", S.pendingUnits)
     end
     if mail.stacks and not planned and S.pendingCount < 1 then
         return false, ("nothing would attach for %s."):format(tostring(mail.recipient))
@@ -634,27 +697,6 @@ local function verifyAttach(mail, moved)
     if mail.stacks and S.pendingCount > (ns.MAX_ATTACH or 12) then
         return false, ("%s's mail has more attachments than a mail can carry — not sending it.")
             :format(tostring(mail.recipient))
-    end
-    -- THE FORM CORROBORATES; IT DOES NOT VETO.
-    --
-    -- Everything above compares the plan against measurements the engine made by
-    -- SUBTRACTION on the bags — arithmetic on numbers the client already handed
-    -- over, which cannot be misread. This last check asks the send slots what they
-    -- think they are holding, which is a different and weaker kind of evidence: the
-    -- position of the count in GetSendMailItem's returns is undocumented on 11509
-    -- and has to be inferred.
-    --
-    -- So a disagreement here means the INFERENCE is wrong, not that the mail is.
-    -- Treating it as a refusal is what let one bad guess, learned once and held for
-    -- the whole session, turn every subsequent mail into "the form holds 0" — a
-    -- failure that survives a retest because nothing ever revisits the guess.
-    -- Throw the guess away, record it, and let the bag arithmetic stand.
-    local onForm = formTotal()
-    S.traceFormSum = onForm
-    if planned and onForm ~= nil and onForm ~= planned then
-        D.formVetoDropped = D.formVetoDropped + 1
-        D.decalibrations  = D.decalibrations + 1
-        decalibrateFormCount()
     end
     return true
 end
@@ -747,9 +789,11 @@ end
 -- stops before it fires. `S.active` alone is not enough to catch that: a second run
 -- started in the meantime would satisfy it and the stale hop would arm a mail out
 -- of the wrong queue. Every deferred hop therefore carries the run it belongs to.
+-- Arguments are forwarded: staging hands its callbacks a result (ok, why, summary)
+-- and a wrapper that swallowed them would turn every staging outcome into "nil".
 local function thisRun(fn)
     local id = S.runId
-    return function() if S.active and S.runId == id then fn() end end
+    return function(...) if S.active and S.runId == id then fn(...) end end
 end
 
 local function resetState()
@@ -763,6 +807,7 @@ local function resetState()
     S.awaitingClick, S.pendingCount, S.pendingUnits, S.pendingGold = false, 0, 0, 0
     S.attempts, S.stopping = 0, false
     S.armMail, S.armIds, S.armBefore, S.armQuiet = nil, nil, nil, nil
+    S.stagedFor, S.stageWhy, S.stageBase = nil, nil, nil
     S.onFinish, S.rebuild, S.check, S.skipped = nil, nil, nil, nil
 end
 
@@ -810,6 +855,11 @@ local function abort(reason, mailboxGone)
     local sent = S.sentMails
     local skipped = skipReport()
     resetState()
+    -- ALWAYS put the cursor down, mailbox or no mailbox. ClearCursor is not
+    -- mailbox-gated, and a run aborted mid-STAGING can be holding a part-stack it
+    -- split a moment ago — leaving that riding the cursor is the sort of thing that
+    -- ends up dropped on a vendor.
+    if CursorHasItem and CursorHasItem() then ClearCursor() end
     if not mailboxGone then clearForm() end
     if reason then
         say(("stopped: %s (%d mail(s) already sent)."):format(reason, sent))
@@ -837,12 +887,25 @@ end
 local function finish()
     local mails, items, gold, units = S.sentMails, S.sentItems, S.sentGold, S.sentUnits
     local done, skipped, skippedRows = S.onFinish, skipReport(), S.skipped
+    -- How many stacks staging split to make this run's exact amounts. Read BEFORE
+    -- resetState, and reported, because the player's bags now look different from
+    -- how they left them and a silent rearrangement is the kind of thing that gets
+    -- mistaken for a bug.
+    local splits = 0
+    if ns.Staging and S.stageBase then
+        splits = (ns.Staging.Diagnostics().staged or 0) - S.stageBase
+        if splits < 0 then splits = 0 end
+    end
     resetState()
     if mails > 0 then
         local goldStr = (gold > 0 and GetCoinTextureString) and (" and " .. GetCoinTextureString(gold)) or ""
         say(("done — sent %d mail(s), %d item(s)%s."):format(mails, items, goldStr))
     else
         say("nothing to send.")
+    end
+    if splits > 0 and ns.Staging.Note then
+        local note = ns.Staging.Note(splits)
+        if note then say(note) end
     end
     if skipped then say(("skipped: %s."):format(table.concat(skipped, ", "))) end
     -- A caller that supplied its own completion line (RunQueue) gets it AFTER the
@@ -868,6 +931,7 @@ local function traceAttempt(mail, verdict, why, quiet)
         itemID  = mail and tonumber(mail.itemID),
         quiet   = quiet,
         redrawn = S.traceRedrawn,
+        retained = S.traceRetained,
         draws   = T and T.draws or nil,
         units   = S.pendingUnits, count = S.pendingCount,
         formSum = S.traceFormSum, cal = Mail._FormCalibration and Mail._FormCalibration(),
@@ -958,25 +1022,63 @@ local function onBagsMaybeSettled()
     if pred() then finishSettle() end
 end
 
--- Wait until the bags AGREE that `planned` units have left them.
+-- Wait until the WORLD AGREES about the mail that has just been armed.
 --
--- This is the fix for the failure that survived two rounds. The old code measured
--- one statement after the click, by re-reading the bag slot it had just drawn from.
--- This client does not write container updates that promptly: it defers them to its
--- next bag event — the same deferral the arm already waits on for LOCKS, and it
--- applies to COUNTS too. So the re-read returned the PRE-split number, the engine
--- measured that nothing had moved, and it refused a mail whose items were sitting
--- correctly on the form. Instantly. Every mail. First mail included, on quiet bags,
--- with no race to blame — which is exactly what the field logs showed and what an
--- empty outbox after a whole run proves.
+-- 1.2.2 waited for the bag totals to fall by exactly `planned` and gave them three
+-- seconds to do it. On this client they never do: the owner's capture shows the
+-- bags unchanged for as long as the attachment sits on the form, so every mail
+-- burned the whole ceiling and then measured zero. That is where his "very slow"
+-- came from — three seconds, twice per mail, to arrive at a refusal.
 --
--- Now the measurement waits for the client to agree, and asks the whole mail at
--- once rather than a slot at a time.
+-- Agreement is now whichever witness can actually speak:
+--   * the FORM says `planned`. The send slots are the client's own UI state, written
+--     the instant the click lands, so on a correct attach this is TRUE IMMEDIATELY
+--     and the wait costs nothing at all. That is where the run's speed comes back
+--     from: the arm no longer sits out a three-second ceiling per mail.
+--   * with no readable form, fall back to the bags — but only once they are STILL,
+--     because a half-written total is not a measurement. Either they fell by exactly
+--     `planned`, or they did not move at all (this client, holding the stack until
+--     the mail goes), and both are agreement.
+--
+-- Nothing here needs the bags settled to know what was attached: the attach counted
+-- whole stacks whose sizes it read off settled slots a moment earlier. The next
+-- mail's arm still waits for settlement — that wait was never optional and has not
+-- moved.
 local function awaitMeasured(ids, before, planned, fn)
     if not (ids and before and planned) then return awaitSettlement(fn) end
     return awaitCondition(function()
-        return (before - bagUnitsFor(ids)) == planned
+        local onForm = formTotal()
+        if onForm ~= nil then return onForm == planned end
+        if not bagsQuiet() then return false end
+        local delta = before - bagUnitsFor(ids)
+        return delta == planned or delta == 0
     end, fn, MEASURE_TIMEOUT)
+end
+
+-- WHY A MAIL COULD NOT BE PREPARED, in the owner's own words and with the way out.
+--
+-- Every one of these is a REFUSAL, not a failure: the boons are still in the bags,
+-- nothing was over-sent, and the sentence says what to do about it. The one that
+-- matters most is `blocked` — a client that will not split bag to bag either. That
+-- is the end of the road for automatic exact amounts, and the honest answer is to
+-- say so and hand the player the manual route rather than to quietly post a full
+-- stack to somebody who needed three.
+local function stagingRefusal(why, want, label)
+    label = label or "item(s)"
+    if why == "blocked" or why == "split" or why == "api" then
+        return ("this client will not split stacks for the mail — put a stack of exactly %d %s in your bags and run again.")
+            :format(want, label)
+    end
+    if why == "nofree" then
+        return ("no empty bag slot to make a stack of exactly %d %s — free one up and run again.")
+            :format(want, label)
+    end
+    if why == "verify" or why == "place" or why == "dest" or why == "stale" then
+        return ("could not make a stack of exactly %d %s in your bags (the bags moved under it) — run again.")
+            :format(want, label)
+    end
+    return ("no stacks in your bags add up to exactly %d %s, and one could not be made.")
+        :format(want, label)
 end
 
 -- Forward declarations: the loop is mutually recursive by nature (arm -> fire ->
@@ -1015,6 +1117,7 @@ function armCurrent()
         -- attempt was made into a still world or a moving one.
         local quiet = bagsQuiet()
         S.traceDraws, S.traceRedrawn, S.traceFormSum = nil, false, nil
+        S.traceRetained = nil
 
         -- RE-CHECK THE PLAN AGAINST LIVE TRUTH, per mail, immediately before the
         -- attach. This is what makes a resumed run send only the remainder: the
@@ -1030,27 +1133,66 @@ function armCurrent()
         end
 
         if not skipThis then
-            -- RE-DERIVE THE DRAWS. The plan's quantity is the contract; its bag
-            -- COORDINATES are not. They were worked out before the run started and
-            -- every mail since has moved the bags underneath them, so for any mail
-            -- that names an item and a quantity the slots are resolved fresh, here,
-            -- against the bags as they are at this instant. A stack that moved,
-            -- merged or emptied simply resolves to wherever the goods actually are.
+            -- RE-DERIVE THE DRAWS, OUT OF WHOLE STACKS ONLY. The plan's quantity is
+            -- the contract; its bag COORDINATES are not. They were worked out before
+            -- the run started and every mail since has moved the bags underneath
+            -- them, so for any mail that names an item and a quantity the slots are
+            -- resolved fresh, here, against the bags as they are at this instant.
+            --
+            -- 1.2.3: the composition may only use stacks WHOLE (Rules.ComposeWhole),
+            -- because splitting onto the send form delivers the whole stack on this
+            -- client. When no combination adds up, the amount is made in the bags
+            -- first (staging.lua) and this is re-run — once. Never split-to-form,
+            -- and never rounded up.
             local draws
             if mail.itemID and tonumber(mail.units) and Rules.ScanStacksForItem then
-                local live = Rules.ScanStacksForItem(mail.itemID)
+                local live  = Rules.ScanStacksForItem(mail.itemID)
+                local wantN = tonumber(mail.units)
                 local total
-                draws, total = Rules.DrawExact(live, mail.units, ns.MAX_ATTACH)
+                draws, total = Rules.ComposeWhole(live, wantN, ns.MAX_ATTACH)
                 D.redrawn = D.redrawn + 1
                 S.traceRedrawn = true
-                if total < tonumber(mail.units) then
+                if not draws and total < wantN then
                     -- Not enough of it left in the bags to honour the plan. This is
                     -- a shortfall, not a race — say so plainly and move on rather
                     -- than burning the retry on a wait that cannot help.
                     clearForm()
                     S.pendingCount, S.pendingUnits, S.pendingGold = 0, 0, 0
                     local why = ("only %d %s left in your bags, %d were planned")
-                        :format(total, mail.unitLabel or "item(s)", tonumber(mail.units))
+                        :format(total, mail.unitLabel or "item(s)", wantN)
+                    noteSkip(mail.recipient, why)
+                    traceAttempt(mail, "skipped", why, quiet)
+                    skipThis = true
+                elseif not draws and Rules.AnySlotLocked and Rules.AnySlotLocked()
+                       and S.attempts < RETRY_BUDGET then
+                    -- STILL MOVING, NOT MISSING. A locked stack cannot be picked up,
+                    -- so it is not offered to the composition — but it has not gone
+                    -- anywhere either. The settlement ceiling expiring early is the
+                    -- only way to get here, and the answer is to wait again with a
+                    -- longer rope, not to declare a shortfall on a bag the client
+                    -- simply had not finished putting down.
+                    S.attempts = S.attempts + 1
+                    awaitCondition(bagsQuiet, armCurrent, MEASURE_TIMEOUT)
+                    return
+                elseif not draws then
+                    -- The units are there; they are not in stacks that add up. Make
+                    -- one that does — ONCE per mail, so a client that will not split
+                    -- costs a single ceiling and not one per retry.
+                    if S.stagedFor ~= S.idx and ns.Staging and not ns.Staging.IsBlocked() then
+                        S.stagedFor, S.stageWhy = S.idx, nil
+                        D.stagedMails = D.stagedMails + 1
+                        clearForm()
+                        S.pendingCount, S.pendingUnits, S.pendingGold = 0, 0, 0
+                        ns.Staging.PrepareOne(mail.itemID, wantN, awaitCondition,
+                            thisRun(function(okStage, whyStage)
+                                if not okStage then S.stageWhy = whyStage or "stage" end
+                                armCurrent()
+                            end), { maxAttach = ns.MAX_ATTACH })
+                        return
+                    end
+                    clearForm()
+                    S.pendingCount, S.pendingUnits, S.pendingGold = 0, 0, 0
+                    local why = stagingRefusal(S.stageWhy, wantN, mail.unitLabel)
                     noteSkip(mail.recipient, why)
                     traceAttempt(mail, "skipped", why, quiet)
                     skipThis = true
@@ -1103,10 +1245,18 @@ function verifyAndFire()
     local moved = nil
     if S.armIds and S.armBefore then
         moved = S.armBefore - bagUnitsFor(S.armIds)
-        -- The authoritative units for this mail. Everything downstream — the send
-        -- guard, the completion line, the outbound ledger — uses this number and
-        -- not the attach's running total.
-        if (tonumber(mail.money) or 0) <= 0 then S.pendingUnits = moved end
+        -- ZERO MEANS "STILL IN THE BAGS", NOT "NOTHING HAPPENED".
+        --
+        -- 1.2.2 overwrote the attach's own count with this subtraction and made it
+        -- the authority. On this client it is always zero while the goods sit on the
+        -- form — the owner's capture proves it — so the authority measured nothing
+        -- and refused everything. S.pendingUnits now stays as the attach observed
+        -- it: the sum of the whole stacks it watched itself pick up. The delta is
+        -- recorded, and only contradicts the attach when it is non-zero.
+        if moved == 0 and (S.pendingUnits or 0) > 0 then
+            D.bagsRetained = D.bagsRetained + 1
+            S.traceRetained = true
+        end
     end
 
     local okAttach, whyAttach = verifyAttach(mail, moved)
@@ -1327,6 +1477,39 @@ local function beginConfirmed(queue, opts)
     S.sentMails, S.sentItems, S.sentGold, S.sentUnits = 0, 0, 0, 0
     S.awaitingClick, S.attempts, S.stopping = false, 0, false
     S.skipped = nil
+    S.stagedFor, S.stageWhy = nil, nil
+    S.stageBase = (ns.Staging and ns.Staging.Diagnostics().staged) or 0
+
+    -- ONE STAGING PASS FOR THE WHOLE RUN, BEFORE THE FIRST MAIL.
+    --
+    -- Every exact amount this run needs is prepared here, in the bags, in a single
+    -- sweep with a single settlement wait at the end. The alternative — staging each
+    -- mail as it comes up — pays a client round trip per mail, and the owner has
+    -- already told us what that feels like ("very slow"). Whatever cannot be
+    -- prepared up front (usually for want of empty bag slots) is prepared per-mail
+    -- later, by which time the mails that have gone have freed their slots again.
+    --
+    -- A pass that fails does NOT stop the run: each mail is still re-checked and
+    -- refused individually with its own reason, which is a far more useful report
+    -- than one abort at the top.
+    if ns.Staging then
+        notifyPanel()
+        ns.Staging.PrepareQueue(queue, awaitCondition, thisRun(function(summary)
+            if summary.jobs > 0 and summary.ok then
+                say(("prepared %d exact stack(s) in your bags."):format(summary.jobs))
+            elseif summary.jobs > 0 and not summary.ok then
+                say((summary.why == "split" or summary.why == "blocked" or summary.why == "api")
+                    and ns.Staging.BLOCKED_ADVICE
+                    or  "could not prepare the exact stacks in your bags — each mail will say what it needed.")
+            end
+            if summary.freeShort > 0 then
+                say(("%d mail(s) need an empty bag slot to prepare and there were none spare — they will be prepared as the run goes.")
+                    :format(summary.freeShort))
+            end
+            armCurrent()
+        end), { maxAttach = ns.MAX_ATTACH })
+        return
+    end
 
     armCurrent()
     notifyPanel()

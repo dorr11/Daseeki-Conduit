@@ -247,10 +247,15 @@ end
 --
 -- PURE. `stacks` is an ordered array of { bag, slot, itemID, count }; returns the
 -- draws that add up to `want` (or as close as the stacks allow), each marked
--- `exact` so the send engine splits rather than taking whole stacks, plus the
--- total they come to. Walks in bag order and takes the largest bite each slot can
--- give, which keeps the attachment count as low as possible — attachments cost
--- postage and there are only twelve.
+-- `exact`, plus the total they come to. Walks in bag order and takes the largest
+-- bite each slot can give.
+--
+-- NOT USED BY THE SEND ENGINE SINCE 1.2.3, and deliberately kept. It plans PARTIAL
+-- bites, which the attach can no longer honour (splitting onto the mail form
+-- delivers the whole stack on 11509 — see ComposeWhole below). It survives because
+-- the harness reconstructs the 1.2.2 engine from the shipped source to keep the
+-- owner's empty-outbox run as a standing red fixture, and that reconstruction needs
+-- the function it actually called. Delete it and GATE STAGE loses its red half.
 function Rules.DrawExact(stacks, want, maxAttach)
     maxAttach = tonumber(maxAttach) or 12
     if maxAttach < 1 then maxAttach = 1 end
@@ -271,6 +276,105 @@ function Rules.DrawExact(stacks, want, maxAttach)
     return draws, total
 end
 
+-- ── Composing an exact quantity out of WHOLE stacks ──────────────────────────
+--
+-- WHY THIS EXISTS, AND WHY DrawExact ABOVE IS NO LONGER THE ARM-TIME DRAW.
+--
+-- DrawExact plans a PARTIAL bite out of a stack and leaves the send engine to take
+-- it with C_Container.SplitContainerItem straight onto the Send Mail form. The
+-- owner's field trace proves that on Classic Era 11509 that sequence — split N,
+-- then ClickSendMailItemButton — puts the WHOLE STACK on the form. Deterministic,
+-- on quiet bags, on an unlocked slot: asked for 7 out of 10, the form came back
+-- holding 10, every single time, and the guard (correctly) refused every mail.
+--
+-- So the engine stops asking the form to hold a partial stack at all. A mail is now
+-- assembled ONLY out of stacks that are already exactly the right size, and the
+-- splitting happens BAG TO BAG beforehand (staging.lua), where the client behaves —
+-- the owner splits stacks by hand every day.
+--
+-- This function is the other half of that: given the stacks that exist, find a set
+-- of WHOLE ones that add up to exactly `want`. Nothing is ever sliced here.
+--
+-- PURE. Returns draws, total, picked where
+--   draws  = { { bag, slot, itemID, count, exact = true, whole = true }, ... } or nil
+--   total  = units available across all the stacks offered (for a shortfall message)
+--   picked = the ORIGINAL stack tables chosen, so a caller keeping a claim pool can
+--            mark them (staging.lua does)
+--
+-- Exact subset-sum is exponential in general; here it is a handful of stacks of at
+-- most ten, so a depth-first search over the stacks in DESCENDING size — which
+-- finds the fewest-attachment answer first, and attachments cost postage — with a
+-- hard node budget is both complete in practice and incapable of hanging. A greedy
+-- walk is NOT enough: want 7 out of stacks {5,4,3} needs 4+3, and greedy takes the
+-- 5 and dies.
+function Rules.ComposeWhole(stacks, want, maxAttach)
+    maxAttach = tonumber(maxAttach) or 12
+    if maxAttach < 1 then maxAttach = 1 end
+    want = math.floor(tonumber(want) or 0)
+
+    -- A LOCKED STACK CANNOT BE PICKED UP, BUT IT IS STILL IN YOUR BAGS. It is left
+    -- out of the composition (the pickup would silently do nothing) and counted in
+    -- the total, because the total is what the caller turns into "only %d left in
+    -- your bags" — and telling a player their boons are gone because the client had
+    -- not finished putting them down is exactly the kind of lie this file exists to
+    -- stop. A caller that gets nil back with total >= want knows to wait, not to
+    -- give up.
+    local items, total = {}, 0
+    for _, s in ipairs((type(stacks) == "table") and stacks or {}) do
+        local c = math.floor(tonumber(s.count) or 0)
+        if c > 0 then
+            total = total + c
+            if not s.locked then
+                items[#items + 1] = { ref = s, count = c, bag = tonumber(s.bag) or 0,
+                                      slot = tonumber(s.slot) or 0, itemID = s.itemID }
+            end
+        end
+    end
+    if want < 1 then return nil, total, nil end
+
+    -- Descending by size, then bag order — deterministic, so the same bags always
+    -- plan the same way and a capture can be reasoned about.
+    table.sort(items, function(a, b)
+        if a.count ~= b.count then return a.count > b.count end
+        if a.bag   ~= b.bag   then return a.bag   < b.bag   end
+        return a.slot < b.slot
+    end)
+
+    local budget = { n = 20000 }
+    local chosen = {}
+    local function search(from, remaining)
+        if remaining == 0 then return true end
+        if from > #items or #chosen >= maxAttach then return false end
+        for j = from, #items do
+            budget.n = budget.n - 1
+            if budget.n <= 0 then return false end
+            local it = items[j]
+            if it.count <= remaining then
+                chosen[#chosen + 1] = it
+                if search(j + 1, remaining - it.count) then return true end
+                chosen[#chosen] = nil
+            end
+        end
+        return false
+    end
+
+    if not search(1, want) then return nil, total, nil end
+
+    -- Hand them back in bag order: the attach walks them in the order given, and a
+    -- bag-ordered mail is the one a player can follow along with.
+    table.sort(chosen, function(a, b)
+        if a.bag ~= b.bag then return a.bag < b.bag end
+        return a.slot < b.slot
+    end)
+    local draws, picked = {}, {}
+    for i, it in ipairs(chosen) do
+        draws[i]  = { bag = it.bag, slot = it.slot, itemID = it.itemID,
+                      count = it.count, exact = true, whole = true }
+        picked[i] = it.ref
+    end
+    return draws, total, picked
+end
+
 -- Every mailable stack of ONE item in the bags, in bag order. Runtime (reads live
 -- containers); the shape matches what DrawExact wants.
 function Rules.ScanStacksForItem(itemID)
@@ -284,6 +388,52 @@ function Rules.ScanStacksForItem(itemID)
             if info and info.itemID == itemID and Rules.IsMailable(info) then
                 out[#out + 1] = { bag = bag, slot = slot, itemID = itemID,
                                   count = info.count or 1, locked = info.isLocked or nil }
+            end
+        end
+    end
+    return out
+end
+
+-- Is this bag slot verifiably EMPTY? Runtime. Deliberately asks the container API
+-- directly rather than going through SlotInfo, which also returns nil for a slot
+-- holding something it could not identify — and staging must never drop a split
+-- into a slot that merely looked empty.
+function Rules.SlotEmpty(bag, slot)
+    local C = C_Container
+    if not (C and C.GetContainerItemInfo) then return false end
+    if C.HasContainerItem then return not C.HasContainerItem(bag, slot) end
+    return C.GetContainerItemInfo(bag, slot) == nil
+end
+
+-- Empty bag slots a GENERIC item may be dropped into, in bag order. Runtime.
+--
+-- Staging needs somewhere to put a split-off part-stack, and "somewhere" has two
+-- requirements the client enforces and will not explain: the slot must be empty,
+-- and its bag must accept the item. Profession bags, quivers and soul bags report a
+-- non-zero bagFamily from C_Container.GetContainerNumFreeSlots and will silently
+-- refuse anything that does not belong to that family, so only family-0 bags (and
+-- the backpack, which is always family 0) are offered here. A client that does not
+-- expose the call at all degrades to "offer everything" — the placement is verified
+-- against the destination slot afterwards either way, so a wrong guess is a clean
+-- staging failure rather than a lost stack.
+function Rules.FreeBagSlots(limit)
+    local out = {}
+    local C = C_Container
+    if not (C and C.GetContainerNumSlots) then return out end
+    for bag = 0, (NUM_BAG_SLOTS or 4) do
+        local usable = true
+        if bag ~= 0 and C.GetContainerNumFreeSlots then
+            local free, family = C.GetContainerNumFreeSlots(bag)
+            if (tonumber(free) or 0) <= 0 then usable = false end
+            if (tonumber(family) or 0) ~= 0 then usable = false end
+        end
+        if usable then
+            local n = C.GetContainerNumSlots(bag) or 0
+            for slot = 1, n do
+                if Rules.SlotEmpty(bag, slot) then
+                    out[#out + 1] = { bag = bag, slot = slot }
+                    if limit and #out >= limit then return out end
+                end
             end
         end
     end

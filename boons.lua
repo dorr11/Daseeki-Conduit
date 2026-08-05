@@ -745,16 +745,30 @@ function Boons.Debug(arg)
         local d = ns.Mail.Diagnostics()
         ns:Print(("attach: %d mail(s) armed, %d re-drawn from a fresh scan, %d stale coordinate(s)")
             :format(d.mails, d.redrawn, d.staleCoords))
-        ns:Print(("  splits: %d asked, %d delivered, %d taken-but-not-handed-over, %d via the legacy call, %d refused")
-            :format(d.splitAttempted, d.splitDelivered, d.splitAsync, d.splitFellBack, d.splitFailed))
-        ns:Print(("  draws refused: %d (%d on a locked slot)   settle waits: %d (%d hit the ceiling)")
-            :format(d.drawsRefused, d.lockedSlots, d.settleWaits, d.settleTimeouts))
+        ns:Print(("  whole-stack pickups: %d delivered, %d via the legacy call, %d came away empty")
+            :format(d.pickups, d.pickupFellBack, d.pickupFailed))
+        ns:Print(("  draws refused: %d (%d on a locked slot, %d not a whole stack)   settle waits: %d (%d hit the ceiling)")
+            :format(d.drawsRefused, d.lockedSlots, d.partialRefused, d.settleWaits, d.settleTimeouts))
         local cal = ns.Mail._FormCalibration and ns.Mail._FormCalibration()
-        ns:Print(("  form counts: %s   disagreements with the bag delta: %d   unreadable: %d")
+        ns:Print(("  form counts: %s   disagreed with the stack picked up: %d   unreadable: %d   re-learned: %d")
             :format(cal and ("read from return #" .. cal) or "not calibrated yet",
-                    d.formBagDisagree, d.formUnreadable))
-        ns:Print(("  form re-learned: %d time(s); form vetoes ignored: %d")
-            :format(d.decalibrations, d.formVetoDropped))
+                    d.formBagDisagree, d.formUnreadable, d.decalibrations))
+        -- THE ONE LINE THAT NAMES THE 1.2.3 CLIENT BEHAVIOUR. A non-zero count here
+        -- says the bags do not shrink while an attachment sits on the form, which is
+        -- why the bag subtraction is no longer the send guard's authority.
+        ns:Print(("  attaches where the bags did not move: %d (this client keeps them until the mail goes)")
+            :format(d.bagsRetained))
+    end
+
+    -- PRE-SPLIT STAGING. Exact amounts are made in the bags before anything is
+    -- attached; this is where a run that could not prepare one says why.
+    if ns.Staging and ns.Staging.Diagnostics then
+        local s = ns.Staging.Diagnostics()
+        ns:Print(("staging: %d pass(es), %d split(s) asked, %d staged, %d served by stacks that were already exact")
+            :format(s.passes, s.splits, s.staged, s.reusedExact))
+        ns:Print(("  refused: %d no empty bag slot, %d client would not split, %d not placed, %d failed verification%s")
+            :format(s.noFreeSlot, s.splitRefused, s.placeFailed, s.verifyFailed,
+                    ns.Staging.IsBlocked() and "  [STAGING BLOCKED for this session]" or ""))
     end
 
     -- THE TRACE. One line here; the detail lives in SavedVariables
