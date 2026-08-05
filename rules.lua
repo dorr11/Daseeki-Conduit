@@ -183,7 +183,15 @@ end
 local QUEST_CLASS = 12
 
 -- Resolve the class/subclass/binding of a bag slot's item. Returns an info table
--- { itemID, classID, subClassID, isBound, count } or nil for an empty/unknown slot.
+-- { itemID, classID, subClassID, isBound, isLocked, count } or nil for an
+-- empty/unknown slot.
+--
+-- `isLocked` is load-bearing and was previously dropped on the floor. The client
+-- locks a bag slot while a container operation involving it is in flight, and a
+-- LOCKED SLOT SILENTLY REFUSES C_Container.SplitContainerItem — no error, no
+-- cursor, nothing. In a hands-free batch the next mail is armed within
+-- milliseconds of the last one being confirmed, which is exactly when slots are
+-- still locked, so the engine has to be able to see it.
 function Rules.SlotInfo(bag, slot)
     local C = C_Container
     if not (C and C.GetContainerItemInfo) then return nil end
@@ -199,8 +207,24 @@ function Rules.SlotInfo(bag, slot)
         classID    = classID,
         subClassID = subClassID,
         isBound    = ci.isBound and true or false,
+        isLocked   = ci.isLocked and true or false,
         count      = ci.stackCount or 1,
     }
+end
+
+-- Is any bag slot mid-operation? While one is, container calls against it are
+-- refused silently, so the send engine waits rather than attaching into the gap.
+function Rules.AnySlotLocked()
+    local C = C_Container
+    if not (C and C.GetContainerNumSlots and C.GetContainerItemInfo) then return false end
+    for bag = 0, (NUM_BAG_SLOTS or 4) do
+        local n = C.GetContainerNumSlots(bag) or 0
+        for slot = 1, n do
+            local ci = C.GetContainerItemInfo(bag, slot)
+            if ci and ci.isLocked then return true end
+        end
+    end
+    return false
 end
 
 -- Can this slot's item be mailed? Soulbound and quest items cannot; anything else
@@ -211,6 +235,59 @@ function Rules.IsMailable(info)
     if info.isBound then return false end
     if info.classID == QUEST_CLASS then return false end
     return true
+end
+
+-- ── Drawing an EXACT quantity out of the bags ────────────────────────────────
+--
+-- The plan says how many units a character is owed. It does NOT get to say which
+-- bag slots they come out of — those coordinates go stale the moment anything
+-- moves, and in a hands-free batch something moves after every single mail. So the
+-- quantity is the contract and the coordinates are re-derived from a fresh scan
+-- immediately before each attach.
+--
+-- PURE. `stacks` is an ordered array of { bag, slot, itemID, count }; returns the
+-- draws that add up to `want` (or as close as the stacks allow), each marked
+-- `exact` so the send engine splits rather than taking whole stacks, plus the
+-- total they come to. Walks in bag order and takes the largest bite each slot can
+-- give, which keeps the attachment count as low as possible — attachments cost
+-- postage and there are only twelve.
+function Rules.DrawExact(stacks, want, maxAttach)
+    maxAttach = tonumber(maxAttach) or 12
+    if maxAttach < 1 then maxAttach = 1 end
+    want = math.floor(tonumber(want) or 0)
+    local draws, total = {}, 0
+    if want < 1 then return draws, 0 end
+    for _, s in ipairs((type(stacks) == "table") and stacks or {}) do
+        if want <= 0 or #draws >= maxAttach then break end
+        local have = math.floor(tonumber(s.count) or 0)
+        if have > 0 then
+            local take = (have > want) and want or have
+            draws[#draws + 1] = { bag = s.bag, slot = s.slot, itemID = s.itemID,
+                                  count = take, exact = true }
+            want  = want - take
+            total = total + take
+        end
+    end
+    return draws, total
+end
+
+-- Every mailable stack of ONE item in the bags, in bag order. Runtime (reads live
+-- containers); the shape matches what DrawExact wants.
+function Rules.ScanStacksForItem(itemID)
+    local out = {}
+    local C = C_Container
+    if not (C and C.GetContainerNumSlots and itemID) then return out end
+    for bag = 0, (NUM_BAG_SLOTS or 4) do
+        local n = C.GetContainerNumSlots(bag) or 0
+        for slot = 1, n do
+            local info = Rules.SlotInfo(bag, slot)
+            if info and info.itemID == itemID and Rules.IsMailable(info) then
+                out[#out + 1] = { bag = bag, slot = slot, itemID = itemID,
+                                  count = info.count or 1, locked = info.isLocked or nil }
+            end
+        end
+    end
+    return out
 end
 
 -- Scan bags for mailable stacks matching a single item rule.

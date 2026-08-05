@@ -545,23 +545,14 @@ local function roster()
     return ns.Network.GetRoster()
 end
 
--- Mailable boon stacks in THIS character's bags, in bag order.
+-- Mailable boon stacks in THIS character's bags, in bag order. One scanner, in
+-- rules.lua, because the send engine re-derives its draws from the SAME scan
+-- immediately before each attach — two scanners would be two answers.
 function Boons.ScanStacks(itemID)
     itemID = itemID or Boons.ITEM_ID
-    local out = {}
-    local C = C_Container
     local R = ns.Rules
-    if not (C and C.GetContainerNumSlots and R) then return out end
-    for bag = 0, (NUM_BAG_SLOTS or 4) do
-        local n = C.GetContainerNumSlots(bag) or 0
-        for slot = 1, n do
-            local info = R.SlotInfo(bag, slot)
-            if info and info.itemID == itemID and R.IsMailable(info) then
-                out[#out + 1] = { bag = bag, slot = slot, itemID = itemID, count = info.count or 1 }
-            end
-        end
-    end
-    return out
+    if not (R and R.ScanStacksForItem) then return {} end
+    return R.ScanStacksForItem(itemID)
 end
 
 -- What the mesh has SEEN of each character's boon count, and when. This is the
@@ -732,6 +723,24 @@ function Boons.Debug(arg)
         ns:Print(("  %s  <-  %d of %d  (has %d%s)")
             :format(t.name, t.send, t.need, t.have,
                     (t.inTransit or 0) > 0 and (", " .. t.inTransit .. " in transit") or ""))
+    end
+
+    -- ATTACH DIAGNOSTICS. What the client actually did to the bags while the last
+    -- run was arming its mails. The live 1.2.0 failure — every mail refusing with
+    -- "the form holds 0" — was undiagnosable from chat, and these are the numbers
+    -- that would have named it in one line. Session-cumulative.
+    if ns.Mail and ns.Mail.Diagnostics then
+        local d = ns.Mail.Diagnostics()
+        ns:Print(("attach: %d mail(s) armed, %d re-drawn from a fresh scan, %d stale coordinate(s)")
+            :format(d.mails, d.redrawn, d.staleCoords))
+        ns:Print(("  splits: %d asked, %d delivered, %d taken-but-not-handed-over, %d via the legacy call, %d refused")
+            :format(d.splitAttempted, d.splitDelivered, d.splitAsync, d.splitFellBack, d.splitFailed))
+        ns:Print(("  draws refused: %d (%d on a locked slot)   settle waits: %d (%d hit the ceiling)")
+            :format(d.drawsRefused, d.lockedSlots, d.settleWaits, d.settleTimeouts))
+        local cal = ns.Mail._FormCalibration and ns.Mail._FormCalibration()
+        ns:Print(("  form counts: %s   disagreements with the bag delta: %d   unreadable: %d")
+            :format(cal and ("read from return #" .. cal) or "not calibrated yet",
+                    d.formBagDisagree, d.formUnreadable))
     end
 end
 
