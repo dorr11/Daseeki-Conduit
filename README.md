@@ -17,12 +17,27 @@ click at any open mailbox — no more manual alt-shuffling.
 - **Send Consumes preset** — a ready-made rule seeded with common raid/dungeon
   consumables.
 - **Mailbox panel** — a compact panel beside the mail window lists your rules
-  with per-rule **Send** buttons, a **Run All** button, and a live progress line.
+  with per-rule **Send** buttons, a **Run All** button, a live progress line, and
+  a **Stop** button for the duration of a run.
 - **Mandatory confirm-before-send** — every run shows a dry-run summary (items,
   gold, mail count, per-recipient breakdown) and sends nothing until you accept.
+- **Hands-free runs** — that one Accept is the only interaction a batch needs.
+  Mails go out strictly one at a time; the next begins only when the previous one
+  has been *confirmed twice over* — the server's `MAIL_SUCCESS`, and the goods
+  themselves leaving (the money delta for a gold mail, the attachments leaving
+  the bags for an item mail). 15s ceilings on each, after which the run stops
+  with a report and clears its own state; 0.5s spacing after failures only; one
+  retry per mail, then that recipient is skipped by name and the run continues.
+  A settings toggle restores the old one-mail-per-click stepping.
 - **Guards** — recipient validation, no self-send, soulbound/quest/unmailable
-  exclusion, and the postage buffer. Runs abort cleanly if the mailbox closes or
-  a mail fails.
+  exclusion, and the postage buffer. **Nothing is sent unless what the Send Mail
+  form holds matches what the plan asked for**, so a mail can never carry more
+  than it was planned to. Runs abort cleanly if the mailbox closes or a mail
+  fails.
+- **Outbound ledger** — every confirmed send is recorded, and mail still in the
+  post counts as already delivered when the next plan is built. A boon run
+  interrupted at two of eight plans only the remaining six when you come back.
+  Entries retire as soon as Nexus sees the goods arrive, or after 30 days.
 - **Per-character disable** — opt a character out without deleting rules.
 - **Auto-friend mail recipients** — Blizzard only asks you to confirm mail to
   someone who is not on your friends list, so Conduit adds each configured
@@ -47,6 +62,8 @@ click at any open mailbox — no more manual alt-shuffling.
 - Configure rules in the Daseeki hub: `/conduit settings` (or `/cdt`).
 - `/conduit debug selftest` runs the built-in rule/batch/gold self-tests.
 - `/conduit debug friends` shows what auto-friend would do on this character.
+- `/conduit debug boons` shows the boon plan plus the outbound ledger with ages;
+  `/conduit debug boons clear` empties the ledger.
 
 ## Requires
 
@@ -62,5 +79,16 @@ click at any open mailbox — no more manual alt-shuffling.
   every file the `.toc` lists, the clean-room firewall, the shipped pure
   self-test suites, SavedVariables additivity, an end-to-end auto-friend
   drive against a stubbed friends list, and a MUTATION TEST of the boon plan
-  builder (twelve one-operator mutants, all of which must be killed by the
+  builder (thirteen one-operator mutants, all of which must be killed by the
   suites). Exit 0 = all pass.
+- `harness/mailsim.lua` stands the Classic Era mailbox up in plain Lua — bags, a
+  cursor, split/pickup semantics, twelve attachment slots that report their stack
+  counts, a `SendMail` that answers on a **virtual clock** — so the live send
+  engine can be driven headless. That is what lets three further gates exist:
+  **GATE ATTACH** reproduces the 1.2.0 over-attach against the pre-fix engine
+  (reconstructed from the shipped source by three edits) and then proves both the
+  new attach and the new send guard kill it independently; **GATE RUN** drives the
+  hands-free state machine through its success path, both timeouts,
+  retry-then-skip, the mailbox-close abort, the one-in-flight invariant and the
+  Send-button ticker's whole lifecycle; **GATE LEDGER** walks the outbound
+  ledger's rules row by row and replays the owner's over-mail scenario verbatim.

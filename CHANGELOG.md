@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+- **A boon mail can no longer carry more than it was planned to.** A live run
+  planned seven Chronoboon Displacers for one character and put **two whole stacks
+  of ten** on the Send Mail form — twenty boons, sixty copper of postage, and
+  nothing in the addon noticing. The attach worked out how many it wanted, called
+  the game's split-or-pickup, checked only that the attachment slot was no longer
+  empty, and then wrote down the number it had *asked* for. It never asked the form
+  what had actually landed. Worse, the same code deliberately fell back to picking
+  up the **whole stack** whenever it could not split — so a seven-unit top-up drawn
+  across two slots quietly became twenty.
+
+  The attach now reads the amount back off the form and puts anything that is not
+  exactly what was asked for straight back in the bag. There is no rounding up: a
+  top-up that cannot be split exactly sends nothing rather than sending a whole
+  stack. And on top of that, **nothing is sent at all until what the form holds
+  matches what the plan says** — if they ever disagree the mail is refused in plain
+  language and the run moves on. Leaving boons behind is a nuisance; posting ten of
+  them to the wrong character is not.
+
+- **One click sends the whole batch.** Conduit used to ask you to click "Send Next"
+  for every single mail, on the belief that the game required a real button press
+  per send. It does not — not on Classic Era. Accept the preview once and the run
+  sends itself: one mail at a time, each one waiting for the server to confirm the
+  last before the next goes out, with a live progress line and a **Stop** button on
+  the panel for the whole run.
+
+  Every mail is confirmed twice over — the server's acknowledgement, *and* the
+  attachments or gold actually leaving — before the next one starts. If either
+  answer fails to arrive within fifteen seconds the run stops with a report and
+  hands everything back; it never wedges in a state that needs a UI reload. A mail
+  that fails is retried once and then that recipient is skipped by name, so one bad
+  address no longer costs you the other nine mails. Closing the mailbox mid-run
+  stops it dead. If you would rather drive each mail yourself, **Settings ->
+  Sending -> "One mail per click"** puts the old behaviour back.
+
+- **An interrupted run no longer re-mails what it already sent.** Cross-realm and
+  cross-account mail takes an hour to arrive, so for that hour Nexus still shows a
+  character holding what they held *before* your top-up — which meant a run that
+  stopped half-way and was started again would happily post the first few mails a
+  second time. Conduit now keeps a record of what it has confirmed sending and
+  treats it as already owned: the preview says "has 9, 1 in transit — nothing to
+  send", and a run stopped at two of eight plans **six** when you come back, not
+  eight. Entries clear themselves as soon as Nexus sees the boons arrive, and expire
+  after thirty days regardless. `/conduit debug boons` shows the plan and everything
+  currently in the post, with ages; `/conduit debug boons clear` empties it.
+
 - **The Replenish Boons button works at the mailbox it was greyed out at.** Open a
   mailbox on your boon source and the button was as likely as not to sit greyed and
   unclickable for the whole visit, with the panel cheerfully reading "Ready." The
