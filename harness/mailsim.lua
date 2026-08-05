@@ -46,6 +46,17 @@ function M.New(layout, opts)
         -- attach poisoning: return an override count for a requested split
         poison = opts.poison,
         noSplit = opts.noSplit,
+        splitAsync = opts.splitAsync,
+        -- ASYNC BAG SETTLEMENT (the live 11509 behaviour that broke 1.2.0).
+        -- With this on, a send does not update the bags in the same breath: the
+        -- slots it touched are LOCKED, the counts are stale, and both only come
+        -- right when the simulated BAG_UPDATE_DELAYED tick lands `settleDelay`
+        -- later. A locked slot refuses SplitContainerItem silently, exactly as the
+        -- client does.
+        asyncBags = opts.asyncBags,
+        settleDelay = opts.settleDelay or 0.4,
+        locks = {},          -- [bag] = { [slot] = true }
+        pendingSettle = nil,
         events = {},
         buttonEnabled = true,
         disableCalls = 0, enableCalls = 0,
@@ -102,6 +113,41 @@ function M:LiveTimers()
     local n = 0
     for _, t in ipairs(self.timers) do if not t.cancelled then n = n + 1 end end
     return n
+end
+
+-- ── async bag settlement ──────────────────────────────────────────────────────
+--
+-- Lock every slot that currently holds `itemID` (the client locks what a pending
+-- container/mail operation touches), and schedule the unlock plus the
+-- BAG_UPDATE_DELAYED that says the burst is over.
+function M:disturbBags(itemID)
+    if not self.asyncBags then
+        self:Fire("BAG_UPDATE_DELAYED")
+        return
+    end
+    for bag = 0, 4 do
+        local b = self.bags[bag]
+        if b then
+            for slot = 1, b.size do
+                local s = b[slot]
+                if s and (itemID == nil or s.itemID == itemID) then
+                    self.locks[bag] = self.locks[bag] or {}
+                    self.locks[bag][slot] = true
+                end
+            end
+        end
+    end
+    if self.pendingSettle then self.pendingSettle.cancelled = true end
+    self.pendingSettle = self:schedule(self.settleDelay, function()
+        self.locks = {}
+        self.pendingSettle = nil
+        self:Fire("ITEM_LOCK_CHANGED")
+        self:Fire("BAG_UPDATE_DELAYED")
+    end)
+end
+
+function M:isLocked(bag, slot)
+    return (self.locks[bag] and self.locks[bag][slot]) and true or false
 end
 
 -- ── bags ──────────────────────────────────────────────────────────────────────
@@ -188,10 +234,13 @@ function M:Install(G)
         GetContainerItemInfo = function(bag, slot)
             local b = sim.bags[bag]; local s = b and b[slot]
             if not s then return nil end
-            return { itemID = s.itemID, stackCount = s.count, isBound = s.isBound and true or false }
+            return { itemID = s.itemID, stackCount = s.count,
+                     isBound = s.isBound and true or false,
+                     isLocked = sim:isLocked(bag, slot) }
         end,
         PickupContainerItem = function(bag, slot)
             local b = sim.bags[bag]; local s = b and b[slot]
+            if sim:isLocked(bag, slot) then return end
             if sim.cursor then
                 if not s then b[slot] = sim.cursor; sim.cursor = nil
                 else b[slot], sim.cursor = sim.cursor, s end
@@ -203,6 +252,25 @@ function M:Install(G)
         end,
         SplitContainerItem = function(bag, slot, n)
             local b = sim.bags[bag]; local s = b and b[slot]
+            -- A LOCKED SLOT REFUSES SILENTLY. No error, no cursor, nothing — this
+            -- one line is the whole live 1.2.0 failure.
+            if sim:isLocked(bag, slot) then return end
+            -- A split that takes from the slot but hands the stack over a frame
+            -- later. Asking again would take a second helping — which is the whole
+            -- reason the engine has to tell this apart from a no-op.
+            if sim.splitAsync then
+                if not s or sim.cursor then return end
+                local moved, id = n, s.itemID
+                if n < s.count then s.count = s.count - n else moved = s.count; b[slot] = nil end
+                sim:schedule(0.05, function()
+                    -- Handed over late. If the cursor is busy by then the client
+                    -- puts it back rather than dropping it on the floor — nothing
+                    -- may vanish, or the conservation check below means nothing.
+                    if not sim.cursor then sim.cursor = { itemID = id, count = moved }
+                    else sim:returnToBags({ itemID = id, count = moved }) end
+                end)
+                return
+            end
             if not s or sim.cursor then return end
             -- Attach poisoning: a client that hands back a different amount than
             -- was asked for is the whole reason the engine verifies the form.
@@ -223,8 +291,14 @@ function M:Install(G)
     G.ATTACHMENTS_MAX_SEND = sim.MAXATT
 
     G.CursorHasItem = function() return sim.cursor ~= nil end
+    -- Putting something BACK in the bags is itself a container operation, so it
+    -- sets them moving again. This is why a retry that does not wait can never
+    -- recover: its own cleanup re-locks the slots it is about to draw from.
     G.ClearCursor = function()
-        if sim.cursor then sim:returnToBags(sim.cursor); sim.cursor = nil end
+        if sim.cursor then
+            sim:returnToBags(sim.cursor); sim.cursor = nil
+            sim:disturbBags(nil)
+        end
     end
 
     G.GetSendMailItem = function(i)
@@ -236,7 +310,7 @@ function M:Install(G)
         if not sim.mailboxOpen then error("mailbox closed: ClickSendMailItemButton") end
         if clear then
             local a = sim.attach[i]
-            if a then sim.attach[i] = nil; sim:returnToBags(a) end
+            if a then sim.attach[i] = nil; sim:returnToBags(a); sim:disturbBags(nil) end
             return
         end
         if sim.cursor then
@@ -336,12 +410,13 @@ function M:Install(G)
                 sim.wallet = sim.wallet - (rec.money or 0) - 30
                 sim.money = 0
             end
+            -- THE BAGS ARE PUT IN MOTION *BEFORE* THE SUCCESS IS ANNOUNCED. That
+            -- ordering is the whole bug: the engine hears MAIL_SUCCESS while the
+            -- containers are still locked, so anything it attaches in that window
+            -- silently gets nothing.
+            if mode ~= "noevidence" then sim:disturbBags(nil) end
             sim:Fire("MAIL_SUCCESS")
-            sim:Fire("MAIL_SEND_SUCCESS")
-            if mode ~= "noevidence" then
-                sim:Fire("PLAYER_MONEY")
-                sim:Fire("BAG_UPDATE_DELAYED")
-            end
+            if mode ~= "noevidence" then sim:Fire("PLAYER_MONEY") end
         end)
         rec.consumed = consumed
     end

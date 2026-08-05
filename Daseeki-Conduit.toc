@@ -4,7 +4,7 @@
 ## Author: Daseeki
 ## X-License: All Rights Reserved
 ## X-Curse-Project-ID: 1638368
-## Version: 1.2.0
+## Version: 1.2.1
 ## SavedVariables: DaseekiConduitDB
 ## Dependencies: Daseeki-Core
 ## OptionalDeps: Daseeki-Nexus

@@ -77,6 +77,7 @@ local EVIDENCE_TIMEOUT = 15      -- the money/bags actually move
 local FAILURE_SPACING  = 0.5     -- ONLY after a failure; the happy path is unpadded
 local BUTTON_HOLD      = 0.2     -- re-assert Blizzard's disabled Send button
 local RETRY_BUDGET     = 1       -- one retry per mail, then skip that recipient
+local SETTLE_TIMEOUT   = 1.0     -- ceiling on waiting for the bags to stop moving
 
 -- ── Run state ─────────────────────────────────────────────────────────────────
 local S = {
@@ -108,10 +109,38 @@ local S = {
     evTimer       = nil,
     holdTicker    = nil,
 
+    settleWaiter  = nil,   -- pending "wait for the bags to stop moving" request
+    settleTimer   = nil,
+
     onFinish      = nil,   -- optional per-run completion callback (see RunQueue)
     rebuild       = nil,   -- optional: re-derive the queue at run start
     check         = nil,   -- optional: re-check ONE mail against live truth
 }
+
+-- ── Attach diagnostics ────────────────────────────────────────────────────────
+--
+-- The live failure this file's 1.2.1 pass exists for could not be diagnosed from
+-- chat: every mail simply refused with "the form holds 0". These counters make the
+-- client's actual behaviour visible through /conduit debug boons, so the next
+-- surprise is a report rather than a mystery. Session-cumulative, in memory only.
+local D = {
+    mails            = 0,   -- mails armed
+    redrawn          = 0,   -- mails whose draws were re-derived from a fresh scan
+    staleCoords      = 0,   -- plan-time slots that no longer held the item
+    splitAttempted   = 0,
+    splitDelivered   = 0,   -- C_Container.SplitContainerItem put it on the cursor
+    splitAsync       = 0,   -- ...took it from the slot but not onto the cursor
+    splitFellBack    = 0,   -- the legacy global delivered instead
+    splitFailed      = 0,   -- nothing delivered
+    lockedSlots      = 0,   -- draws skipped because the slot was mid-operation
+    drawsRefused     = 0,
+    formUnreadable   = 0,   -- GetSendMailItem would not yield a usable count
+    formBagDisagree  = 0,   -- the form and the bag subtraction did not match
+    settleWaits      = 0,
+    settleTimeouts   = 0,
+}
+function Mail.Diagnostics() return D end
+function Mail.ResetDiagnostics() for k in pairs(D) do D[k] = 0 end end
 
 local function notifyPanel()
     if ns.Panel and ns.Panel.Refresh then ns.Panel.Refresh() end
@@ -176,6 +205,68 @@ end
 local function slotAttached(i)
     return (GetSendMailItem and GetSendMailItem(i)) and true or false
 end
+
+-- ── Reading the quantity back off the Send Mail form ─────────────────────────
+--
+-- The form is the thing being sent, so the form is what the send guard should be
+-- measuring. The wrinkle: GetSendMailItem carries no signature in the 11509 API
+-- catalog (it is an undocumented FrameXML-era global — the catalog lists the name
+-- and nothing else), and its return ORDER has differed across clients. Hard-coding
+-- "the fourth return is the count" would be a guess, and a wrong guess here reads
+-- an item quality as a stack size.
+--
+-- So the position is CALIBRATED instead of assumed. The bag subtraction (how much
+-- left the slot we drew from) is a fact we already have and cannot be wrong about;
+-- the first draw that lands unambiguously tells us which return position carried
+-- that same number, and from then on the FORM is the authority and the bag
+-- subtraction is a cross-check whose disagreements are counted.
+local formCountIndex   -- nil until calibrated
+
+local function formReturns(i)
+    if not GetSendMailItem then return nil end
+    local r = { GetSendMailItem(i) }
+    if r[1] == nil then return nil end
+    return r
+end
+
+-- Learn which return position holds the stack count, given a landing we KNOW the
+-- size of. Only accepts an unambiguous answer (exactly one position matching).
+local function calibrateFormCount(i, known)
+    if formCountIndex or not known or known < 1 then return end
+    local r = formReturns(i)
+    if not r then return end
+    local at
+    for idx = 1, 6 do
+        if tonumber(r[idx]) == known then
+            if at then return end        -- ambiguous; wait for a clearer landing
+            at = idx
+        end
+    end
+    if at then formCountIndex = at end
+end
+
+-- Units the form reports in slot `i`, or nil if we cannot read it yet.
+local function formCount(i)
+    if not formCountIndex then return nil end
+    local r = formReturns(i)
+    if not r then return nil end
+    return tonumber(r[formCountIndex])
+end
+
+-- Total units the form reports across every attachment slot, or nil.
+local function formTotal()
+    if not formCountIndex then return nil end
+    local total = 0
+    for i = 1, (ns.MAX_ATTACH or 12) do
+        if slotAttached(i) then
+            local c = formCount(i)
+            if not c then return nil end
+            total = total + c
+        end
+    end
+    return total
+end
+Mail._FormCalibration = function() return formCountIndex end   -- harness seam
 
 -- Does the form hold any attachment at all?
 local function formHasAttachment()
@@ -256,17 +347,86 @@ end
 --
 -- Sets S.pendingCount / S.pendingUnits / S.pendingGold from the FORM, and returns
 -- attached, units, refused (refused = a draw the form would not honour exactly).
-local function attachMail(mail)
+-- Get `want` units out of (bag, slot) onto the cursor, or fail honestly.
+--
+-- THE 11509 FACTS, from the API catalog (build 1.15.9.68808):
+--   * C_Container.SplitContainerItem(bag, slot, amount) EXISTS. The 1.2.0 theory
+--     that the whole-stack fallback was firing because the function was missing is
+--     therefore dead — the function is there, so any failure is one of DELIVERY,
+--     not of absence.
+--   * there is NO bare SplitContainerItem/PickupContainerItem global on this
+--     client, so the "fall back to the legacy global" belt-and-braces below has
+--     nothing to catch it here. It is kept for other clients and, more usefully,
+--     so the diagnostics can say which door actually opened.
+--
+-- Delivery has three distinguishable outcomes, and telling them apart is the whole
+-- point — two of them look identical from the cursor alone:
+--   DELIVERED  the cursor holds it. Proceed.
+--   ASYNC      the cursor is empty but the SLOT SHRANK: the split happened, the
+--              client just has not handed it over yet. Calling split again here
+--              would take a SECOND helping. So: take nothing, and let the
+--              settlement wait re-read the world before the retry.
+--   NOTHING    cursor empty and the slot untouched — a genuine no-op (a locked
+--              slot is the common cause). Safe to try the legacy door.
+local function pickupExactly(bag, slot, want, have)
+    local C = C_Container
+    ClearCursor()
+
+    if want >= have then
+        if C and C.PickupContainerItem then C.PickupContainerItem(bag, slot) end
+        if CursorHasItem() then return "delivered" end
+        if _G.PickupContainerItem then _G.PickupContainerItem(bag, slot) end
+        return CursorHasItem() and "fellback" or "nothing"
+    end
+
+    D.splitAttempted = D.splitAttempted + 1
+    if C and C.SplitContainerItem then
+        C.SplitContainerItem(bag, slot, want)
+        if CursorHasItem() then
+            D.splitDelivered = D.splitDelivered + 1
+            return "delivered"
+        end
+        local after = Rules.SlotInfo(bag, slot)
+        local left  = (after and after.count) or 0
+        if left < have then
+            -- It left the slot but not onto the cursor. Do NOT ask again.
+            D.splitAsync = D.splitAsync + 1
+            return "async"
+        end
+    end
+    if _G.SplitContainerItem then
+        _G.SplitContainerItem(bag, slot, want)
+        if CursorHasItem() then
+            D.splitFellBack = D.splitFellBack + 1
+            return "fellback"
+        end
+    end
+    D.splitFailed = D.splitFailed + 1
+    return "nothing"
+end
+
+-- `draws` overrides mail.stacks when the caller has re-derived them from a fresh
+-- bag scan (which armCurrent does for every mail that names an itemID + units).
+local function attachMail(mail, draws)
     clearForm()
     local attached, units, refused = 0, 0, 0
+    local stacks = draws or mail.stacks
 
-    if mail.stacks then
+    if stacks then
         local C = C_Container
-        for _, st in ipairs(mail.stacks) do
+        for _, st in ipairs(stacks) do
             if attached >= (ns.MAX_ATTACH or 12) then break end
             local info = Rules.SlotInfo(st.bag, st.slot)
-            -- The slot must still hold the SAME itemID and still be mailable.
-            if info and info.itemID == st.itemID and Rules.IsMailable(info) then
+            if not (info and info.itemID == st.itemID) then
+                -- The coordinates went stale under us. With re-derived draws this
+                -- should not happen; counting it says whether it still does.
+                D.staleCoords = D.staleCoords + 1
+            elseif info.isLocked then
+                -- Mid-operation. Container calls against this slot are refused
+                -- silently, so asking would only produce a mystery.
+                D.lockedSlots = D.lockedSlots + 1
+                refused = refused + 1
+            elseif Rules.IsMailable(info) then
                 local have = tonumber(info.count) or 0
                 -- A descriptor carrying `exact` sends its `count` and NO MORE; one
                 -- without it means "all of this stack" (a rule saying "send my
@@ -280,32 +440,28 @@ local function attachMail(mail)
 
                 if want >= 1 then
                     local nextSlot = attached + 1
-                    ClearCursor()
-                    local picked = false
-                    if want < have then
-                        -- A PARTIAL draw. Only a real split can serve it. If the
-                        -- client will not split, we take nothing: the old fallback
-                        -- to a whole-stack pickup here is precisely the over-attach.
-                        if C and C.SplitContainerItem then
-                            C.SplitContainerItem(st.bag, st.slot, want)
-                            picked = CursorHasItem() and true or false
-                        end
-                    elseif C and C.PickupContainerItem then
-                        C.PickupContainerItem(st.bag, st.slot)
-                        picked = CursorHasItem() and true or false
-                    end
+                    local outcome = pickupExactly(st.bag, st.slot, want, have)
 
-                    if picked then
+                    if outcome == "delivered" or outcome == "fellback" then
                         ClickSendMailItemButton(nextSlot)
-                        -- HOW MUCH ACTUALLY MOVED, measured at the bag slot rather
-                        -- than read out of the attachment's tooltip fields: whatever
-                        -- left this slot is exactly what is now on the form, and it
-                        -- is one subtraction that no API return-order change can
-                        -- misreport.
-                        local after = Rules.SlotInfo(st.bag, st.slot)
-                        local left  = (after and after.itemID == st.itemID)
-                                      and (tonumber(after.count) or 0) or 0
-                        local landed = have - left
+                        -- TWO INDEPENDENT MEASUREMENTS, and they must agree.
+                        --   the FORM  — what is actually staged to be sent;
+                        --   the BAGS  — how much left the slot we drew from.
+                        -- The form is the authority once its shape is calibrated
+                        -- (see formCount); until then the bag subtraction stands in,
+                        -- and it is what calibrates the form in the first place.
+                        local after  = Rules.SlotInfo(st.bag, st.slot)
+                        local left   = (after and after.itemID == st.itemID)
+                                       and (tonumber(after.count) or 0) or 0
+                        local viaBag = have - left
+                        calibrateFormCount(nextSlot, viaBag)
+                        local viaForm = formCount(nextSlot)
+                        if viaForm == nil then D.formUnreadable = D.formUnreadable + 1 end
+                        if viaForm ~= nil and viaForm ~= viaBag then
+                            D.formBagDisagree = D.formBagDisagree + 1
+                        end
+                        local landed = viaForm or viaBag
+
                         if slotAttached(nextSlot) and landed == want then
                             attached = nextSlot
                             units    = units + landed
@@ -323,6 +479,10 @@ local function attachMail(mail)
                             refused = refused + 1
                         end
                     else
+                        -- "async" (already taken from the slot, cursor not yet) or
+                        -- "nothing". Either way this draw does not travel now; the
+                        -- settlement wait before the retry is what makes the second
+                        -- attempt see a world that has stopped moving.
                         ClearCursor()
                         refused = refused + 1
                     end
@@ -330,6 +490,7 @@ local function attachMail(mail)
             end
         end
     end
+    if refused > 0 then D.drawsRefused = D.drawsRefused + refused end
 
     if SendMailNameEditBox then SendMailNameEditBox:SetText(mail.recipient or "") end
     if SendMailSubjectEditBox then SendMailSubjectEditBox:SetText(mail.subject or ns.MAIL_SUBJECT) end
@@ -368,9 +529,19 @@ local function verifyAttach(mail)
                     GetCoinTextureString and GetCoinTextureString(money) or (money .. "c"),
                     GetCoinTextureString and GetCoinTextureString(S.pendingGold or 0) or ((S.pendingGold or 0) .. "c"))
     end
-    if mail.stacks and S.pendingCount > #mail.stacks then
-        return false, ("%s's mail has more attachments than the plan drew — not sending it.")
+    if mail.stacks and S.pendingCount > (ns.MAX_ATTACH or 12) then
+        return false, ("%s's mail has more attachments than a mail can carry — not sending it.")
             :format(tostring(mail.recipient))
+    end
+    -- LAST WORD TO THE FORM. Everything above compares the plan against what the
+    -- attach BELIEVES it staged; this compares it against what the form itself
+    -- reports, summed across its slots. Once the form's shape is calibrated the two
+    -- can only differ if something moved the staging under us, and that is exactly
+    -- the case worth refusing.
+    local onForm = formTotal()
+    if planned and onForm ~= nil and onForm ~= planned then
+        return false, ("%s's mail should carry %d %s but the form is holding %d — not sending it.")
+            :format(tostring(mail.recipient), planned, mail.unitLabel or "item(s)", onForm)
     end
     return true
 end
@@ -485,6 +656,9 @@ end
 local function resetState()
     releaseFlight()
     S.runId = S.runId + 1
+    -- A settlement wait belongs to the run that asked for it.
+    S.settleWaiter = nil
+    S.settleTimer  = cancel(S.settleTimer)
     S.active, S.queue, S.idx = false, nil, 0
     S.awaitingClick, S.pendingCount, S.pendingUnits, S.pendingGold = false, 0, 0, 0
     S.attempts, S.stopping = 0, false
@@ -585,6 +759,67 @@ local function noteSkip(recipient, reason)
     say(("skipping %s — %s"):format(tostring(recipient), tostring(reason)))
 end
 
+-- ── Waiting for the bags to stop moving ───────────────────────────────────────
+--
+-- THE LIVE FAILURE THIS EXISTS FOR. Hands-free arms mail N+1 the instant mail N
+-- reaches its terminal state — the owner's log shows a whole tail of mails refused
+-- inside one second. At that moment the client has not finished settling the bags:
+-- slots involved in the send are still LOCKED, and a locked slot makes
+-- C_Container.SplitContainerItem a silent no-op. Nothing reaches the cursor,
+-- nothing lands on the form, and the send guard correctly refuses a mail that would
+-- have carried zero. The guard was right; the attach was early.
+--
+-- So arming now waits for the world to hold still first:
+--   * the primary signal is BAG_UPDATE_DELAYED, which is Blizzard's own "that is
+--     the end of this burst of bag changes";
+--   * the condition is that no bag slot is locked and nothing is on the cursor;
+--   * and there is a hard 1s ceiling, because a wait that can hang is worse than a
+--     wait that gives up — if it expires we attach anyway and the guard is still
+--     there to refuse anything that comes out wrong.
+--
+-- This applies to STEP MODE too. A fast clicker hits precisely the same race, and
+-- the arm happens on the same code path either way.
+
+local function bagsQuiet()
+    -- Nothing should be riding the cursor between mails. If something is, it is
+    -- debris from a draw the client handed over late, and putting it back IS part
+    -- of settling — waiting for it to clear itself would wait forever.
+    if CursorHasItem and CursorHasItem() then
+        ClearCursor()
+        if CursorHasItem() then return false end
+    end
+    if Rules.AnySlotLocked and Rules.AnySlotLocked() then return false end
+    return true
+end
+
+local function finishSettle()
+    local w = S.settleWaiter
+    if not w then return end
+    S.settleWaiter = nil
+    S.settleTimer  = cancel(S.settleTimer)
+    w()
+end
+
+-- Run `fn` once the bags have settled (or the ceiling expires).
+local function awaitSettlement(fn)
+    local wrapped = thisRun(fn)
+    if bagsQuiet() then return wrapped() end
+    D.settleWaits = D.settleWaits + 1
+    S.settleWaiter = wrapped
+    S.settleTimer  = cancel(S.settleTimer)
+    S.settleTimer  = newTimer(SETTLE_TIMEOUT, function()
+        if not S.settleWaiter then return end
+        D.settleTimeouts = D.settleTimeouts + 1
+        finishSettle()
+    end)
+end
+
+-- BAG_UPDATE_DELAYED is the "burst over" signal; re-test the condition on it.
+local function onBagsMaybeSettled()
+    if not S.settleWaiter then return end
+    if bagsQuiet() then finishSettle() end
+end
+
 -- Forward declarations: the loop is mutually recursive by nature (arm -> fire ->
 -- terminal -> arm), and naming the hops is clearer than one giant function.
 local armCurrent, fireCurrent, advance
@@ -598,7 +833,9 @@ function advance()
     end
     S.idx = S.idx + 1
     S.attempts = 0
-    armCurrent()
+    -- A mail has just left. The bags are mid-settle; arming into that is what made
+    -- every mail in the owner's tail attach nothing.
+    awaitSettlement(armCurrent)
 end
 
 -- Attach the mail at S.idx and either fire it (hands-free) or await a click (step).
@@ -629,7 +866,33 @@ function armCurrent()
         end
 
         if not skipThis then
-            local attached = attachMail(mail)
+            -- RE-DERIVE THE DRAWS. The plan's quantity is the contract; its bag
+            -- COORDINATES are not. They were worked out before the run started and
+            -- every mail since has moved the bags underneath them, so for any mail
+            -- that names an item and a quantity the slots are resolved fresh, here,
+            -- against the bags as they are at this instant. A stack that moved,
+            -- merged or emptied simply resolves to wherever the goods actually are.
+            local draws
+            if mail.itemID and tonumber(mail.units) and Rules.ScanStacksForItem then
+                local live = Rules.ScanStacksForItem(mail.itemID)
+                local total
+                draws, total = Rules.DrawExact(live, mail.units, ns.MAX_ATTACH)
+                D.redrawn = D.redrawn + 1
+                if total < tonumber(mail.units) then
+                    -- Not enough of it left in the bags to honour the plan. This is
+                    -- a shortfall, not a race — say so plainly and move on rather
+                    -- than burning the retry on a wait that cannot help.
+                    clearForm()
+                    S.pendingCount, S.pendingUnits, S.pendingGold = 0, 0, 0
+                    noteSkip(mail.recipient,
+                        ("only %d %s left in your bags, %d were planned")
+                            :format(total, mail.unitLabel or "item(s)", tonumber(mail.units)))
+                    skipThis = true
+                end
+            end
+
+            if not skipThis then
+            local attached = attachMail(mail, draws)
             local okAttach, whyAttach = verifyAttach(mail)
             if not okAttach then
                 clearForm()
@@ -637,8 +900,14 @@ function armCurrent()
                 say(whyAttach)
                 if S.attempts < RETRY_BUDGET then
                     S.attempts = S.attempts + 1
-                    -- One re-arm: bags shift, and the second read is often right.
-                    newTimer(FAILURE_SPACING, thisRun(armCurrent))
+                    -- ONE re-arm, and it waits for the bags to settle first. The
+                    -- 1.2.0 retry re-ran instantly into the same unsettled state and
+                    -- produced the same refusal inside the same second, which is
+                    -- what the owner's log shows; a retry that does not wait is not
+                    -- a retry, it is the same attempt twice.
+                    newTimer(FAILURE_SPACING, thisRun(function()
+                        awaitSettlement(armCurrent)
+                    end))
                     return
                 end
                 noteSkip(mail.recipient, "what would attach did not match the plan")
@@ -646,6 +915,7 @@ function armCurrent()
             elseif attached < 1 and (tonumber(mail.money) or 0) <= 0 then
                 -- Nothing to send (bags shifted): skip quietly and try the next.
                 skipThis = true
+            end
             end
         end
 
@@ -655,6 +925,7 @@ function armCurrent()
             notifyPanel()
         else
             -- Armed and verified.
+            D.mails = D.mails + 1
             if Mail.StepMode() then
                 S.awaitingClick = true
                 local total = #S.queue
@@ -773,16 +1044,19 @@ local function failSend(reason)
     end
 
     S.attempts = S.attempts + 1
+    -- Both re-entries below wait for the bags to settle as well as for the failure
+    -- spacing: a failed send hands its attachments back, and re-attaching while
+    -- they are still in mid-air is the same race that emptied the owner's forms.
     if S.attempts <= RETRY_BUDGET then
         say(("%s — retrying %s once."):format(reason, tostring(mail and mail.recipient)))
-        newTimer(FAILURE_SPACING, thisRun(armCurrent))
+        newTimer(FAILURE_SPACING, thisRun(function() awaitSettlement(armCurrent) end))
         return
     end
     noteSkip(mail and mail.recipient, reason)
     newTimer(FAILURE_SPACING, thisRun(function()
         S.idx = S.idx + 1
         S.attempts = 0
-        armCurrent()
+        awaitSettlement(armCurrent)
     end))
 end
 
@@ -1025,8 +1299,17 @@ ns:RegisterEvent("MAIL_SUCCESS", function()
 end)
 
 ns:RegisterEvent("PLAYER_MONEY", pollEvidence)
-ns:RegisterEvent("BAG_UPDATE_DELAYED", pollEvidence)
 ns:RegisterEvent("BAG_UPDATE", pollEvidence)
+
+-- BAG_UPDATE_DELAYED does double duty: it is Blizzard's "that burst of bag changes
+-- is over", which is both the evidence signal for an item mail and the signal that
+-- it is finally safe to attach the next one. ITEM_LOCK_CHANGED catches the case
+-- where the last thing to settle is a lock rather than a count.
+ns:RegisterEvent("BAG_UPDATE_DELAYED", function(...)
+    pollEvidence(...)
+    onBagsMaybeSettled()
+end)
+ns:RegisterEvent("ITEM_LOCK_CHANGED", function() onBagsMaybeSettled() end)
 
 ns:RegisterEvent("MAIL_FAILED", function()
     if not (S.active and S.inFlight) then return end

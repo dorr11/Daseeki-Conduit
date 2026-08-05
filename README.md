@@ -34,6 +34,11 @@ click at any open mailbox — no more manual alt-shuffling.
   form holds matches what the plan asked for**, so a mail can never carry more
   than it was planned to. Runs abort cleanly if the mailbox closes or a mail
   fails.
+- **Settlement-aware attaching** — the client locks bag slots while a container or
+  mail operation is in flight, and a locked slot makes `SplitContainerItem` a
+  silent no-op. Arming therefore waits for `BAG_UPDATE_DELAYED` (1s ceiling) before
+  touching anything, re-derives which slots the items come out of on every mail,
+  and never re-asks a split the client has half-completed.
 - **Outbound ledger** — every confirmed send is recorded, and mail still in the
   post counts as already delivered when the next plan is built. A boon run
   interrupted at two of eight plans only the remaining six when you come back.
@@ -62,8 +67,9 @@ click at any open mailbox — no more manual alt-shuffling.
 - Configure rules in the Daseeki hub: `/conduit settings` (or `/cdt`).
 - `/conduit debug selftest` runs the built-in rule/batch/gold self-tests.
 - `/conduit debug friends` shows what auto-friend would do on this character.
-- `/conduit debug boons` shows the boon plan plus the outbound ledger with ages;
-  `/conduit debug boons clear` empties the ledger.
+- `/conduit debug boons` shows the boon plan, the outbound ledger with ages, and
+  the attach diagnostics (splits asked/delivered/refused, locked slots, settle
+  waits); `/conduit debug boons clear` empties the ledger.
 
 ## Requires
 
@@ -90,5 +96,9 @@ click at any open mailbox — no more manual alt-shuffling.
   new attach and the new send guard kill it independently; **GATE RUN** drives the
   hands-free state machine through its success path, both timeouts,
   retry-then-skip, the mailbox-close abort, the one-in-flight invariant and the
-  Send-button ticker's whole lifecycle; **GATE LEDGER** walks the outbound
-  ledger's rules row by row and replays the owner's over-mail scenario verbatim.
+  Send-button ticker's whole lifecycle; **GATE SETTLE** models ASYNCHRONOUS bag
+  settlement (locked slots, counts that only land on the `BAG_UPDATE_DELAYED`
+  tick, and a split that half-completes) and replays the live field failure — the
+  1.2.0 arming loses most of the run's tail to the race, the shipped arming
+  delivers every mail; **GATE LEDGER** walks the outbound ledger's rules row by row
+  and replays the owner's over-mail scenario verbatim.

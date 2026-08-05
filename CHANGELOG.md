@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+- **Mails stopped arriving empty.** The first live hands-free boon run refused its
+  whole tail: "Daseeki's mail should carry 3 Chronoboon Displacer but the form
+  holds 0", and the same for the two after it, all inside one second. The safety
+  net worked exactly as intended — nothing was over-mailed and every boon stayed in
+  the bags — but nothing was *sent* either.
+
+  The cause was speed. Hands-free starts the next mail the instant the last one is
+  confirmed, and at that moment the game has not finished putting the bags down:
+  the slots are still locked, and a locked slot makes the game's own "split this
+  stack" call do nothing at all — no error, no explanation. So the attach came away
+  empty-handed and the guard, correctly, refused to send an empty mail. The retry
+  half a second later did not wait for anything either, so it hit the same locked
+  bags and produced the same refusal.
+
+  Three changes, so this cannot come back in another disguise:
+  - **The run now waits for your bags to stop moving before it attaches anything.**
+    It watches for the game's own "that's the last of the bag changes" signal, and
+    gives up waiting after one second so a quiet client can never hang the run.
+    Step mode waits too — clicking fast hits the identical race.
+  - **Where the items come from is worked out fresh for every single mail.** The
+    plan decides *how many* a character gets; it no longer decides *which bag slot
+    they come out of*, because those coordinates go stale the moment anything moves
+    — and in a batch, something moves after every mail.
+  - **A split that the game half-completes is never re-asked.** If the stack left
+    the slot but has not reached the cursor yet, asking again would take a second
+    helping; the engine now recognises that state, takes nothing, and lets the
+    settle-and-retry do its job.
+
+- **`/conduit debug boons` now shows what the client actually did.** The failure
+  above was invisible from chat — every mail simply said "the form holds 0". The
+  debug view now reports mails armed, draws re-derived, stale coordinates, splits
+  asked for versus delivered versus refused, draws blocked by a locked slot, how
+  often the run waited for the bags and how often that wait timed out. If something
+  like this happens again it will be one line to capture rather than a mystery.
+
+- **The send guard now has the last word from the form itself.** As well as
+  checking what the attach believes it staged, the engine sums what the Send Mail
+  form actually reports across its slots and refuses if that disagrees with the
+  plan. (The game does not document how it reports that number on this client, so
+  the engine works it out from a landing it can independently verify rather than
+  guessing.)
+
+## 1.2.0 — merged 2026-08-05, superseded before release
+
 - **A boon mail can no longer carry more than it was planned to.** A live run
   planned seven Chronoboon Displacers for one character and put **two whole stacks
   of ten** on the Send Mail form — twenty boons, sixty copper of postage, and
