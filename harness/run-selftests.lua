@@ -198,7 +198,10 @@ do
         "mail.lua registers a mailbox closer (the batch aborts with the mail window)")
     sourceHas("mail.lua", 'StaticPopup_Hide("DASEEKI_CONDUIT_SEND_CONFIRM")',
         "...and dismisses the send-confirm popup with it")
-    sourceHas("core.lua", 'mf:HookScript("OnHide"',
+    -- Both MailFrame scripts now go in through the install-once guard rather than a
+    -- bare mf:HookScript, so the pin follows them there (GATE HDR (d) checks the
+    -- guard itself; the mailbox-close suite drives it for real).
+    sourceHas("core.lua", '{ "OnHide", function()',
         "core.lua hooks MailFrame OnHide as well as MAIL_CLOSED")
     -- THERE IS ONE SEND PATH. Boon replenishment must ride mail.lua's confirm-first
     -- engine, not grow a second one; a regression that reaches for SendMail from
@@ -529,6 +532,136 @@ end
 realprint("=== GATE MUT: " .. (FAILS == 0 and "PASS" or "FAIL") .. " ===\n")
 
 ----------------------------------------------------------------------
+-- GATE HDR: the panel header's control cluster (gear + close).
+--
+-- Owner request: "can we add a settings icon next to the 'x' in conduit? update
+-- the icons for both to match the suite". That is an APPEARANCE change, which a
+-- headless harness cannot see — and panel.lua is deliberately never LOADED here
+-- (it builds DaseekiUI frames; GATE 0 only proves it compiles). So this gate pins
+-- the things that make the appearance true and that a later edit could silently
+-- undo:
+--
+--   (a) THE ART IS OURS AND UNMODIFIED. icon-close/icon-gear are byte copies of
+--       Daseeki-Nexus/textures — the same bytes Raid Prep and Bags 2.0 ship, which
+--       is the whole point: the gear and the close mark are pixel-identical across
+--       the suite. The digests below are the ones Raid Prep pins, independently
+--       recomputed here. (A Nexus checkout is not reachable from a git worktree, so
+--       the ORIGINAL cannot be diffed at test time — the digest is the portable
+--       form of that diff.) Nothing is authored for this window: no glyph in the
+--       cluster is new, so unlike Raid Prep's gavel there is no dev/ generator.
+--
+--   (b) THE HEADER USES THE GLYPH PATTERN, at the suite's metrics, with the tint
+--       contract; and stock/text art survives ONLY as the no-Core fallback.
+--
+--   (c) THE GEAR IS THE SAME DOOR AS THE SLASH COMMAND — one ns:OpenSettings in
+--       core.lua, called by both, so the hub target cannot drift between them.
+----------------------------------------------------------------------
+local HDR_BEFORE = FAILS
+realprint("=== GATE HDR: header control cluster ===")
+do
+    local function readBinary(path)
+        local fh = io.open(path, "rb"); if not fh then return nil end
+        local s = fh:read("*a"); fh:close(); return s
+    end
+
+    -- djb2 over the whole file, kept in double-exact range (hash*33 + b < 2^53).
+    local function digest(s)
+        local h = 5381
+        for i = 1, #s do h = (h * 33 + s:byte(i)) % 4294967296 end
+        return h
+    end
+
+    -- 64x64 32bpp uncompressed true-colour, top-left origin => 18 + 64*64*4 bytes.
+    -- The runtime tints the white mask with a theme token, so a paletted or 24bpp
+    -- re-export would render wrong rather than merely different.
+    local TGA_BYTES = 16402
+    local GLYPHS = {
+        { "icon-close.tga", 1198911579 },
+        { "icon-gear.tga",  1303632799 },
+    }
+    for _, g in ipairs(GLYPHS) do
+        local name, want = g[1], g[2]
+        local raw = readBinary(P("art/" .. name))
+        ck(raw ~= nil, "(a) art/" .. name .. " ships (copied from Daseeki-Nexus/textures)")
+        if raw then
+            ck(#raw == TGA_BYTES, "(a) " .. name .. " is a 64x64 32bpp TGA (" .. #raw .. " bytes)")
+            ck(raw:byte(3) == 2 and raw:byte(17) == 32 and raw:byte(18) == 0x28,
+               "(a) " .. name .. " header: uncompressed true-colour, 32bpp, top-left origin")
+            ck(digest(raw) == want, "(a) " .. name .. " is byte-identical to the suite glyph")
+        end
+    end
+
+    local src = readFile(P("panel.lua")) or ""
+
+    -- The metrics ARE the parity: 22/2/8 is the Nexus dashboard button verbatim.
+    ck(src:find("local ICONBTN    = 22", 1, true) ~= nil, "(b) 22px control button (suite parity)")
+    ck(src:find("local ICON_INSET = 2", 1, true)  ~= nil, "(b) 2px glyph inset => 18x18 drawn")
+    ck(src:find("local ICON_SPACE = 8", 1, true)  ~= nil, "(b) 8px gap between controls")
+    ck(src:find('"Interface\\\\AddOns\\\\" .. tostring(ADDON) .. "\\\\art\\\\"', 1, true) ~= nil,
+       "(b) art is loaded from the addon's OWN art/ directory")
+
+    -- The pattern itself, and the tint contract it carries.
+    ck(src:find("local function makeGlyphButton", 1, true) ~= nil, "(b) the glyph-button factory exists")
+    ck(src:find("UI.FLAT_BACKDROP", 1, true) ~= nil,        "(b) the button is the suite FLAT_BACKDROP object")
+    ck(src:find('UI.Color("borderLite")', 1, true) ~= nil,  "(b) borderLite edge, as Nexus/Bags/Raid Prep")
+    ck(src:find('self._hot and hot or "muted"', 1, true) ~= nil,
+       "(b) the GLYPH carries the hover: muted at rest, hot on enter")
+    ck(src:find('hot = "danger"', 1, true) ~= nil, "(b) the close hovers danger (destructive affordance)")
+
+    -- Both controls are built through the factory, on our own glyphs, and BOTH are
+    -- the same size — the owner asked for icons that match each other, not merely
+    -- icons that exist.
+    for _, icon in ipairs({ "icon-close", "icon-gear" }) do
+        ck(src:find('icon = "' .. icon .. '"', 1, true) ~= nil, "(b) the cluster draws " .. icon)
+    end
+    ck(src:find("b:SetSize(ICONBTN, ICONBTN)", 1, true) ~= nil,
+       "(b) every control in the cluster is the SAME square (matching sizes)")
+
+    -- The older-Core install must still get a working header, and stock/text art
+    -- must live BELOW that marker — one drifting up into the themed path is the
+    -- regression this round removes.
+    ck(src:find("local function glyphCapable", 1, true) ~= nil,
+       "(b) the themed path is guarded (an older Core has no FLAT_BACKDROP)")
+    local markAt = src:find("NO-CORE FALLBACK", 1, true)
+    ck(markAt ~= nil, "(b) the fallback branch is declared")
+    if markAt then
+        for _, stock in ipairs({ "Interface/Icons/", "Interface/Buttons/", 'cx:SetText("X")' }) do
+            local at, bad = 0, false
+            while true do
+                at = src:find(stock, at + 1, true)
+                if not at then break end
+                if at < markAt then bad = true end
+            end
+            ck(not bad, "(b) stock/text art '" .. stock .. "' survives only below NO-CORE FALLBACK")
+        end
+    end
+
+    -- (c) one door to the hub.
+    local core = readFile(P("core.lua")) or ""
+    ck(core:find("function ns:OpenSettings", 1, true) ~= nil,
+       "(c) core.lua owns the single settings action")
+    ck(core:find('DaseekiSuite:Open("conduit")', 1, true) ~= nil,
+       "(c) ...which opens the hub's Conduit section")
+    ck(src:find("ns:OpenSettings()", 1, true) ~= nil, "(c) the gear calls it")
+    ck(src:find("DaseekiSuite", 1, true) == nil,
+       "(c) the panel never re-derives the hub target itself")
+
+    -- The refresh wiring this round adds, pinned where the harness can see it:
+    -- panel.lua is not loaded, so its REGISTRATION is asserted textually while the
+    -- guard and fan-out it depends on are driven for real in the mailbox-close suite.
+    ck(src:find("ns:RegisterMailboxRefresher(", 1, true) ~= nil,
+       "(d) the panel refreshes when the mail window actually becomes visible")
+    ck(src:find('f:SetScript("OnShow"', 1, true) ~= nil,
+       "(d) ...and whenever the panel itself is shown")
+    ck(core:find('{ "OnShow", function()', 1, true) ~= nil,
+       "(d) core.lua hooks MailFrame's OnShow, not just its OnHide")
+    ck(core:find("ns.HookOnce(mailFrameHook, _G.MailFrame", 1, true) ~= nil,
+       "(d) ...through the install-once guard (never hooked twice)")
+end
+local V_HDR = (FAILS == HDR_BEFORE)
+realprint("=== GATE HDR: " .. (V_HDR and "PASS" or "FAIL") .. " ===\n")
+
+----------------------------------------------------------------------
 realprint("############################################################")
 realprint("# Daseeki-Conduit self-tests")
 realprint("#   GATE 0      toc parse             : PASS")
@@ -537,6 +670,7 @@ realprint("#   GATE SUITES shipped pure suites   : PASS")
 realprint("#   GATE SV     additive SavedVariables : " .. (FAILS == 0 and "PASS" or "FAIL"))
 realprint("#   GATE FRIEND real auto-friend pass : " .. (FAILS == 0 and "PASS" or "FAIL"))
 realprint("#   GATE MUT    boon plan mutations  : " .. (FAILS == 0 and "PASS" or "FAIL"))
+realprint("#   GATE HDR    header control cluster : " .. (V_HDR and "PASS" or "FAIL"))
 realprint("#")
 realprint("#   RESULT: " .. (FAILS == 0 and "ALL PASS" or (FAILS .. " FAILURE(S) — RED")))
 realprint("############################################################")

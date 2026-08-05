@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- **The Replenish Boons button works at the mailbox it was greyed out at.** Open a
+  mailbox on your boon source and the button was as likely as not to sit greyed and
+  unclickable for the whole visit, with the panel cheerfully reading "Ready." The
+  panel was deciding whether a mailbox was open a beat before the game had finished
+  opening it, and nothing ever asked again. It now watches the mail window itself
+  rather than guessing from the event, so the button is armed whenever the mailbox
+  actually is.
+
+- **A greyed button now says why.** Hovering Replenish Boons when it will not fire
+  tells you which gate is shut — no mailbox open, Conduit disabled on this
+  character, or a send already running — instead of leaving you to guess at a
+  button that just refuses.
+
+- **A settings gear in the panel header, and both header icons in the suite's
+  style.** The Conduit panel's ✕ was a plain letter X; it is now the same close
+  glyph Nexus, Bags and Raid Prep wear, with a settings gear beside it that opens
+  Conduit's page in the Daseeki hub — the same place `/conduit settings` goes. Both
+  icons are the same size, aligned to the panel's right edge, and light up on hover
+  exactly like their counterparts elsewhere in the suite.
+
 ## 1.1.0 — 2026-08-05
 
 - **Chronoboon replenishment.** Nominate one character as your boon source, and at

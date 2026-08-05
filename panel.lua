@@ -34,8 +34,90 @@ local SEND_W    = 54
 local FOOT_H    = 78   -- footer band: Run All + Send Next + progress
 local BOON_H    = 28   -- the boon row's extra footer height, when it is drawn at all
 
+-- Header control cluster (suite glyph metrics — see makeGlyphButton below).
+local ART        = "Interface\\AddOns\\" .. tostring(ADDON) .. "\\art\\"
+local ICONBTN    = 22   -- control button edge
+local ICON_INSET = 2    -- glyph inset inside the button => 18x18 drawn
+local ICON_SPACE = 8    -- gap between adjacent controls
+-- The cluster's vertical centre is the header row's, so the glyphs sit on the same
+-- optical line as the 18px maker mark and the title beside it: the mark spans
+-- -PAD..-(PAD+18), centre -19, so a 22px button's top edge is -(19-11) = -8.
+local ICON_TOP   = -8
+
 local frame       -- the panel frame (lazy)
 local rowPool = {}
+
+-- ── Suite glyph buttons (the header's upper-right control cluster) ────────────
+-- The upper right of a Daseeki window is ONE object across the suite, and this is
+-- it — the same button Nexus' dashboard titlebar builds, Bags 2.0's title row
+-- builds, and Raid Prep's checklist header builds:
+--
+--   * 22x22 BackdropTemplate, FLAT_BACKDROP filled `inset` with a `borderLite` edge.
+--   * a 64x64 white-on-transparent glyph mask inset 2px on all four sides (18x18
+--     drawn, NO SetTexCoord crop — our glyphs carry their own margin).
+--   * the GLYPH carries the hover, not the border: `muted` at rest, `accent` on
+--     enter — and `danger` on the close, the one destructive affordance in the row.
+--
+-- The art is Conduit's OWN copy (art/icon-close.tga, art/icon-gear.tga) of the
+-- canonical Nexus masks, byte-for-byte. That per-addon copy IS the suite pattern:
+-- there is no shared texture path in Core to point at, and the gear and the close
+-- mark are meant to be pixel-identical everywhere they appear. The harness pins
+-- both digests so a re-export or an accidental redraw fails the build instead of
+-- quietly drifting this window away from its neighbours.
+--
+-- `_hot` is stashed on the button so the UI.Skin callback — which re-runs on every
+-- ThemeChanged — re-reads the CURRENT hover state instead of resetting a button the
+-- cursor happens to be parked on. Pure child textures; no protected op.
+--
+-- Every colour here is a THEME TOKEN. Core is a hard Dependency for Conduit, but an
+-- OLDER Core may predate FLAT_BACKDROP (this file already guards PaintLedgerGround,
+-- Hairline and MakerMark the same way), so the factory REPORTS FAILURE rather than
+-- guessing literals and the caller keeps a plain fallback header.
+local function glyphCapable()
+    return (UI and UI.Color and UI.Skin and UI.FLAT_BACKDROP) and true or false
+end
+
+local function makeGlyphButton(parent, spec)
+    if not glyphCapable() then return nil end
+    local b = CreateFrame("Button", nil, parent, "BackdropTemplate")
+    b:SetSize(ICONBTN, ICONBTN)          -- both dims at creation
+    b:RegisterForClicks("LeftButtonUp")
+    local hot = spec.hot or "accent"
+
+    local face = b:CreateTexture(nil, "ARTWORK")
+    face:SetPoint("TOPLEFT",     b, "TOPLEFT",      ICON_INSET, -ICON_INSET)
+    face:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -ICON_INSET,  ICON_INSET)
+    face:SetTexture(ART .. spec.icon)
+    b._face = face
+
+    UI.Skin(b, function(self)
+        self:SetBackdrop(UI.FLAT_BACKDROP)
+        self:SetBackdropColor(UI.Color("inset"))
+        self:SetBackdropBorderColor(UI.Color("borderLite"))
+        self._face:SetVertexColor(UI.Color(self._hot and hot or "muted"))
+    end)
+
+    b:SetScript("OnEnter", function(self)
+        self._hot = true
+        self._face:SetVertexColor(UI.Color(hot))
+        if GameTooltip and spec.tooltip then
+            GameTooltip:SetOwner(self, spec.tipAnchor or "ANCHOR_BOTTOM")
+            GameTooltip:SetText(spec.tooltip, UI.Color("text"))
+            -- UI.Color returns r,g,b,a; the alpha lands on AddLine's wrapText slot
+            -- (always 1, so the sub-line wraps). Same call shape as Nexus, Bags and
+            -- Raid Prep — deliberately not "improved" here, so the tooltips read alike.
+            if spec.tooltip2 then GameTooltip:AddLine(spec.tooltip2, UI.Color("muted")) end
+            GameTooltip:Show()
+        end
+    end)
+    b:SetScript("OnLeave", function(self)
+        self._hot = nil
+        self._face:SetVertexColor(UI.Color("muted"))
+        if GameTooltip then GameTooltip:Hide() end
+    end)
+    if spec.onClick then b:SetScript("OnClick", spec.onClick) end
+    return b
+end
 
 -- ── Row construction ──────────────────────────────────────────────────────────
 local function makeRow(parent, i)
@@ -136,27 +218,78 @@ local function build()
         title:SetPoint("TOPLEFT", f, "TOPLEFT", PAD, -PAD)
     end
 
-    -- Top-right ✕ (BRAND_SPEC §8) — matches the hub/Nexus close treatment. ESC-close is
-    -- wired via UISpecialFrames above. Closing only hides the panel; an in-progress run is
-    -- left intact (reopen with /conduit show — see core.lua).
-    local closeBtn = CreateFrame("Button", nil, f)
-    closeBtn:SetSize(24, 24)
-    closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -4, -4)
-    local cx = closeBtn:CreateFontString(nil, "OVERLAY")
-    cx:SetFontObject(UI.fonts.body)
-    cx:SetPoint("CENTER", closeBtn, "CENTER", 0, 0)
-    cx:SetText("X")
-    closeBtn:SetScript("OnEnter", function() cx:SetFontObject(UI.fonts.danger) end)
-    closeBtn:SetScript("OnLeave", function() cx:SetFontObject(UI.fonts.body) end)
-    closeBtn:SetScript("OnClick", function() Panel.Hide() end)
+    -- ── Header control cluster (BRAND_SPEC §8) ────────────────────────────────
+    -- Laid RIGHT→LEFT from the window edge, so the visual order is
+    --
+    --     [gear] [✕]
+    --
+    -- which is the Nexus dashboard's, Bags 2.0's and Raid Prep's right cluster
+    -- verbatim (… gear then ✕ hard against the edge).
+    --
+    -- Closing only hides the panel; an in-progress run is left intact (reopen with
+    -- /conduit show — see core.lua). ESC-close is wired via UISpecialFrames above.
+    --
+    -- ⚠ EDGE JUDGEMENT: the suite's cluster sits ICON_SPACE (8) from the window
+    -- edge, but every other right edge in THIS panel — the header hairline, the
+    -- rules card, the footer buttons — is at PAD (10). Grid discipline inside one
+    -- window beats a 2px suite habit, so the ✕ is flush at -PAD and ICON_SPACE is
+    -- kept as the gap BETWEEN the controls. Easy to flip if Drew wants the 8.
+    local doClose    = function() Panel.Hide() end
+    local doSettings = function() ns:SafeCall(function() ns:OpenSettings() end) end
+
+    local closeBtn, gearBtn
+    if glyphCapable() then
+        -- ✕ — hovers `danger`, and carries NO tooltip: the mark is universal, and
+        -- Nexus leaves its close bare for the same reason.
+        closeBtn = makeGlyphButton(f, { icon = "icon-close", hot = "danger", onClick = doClose })
+        closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -PAD, ICON_TOP)
+
+        -- GEAR — byte-identical to the Nexus/Bags/Raid-Prep settings glyph. A cog is
+        -- ambiguous, so unlike the ✕ it keeps its tooltip. Same door as /conduit
+        -- settings, through core.lua's single ns:OpenSettings.
+        gearBtn = makeGlyphButton(f, { icon = "icon-gear",
+            tooltip  = "Conduit Settings",
+            tooltip2 = "Open the Daseeki hub to Conduit's rules and options.",
+            onClick  = doSettings })
+        gearBtn:SetPoint("RIGHT", closeBtn, "LEFT", -ICON_SPACE, 0)
+    else
+        -- NO-CORE FALLBACK: an older Core with no FLAT_BACKDROP, so there is no
+        -- themed button object to hang a tinted glyph on. The header keeps the plain
+        -- text ✕ this panel shipped with, plus a stock-art gear beside it.
+        closeBtn = CreateFrame("Button", nil, f)
+        closeBtn:SetSize(ICONBTN, ICONBTN)
+        closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -PAD, ICON_TOP)
+        local cx = closeBtn:CreateFontString(nil, "OVERLAY")
+        cx:SetFontObject(UI.fonts.body)
+        cx:SetPoint("CENTER", closeBtn, "CENTER", 0, 0)
+        cx:SetText("X")
+        closeBtn:SetScript("OnEnter", function() cx:SetFontObject(UI.fonts.danger) end)
+        closeBtn:SetScript("OnLeave", function() cx:SetFontObject(UI.fonts.body) end)
+        closeBtn:SetScript("OnClick", doClose)
+
+        gearBtn = CreateFrame("Button", nil, f)
+        gearBtn:SetSize(ICONBTN, ICONBTN)
+        gearBtn:SetPoint("RIGHT", closeBtn, "LEFT", -ICON_SPACE, 0)
+        gearBtn:SetNormalTexture("Interface/Icons/Trade_Engineering")
+        gearBtn:SetHighlightTexture("Interface/Buttons/ButtonHilight-Square", "ADD")
+        gearBtn:SetScript("OnClick", doSettings)
+        gearBtn:SetScript("OnEnter", function(self)
+            if not GameTooltip then return end
+            GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+            GameTooltip:AddLine("Conduit Settings", 1, 1, 1)
+            GameTooltip:Show()
+        end)
+        gearBtn:SetScript("OnLeave", function() if GameTooltip then GameTooltip:Hide() end end)
+    end
     f.closeBtn = closeBtn
+    f.gearBtn  = gearBtn
 
     -- Slash-command hint → uppercase letter-spaced micro-label (§3); stays faint (calm).
-    -- Sits to the LEFT of the ✕ (created above); vertical offset preserves its original
-    -- title-baseline alignment while clearing the close button.
+    -- Sits to the LEFT of the cluster, vertically centred on it (§3: mixed-height row
+    -- items centre rather than share a baseline).
     local hint = f:CreateFontString(nil, "OVERLAY")
     hint:SetFontObject(UI.fonts.microLabel or UI.fonts.small)
-    hint:SetPoint("TOPRIGHT", closeBtn, "LEFT", -4, 4)
+    hint:SetPoint("RIGHT", gearBtn, "LEFT", -6, 0)
     hint:SetJustifyH("RIGHT")
     UI.Skin(hint, function(self) self:SetTextColor(UI.Color("faint")) end)
     hint:SetText("/CONDUIT")
@@ -262,6 +395,16 @@ local function build()
         if not GameTooltip then return end
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
         GameTooltip:AddLine("Replenish Boons")
+
+        -- WHY IT IS GREYED, FIRST. A refusing button that explains nothing is the
+        -- defect this round fixes, and the reason must be the SAME answer the alpha
+        -- was drawn from: Refresh stashes the ButtonState string it used, and the
+        -- tooltip only translates it. Re-deriving from the live world here would let
+        -- the sentence and the greying disagree — precisely the class of bug that
+        -- produced a greyed button at an open mailbox.
+        local reason = ns.Boons and ns.Boons.StateReason(self._state)
+        if reason then GameTooltip:AddLine(reason, 1, 0.35, 0.35, true) end
+
         GameTooltip:AddLine("Tops every level-60 character in the mesh up to "
             .. tostring(ns.Boons and ns.Boons.TARGET or 10) .. " Chronoboon Displacers,"
             .. " biggest need first.", 1, 1, 1, true)
@@ -295,6 +438,12 @@ local function build()
     prog:SetWordWrap(true)
     UI.Skin(prog, function(self) self:SetTextColor(UI.Color("muted")) end)
     f.prog = prog
+
+    -- Anything that puts this panel on screen redraws it, including a route that
+    -- does not go through Panel.Show (UISpecialFrames restore, a future caller).
+    -- Refresh() no-ops on a hidden frame and is idempotent on a shown one, so this
+    -- can only ever cost a redraw.
+    f:SetScript("OnShow", function() ns:SafeCall(Panel.Refresh) end)
 
     frame = f
     return f
@@ -371,6 +520,11 @@ function Panel.Refresh()
     local boonState, boonHint = "off", nil
     if ns.Boons and not awaiting then boonState, boonHint = ns.Boons.State() end
 
+    -- The ONE answer this redraw is working from. The tooltip reads it back rather
+    -- than asking the world a second time, so the reason it prints can never
+    -- contradict the alpha set three lines below.
+    f.boonBtn._state = boonState
+
     if boonState == "off" then
         f.boonBtn:Hide()
         f.boonHint:Hide()
@@ -424,6 +578,9 @@ function Panel.Show()
     ns:MailboxOpened()
     anchorToMail(f)
     f:Show()
+    -- Refresh explicitly as well as via the frame's OnShow: OnShow does NOT fire when
+    -- Show() is called on an already-shown frame, which is exactly the /conduit show
+    -- case. Refresh is idempotent, so the two paths overlapping costs one redraw.
     Panel.Refresh()
 end
 
@@ -432,6 +589,21 @@ function Panel.Hide()
 end
 
 ns:RegisterEvent("MAIL_SHOW", function() ns:SafeCall(Panel.Show) end)
+
+-- …and again when the mail window is ACTUALLY on screen.
+--
+-- MAIL_SHOW is the server saying a mailbox was opened; FrameXML shows MailFrame from
+-- its own handler for the same event, and the two handlers have no defined order. So
+-- the Show above can run one beat BEFORE MailFrame:IsShown() becomes true — and the
+-- boon row is drawn from Boons.State(), which reads exactly that. Landing on the
+-- wrong side of that coin flip froze the row at "nomailbox" for the whole visit: a
+-- greyed Replenish Boons button at a wide-open mailbox, panel reading "Ready.".
+--
+-- core.lua hooks MailFrame's OnShow (once) and fans out to the refreshers registered
+-- here, so the answer is re-asked against observed visibility instead of inferred
+-- visibility. Idempotent: on the ordering where MAIL_SHOW already read it correctly,
+-- this is a second identical redraw.
+ns:RegisterMailboxRefresher(function() Panel.Refresh() end)
 
 -- The panel is furniture of the mail window, so it leaves when the window does —
 -- every route out: walking away from the mailbox, Escape, the mail window's own
