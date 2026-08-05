@@ -47,6 +47,11 @@ function M.New(layout, opts)
         poison = opts.poison,
         noSplit = opts.noSplit,
         splitAsync = opts.splitAsync,
+        formBadAfter = opts.formBadAfter,
+        formBadValue = opts.formBadValue,
+        formShape = opts.formShape,
+        asyncCounts = opts.asyncCounts,
+        attachClicks = 0,
         -- ASYNC BAG SETTLEMENT (the live 11509 behaviour that broke 1.2.0).
         -- With this on, a send does not update the bags in the same breath: the
         -- slots it touched are LOCKED, the counts are stale, and both only come
@@ -141,6 +146,7 @@ function M:disturbBags(itemID)
     self.pendingSettle = self:schedule(self.settleDelay, function()
         self.locks = {}
         self.pendingSettle = nil
+        self:flushDeferred()          -- the counts land HERE, not at call time
         self:Fire("ITEM_LOCK_CHANGED")
         self:Fire("BAG_UPDATE_DELAYED")
     end)
@@ -148,6 +154,47 @@ end
 
 function M:isLocked(bag, slot)
     return (self.locks[bag] and self.locks[bag][slot]) and true or false
+end
+
+-- ASYNC COUNTS. The profile that matters most, and the one every headless build
+-- passed by accident: a client that hands the ITEMS over immediately (the cursor
+-- fills, the attachment lands) but does not write the new bag COUNTS until its
+-- next bag event. Anything that re-reads a slot one statement after taking from it
+-- gets the PRE-split number back, and therefore measures that nothing moved.
+--
+-- The simulator used to apply container mutations synchronously inside the attach
+-- call, which is precisely why a measurement bug of this shape could not fail here.
+-- `bag`/`slot` name the ONE slot the operation touched. The client locks what it
+-- is working on, not the whole inventory, so a second draw from a different slot in
+-- the same mail is still serviceable — which is what makes multi-attachment mails
+-- possible at all.
+function M:deferBag(fn, bag, slot)
+    if not self.asyncCounts then return fn() end
+    self.deferred = self.deferred or {}
+    self.deferred[#self.deferred + 1] = fn
+    self:disturbSlot(bag, slot)
+end
+
+function M:disturbSlot(bag, slot)
+    if bag and slot and self.asyncBags then
+        self.locks[bag] = self.locks[bag] or {}
+        self.locks[bag][slot] = true
+    end
+    if self.pendingSettle then self.pendingSettle.cancelled = true end
+    self.pendingSettle = self:schedule(self.settleDelay, function()
+        self.locks = {}
+        self.pendingSettle = nil
+        self:flushDeferred()
+        self:Fire("ITEM_LOCK_CHANGED")
+        self:Fire("BAG_UPDATE_DELAYED")
+    end)
+end
+
+function M:flushDeferred()
+    local d = self.deferred
+    if not d then return end
+    self.deferred = nil
+    for i = 1, #d do d[i]() end
 end
 
 -- ── bags ──────────────────────────────────────────────────────────────────────
@@ -247,8 +294,13 @@ function M:Install(G)
                 return
             end
             if not s then return end
-            sim.cursor = { itemID = s.itemID, count = s.count }
-            b[slot] = nil
+            local took = s.count
+            sim.cursor = { itemID = s.itemID, count = took }
+            sim:deferBag(function()
+                if b[slot] ~= s then return end
+                s.count = s.count - took
+                if s.count <= 0 then b[slot] = nil end
+            end, bag, slot)
         end,
         SplitContainerItem = function(bag, slot, n)
             local b = sim.bags[bag]; local s = b and b[slot]
@@ -273,13 +325,21 @@ function M:Install(G)
             end
             if not s or sim.cursor then return end
             -- Attach poisoning: a client that hands back a different amount than
-            -- was asked for is the whole reason the engine verifies the form.
+            -- was asked for is the whole reason the engine verifies at all.
             if sim.poison then n = sim.poison(bag, slot, n, s.count) or n end
-            if n >= s.count then
-                sim.cursor = { itemID = s.itemID, count = s.count }; b[slot] = nil
-            else
-                sim.cursor = { itemID = s.itemID, count = n }; s.count = s.count - n
-            end
+            local have = s.count
+            local take = (n >= have) and have or n
+            sim.cursor = { itemID = s.itemID, count = take }
+            -- The ITEMS move now; the COUNT the client reports may not.
+            --
+            -- A DELTA, not a remembered absolute. Between this call and the flush a
+            -- detached attachment can merge back into this very slot; writing back
+            -- a snapshot would erase whatever arrived meanwhile. Deltas compose.
+            sim:deferBag(function()
+                if b[slot] ~= s then return end
+                s.count = s.count - take
+                if s.count <= 0 then b[slot] = nil end
+            end, bag, slot)
         end,
     }
     -- A client with no partial-stack API at all. This is the condition the pre-fix
@@ -301,10 +361,22 @@ function M:Install(G)
         end
     end
 
+    -- The Send Mail form's read-back. Its return ORDER is undocumented on 11509, so
+    -- the shape is configurable here — and `formBadAfter` models a client that
+    -- reports the count honestly for the first N attachments and then stops (a
+    -- stale or zero count), which is the profile that turns a once-learned
+    -- calibration into a measurement of nothing.
     G.GetSendMailItem = function(i)
         local a = sim.attach[i]
         if not a then return nil end
-        return "Item" .. a.itemID, a.itemID, nil, a.count, 1
+        local count = a.count
+        if sim.formBadAfter and (sim.attachClicks or 0) > sim.formBadAfter then
+            count = sim.formBadValue or 0
+        end
+        if sim.formShape == "noID" then
+            return "Item" .. a.itemID, nil, count, 1        -- name, texture, count, quality
+        end
+        return "Item" .. a.itemID, a.itemID, nil, count, 1  -- name, id, texture, count, quality
     end
     G.ClickSendMailItemButton = function(i, clear)
         if not sim.mailboxOpen then error("mailbox closed: ClickSendMailItemButton") end
@@ -317,6 +389,7 @@ function M:Install(G)
             local old = sim.attach[i]
             sim.attach[i] = sim.cursor
             sim.cursor = old
+            sim.attachClicks = (sim.attachClicks or 0) + 1
         else
             local a = sim.attach[i]
             if a then sim.attach[i] = nil; sim.cursor = a end

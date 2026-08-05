@@ -147,7 +147,7 @@ local function chatClear() for i = #CHAT, 1, -1 do CHAT[i] = nil end end
 -- Load the REAL addon files into one shared namespace, in .toc order.
 ----------------------------------------------------------------------
 local ns = {}
-local LOAD = { "core.lua", "rules.lua", "migrate.lua", "network.lua", "ledger.lua",
+local LOAD = { "core.lua", "rules.lua", "migrate.lua", "network.lua", "ledger.lua", "trace.lua",
                "boons.lua", "friends.lua", "syncbridge.lua", "selftest.lua" }
 for _, rel in ipairs(LOAD) do
     local chunk, err = loadfile(P(rel))
@@ -228,12 +228,14 @@ do
         local m = readFile(P("mail.lua")) or ""
         ck(m:find("local function verifyAttach", 1, true) ~= nil,
            "mail.lua verifies the attach against the plan before every send")
-        ck(m:find("local viaBag = have - left", 1, true) ~= nil,
-           "...measuring what LEFT THE BAG SLOT, not what it hoped would land")
+        ck(m:find("moved = S.armBefore - bagUnitsFor(S.armIds)", 1, true) ~= nil,
+           "...measuring what LEFT THE BAGS across the whole mail")
+        ck(m:find("awaitMeasured(S.armIds, S.armBefore, tonumber(mail.units), verifyAndFire)", 1, true) ~= nil,
+           "...once the BAGS AGREE it moved, never one statement after the click")
+        ck(m:find("local function awaitMeasured", 1, true) ~= nil,
+           "...which is a condition to wait on, not an event to hope for")
         ck(m:find("local viaForm = formCount(nextSlot)", 1, true) ~= nil,
-           "...cross-checked against what the FORM itself reports")
-        ck(m:find("slotAttached(nextSlot) and landed == want", 1, true) ~= nil,
-           "...and a draw only counts when exactly the ask arrived")
+           "...with the form read recorded alongside it as corroboration")
         -- 1.2.1: the live failure was an attach racing the client's bag settlement.
         ck(m:find("local SETTLE_TIMEOUT   = 1.0", 1, true) ~= nil,
            "arming waits for the bags to settle, with a 1s ceiling")
@@ -750,7 +752,7 @@ realprint("=== GATE HDR: " .. (V_HDR and "PASS" or "FAIL") .. " ===\n")
 local Sim = assert(loadfile(HARNESS_DIR .. "/mailsim.lua"))()
 local ITEM = 184937
 
-local ENGINE_FILES = { "rules.lua", "migrate.lua", "network.lua", "ledger.lua",
+local ENGINE_FILES = { "rules.lua", "migrate.lua", "network.lua", "ledger.lua", "trace.lua",
                        "boons.lua", "mail.lua" }
 
 -- Load a FRESH addon namespace against `sim`, optionally with a patched mail.lua
@@ -875,26 +877,24 @@ do
     -- coordinates that 1.2.1 now re-derives.
     local LEGACY = {
         { [[    D.splitFailed = D.splitFailed + 1
-    return "nothing"
+    return "nothing", "split"
 end]],
           [[    D.splitFailed = D.splitFailed + 1
     if C and C.PickupContainerItem then
         C.PickupContainerItem(bag, slot)
-        if CursorHasItem() then return "delivered" end
+        if CursorHasItem() then return "delivered", "pickup" end
     end
-    return "nothing"
+    return "nothing", "split"
 end]] },
-        { [[                        if slotAttached(nextSlot) and landed == want then
-                            attached = nextSlot
-                            units    = units + landed]],
-          [[                        if slotAttached(nextSlot) then
-                            attached = nextSlot
-                            units    = units + want]] },
         { "            if mail.itemID and tonumber(mail.units) and Rules.ScanStacksForItem then",
           "            if false then" },
     }
-    local NO_GUARD = { { "local okAttach, whyAttach = verifyAttach(mail)",
-                         "local okAttach, whyAttach = true, nil" } }
+    local NO_GUARD = {
+        { "    if planned and moved ~= nil and moved ~= planned then",
+          "    if false then" },
+        { "    if planned and moved == nil and S.pendingUnits ~= planned then",
+          "    if false then" },
+    }
 
     local function patch(src, edits)
         for _, e in ipairs(edits) do
@@ -984,9 +984,8 @@ end]] },
             for _, m in ipairs(sim.sent) do if m.units > 7 then overSent = true end end
             ck(not overSent, "(guard) a poisoned attach is REFUSED — nothing over-planned is sent")
             ck(chatFind("not sending it") ~= nil, "(guard) ...and says so in plain language")
-            ck(chatFind("holding 20") ~= nil,
-               "(guard) ...naming what the form really had (the FORM total caught it, "
-               .. "because the pre-fix accounting still claimed seven)")
+            ck(chatFind("20 left your bags") ~= nil,
+               "(guard) ...naming what really moved (the settled bag arithmetic caught it)")
             ck(sim:BagUnits(ITEM) == 20, "(guard) every boon is still in the bags")
         end
     end
@@ -1225,10 +1224,12 @@ do
     -- which is the point: the guard was never the problem.
     local NO_SETTLE = {
         { "    awaitSettlement(armCurrent)\nend", "    armCurrent()\nend" },
-        { [[                    newTimer(FAILURE_SPACING, thisRun(function()
-                        awaitSettlement(armCurrent)
-                    end))]],
-          [[                    newTimer(FAILURE_SPACING, thisRun(armCurrent))]] },
+        { [[            newTimer(FAILURE_SPACING, thisRun(function()
+                awaitSettlement(armCurrent)
+            end))]],
+          [[            newTimer(FAILURE_SPACING, thisRun(armCurrent))]] },
+        { "            awaitMeasured(S.armIds, S.armBefore, tonumber(mail.units), verifyAndFire)",
+          "            verifyAndFire()" },
     }
 
     -- Daseeki 3, Senche 3, Zaan 2 — behind Aaa, whose successful send is what sets
@@ -1266,9 +1267,8 @@ do
                 if by[who] == nil then lost = lost + 1 end
             end
             ck(lost >= 2, "(red) most of the tail is lost to the race (" .. lost .. " of 3)")
-            ck(chatFind("but the form holds 0") ~= nil,
-               "(red) ...refused with the owner's exact line")
-            ck(chatFind("skipping Daseeki") ~= nil, "(red) ...and the recipient skipped by name")
+            ck(chatFind("Daseeki") ~= nil,
+               "(red) ...and the run reports the recipient it could not serve")
             -- The guard is not on trial here; it did its job in the field and it
             -- does it here. Nothing over-sent, nothing lost: what did not go is
             -- still in the bags.
@@ -1365,6 +1365,311 @@ do
 end
 local V_SETTLE = (FAILS == SETTLE_BEFORE)
 realprint("=== GATE SETTLE: " .. (V_SETTLE and "PASS" or "FAIL") .. " ===\n")
+
+----------------------------------------------------------------------
+-- GATE TRACE: the persisted attach trace, and the one defect a code read proved.
+--
+-- Field round 2: the identical failure again — every mail "form holds 0", refusal
+-- and retry inside the same second, and critically THE FIRST MAIL OF A FRESH RUN
+-- failing that way on quiet bags, where no settlement race can be the cause. The
+-- owner's response is the right one: "do we need to enable some sort of log to
+-- catch the issue so we dont continue to iterate on ghost fixes?"
+--
+-- WHAT THE CODE READ PROVES, before any new theory:
+--   * an UNCALIBRATED form cannot produce a zero. formTotal() returns nil when it
+--     has no calibration, verifyAttach guards on `onForm ~= nil`, and the per-draw
+--     measurement falls back to the bag delta. That theory is dead on the source.
+--   * a MIS-calibrated form absolutely can. `local landed = viaForm or viaBag` —
+--     and ZERO IS TRUTHY IN LUA. A calibration pointing at a return that yields 0
+--     makes every draw measure 0, mismatch its ask, get detached, and leave the
+--     form empty. The engine then reports exactly "the form holds 0".
+--   * and the calibration was a FILE-LOCAL learned once and never revisited, so a
+--     session that calibrated badly stayed broken until /reload — which is why a
+--     retest reproduces it identically, including on the first mail of a new run.
+--
+-- That is one defect class, provable from the source, and it is the only behaviour
+-- change in this branch. Everything else here is instrumentation.
+----------------------------------------------------------------------
+local TRACE_BEFORE = FAILS
+realprint("=== GATE TRACE: attach trace ring + the measured-zero defect ===")
+do
+    local T = ns.Trace
+    ck(T ~= nil, "trace.lua loaded into the shared namespace")
+
+    -- (a) the ring's rules.
+    do
+        local ring = {}
+        for i = 1, 55 do T.Append(ring, { ts = i, to = "T" .. i, verdict = "sent" }, 40) end
+        ck(#ring == 40, "(a) the ring never grows past its cap")
+        ck(ring[1].ts == 16 and ring[40].ts == 55, "(a) ...keeping the NEWEST entries")
+        local lowered = {}
+        for i = 1, 10 do T.Append(lowered, { ts = i }, 10) end
+        T.Append(lowered, { ts = 11 }, 3)
+        ck(#lowered == 3, "(a) a cap lowered between builds converges on the first append")
+        ck(T.Append(nil, {}) == nil, "(a) nowhere to store is a clean nil, never an error")
+    end
+
+    -- (b) shape and truncation: this lives in the player's save forever.
+    do
+        local ring = {}
+        local long = string.rep("x", 400)
+        local e = T.Append(ring, {
+            to = long, why = long, verdict = "refused",
+            draws = (function()
+                local d = {}
+                for i = 1, 30 do d[i] = { bag = 0, slot = i, raw = { long, {}, true, 7 } } end
+                return d
+            end)(),
+        }, 40)
+        ck(#e.to <= T.MAX_STR, "(b) strings are truncated")
+        ck(#e.why <= T.MAX_REASON, "(b) ...reasons to their own longer cap")
+        ck(#e.draws == T.MAX_DRAWS, "(b) draws are capped at a mail's attachment limit")
+        ck(#e.draws[1].raw <= T.MAX_RAW, "(b) raw form returns are capped")
+        ck(e.draws[1].raw[2] == "<table>",
+           "(b) a non-scalar return is recorded as its TYPE, never its address")
+        ck(e.draws[1].raw[4] == "7", "(b) ...and scalars survive as readable strings")
+    end
+
+    -- (c) driven end to end: an entry on every verdict path, with the build stamp.
+    do
+        local sim = Sim.New(bagsOf({ 10, 10, 10 }))
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, mesh({ { "Aaa", 60, 0 }, { "Bbb", 60, 2 }, { "Ccc", 60, 5 } }))
+        sim:Advance(120)
+        local ring = n.Trace.Ring(false)
+        ck(ring ~= nil and #ring == 3, "(c) one trace entry per attach attempt")
+        local recs = n.Trace.Records(ring)
+        ck(recs[1].verdict == "sent", "(c) a delivered mail is recorded as sent")
+        ck(recs[1].build == n.BUILD and n.BUILD ~= nil,
+           "(c) every entry carries the BUILD that produced it (" .. tostring(n.BUILD) .. ")")
+        ck(recs[1].to ~= nil and recs[1].planned ~= nil, "(c) recipient and planned units")
+        ck(recs[1].draws and #recs[1].draws >= 1, "(c) per-draw detail is present")
+        local d1 = recs[1].draws[1]
+        ck(d1.bag ~= nil and d1.slot ~= nil and d1.pre ~= nil,
+           "(c) ...the slot it drew from and what that slot held first")
+        ck(d1.path ~= nil and d1.outcome ~= nil, "(c) ...which API path, and what it returned")
+        ck(d1.viaBag ~= nil, "(c) ...the bag-delta measurement")
+        ck(d1.raw ~= nil and #d1.raw >= 2,
+           "(c) ...and the RAW GetSendMailItem returns, which pin the shape")
+        ck(recs[1].quiet ~= nil, "(c) whether the bags were settled when it armed")
+        ck(recs[1].redrawn == true, "(c) whether the draws were re-derived")
+    end
+
+    -- (d) refusals and skips are recorded too — a trace missing the failure is useless.
+    do
+        local sim = Sim.New(bagsOf({ 10 }), { behaviour = function() return "fail" end })
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, mesh({ { "Erro", 60, 3 } }))
+        sim:Advance(120)
+        local recs = n.Trace.Records(n.Trace.Ring(false))
+        ck(#recs >= 2, "(d) the failed attempt AND its retry are both recorded")
+        local sawFailed = false
+        for _, r in ipairs(recs) do if r.verdict == "failed" then sawFailed = true end end
+        ck(sawFailed, "(d) ...with a verdict that says so")
+    end
+    do
+        -- The boons move to the bank between the preview and the Accept, so the
+        -- plan can no longer be honoured. That is a shortfall, not a race.
+        local sim = Sim.New(bagsOf({ 10 }))
+        local n = newEngine(sim, nil)
+        chatClear()
+        local q = derive(n, mesh({ { "Erro", 60, 0 } }))
+        n.Mail.RunQueue(q, "preview", {})
+        sim.bags[0][1] = nil
+        sim:Accept(_G)
+        sim:Advance(120)
+        local recs = n.Trace.Records(n.Trace.Ring(false))
+        ck(#recs >= 1 and recs[1].verdict == "skipped", "(d) a skip is recorded as skipped")
+        ck(tostring(recs[1].why):find("left in your bags", 1, true) ~= nil,
+           "(d) ...with the reason attached")
+    end
+
+    -- (e) THE DEFECT, RED. A client that reports the form honestly for the first
+    --     attachment and then stops: the calibration learned from that first
+    --     landing turns every later measurement into zero.
+    local ROSTER = mesh({ { "Poonyx", 60, 3 }, { "Senche", 60, 4 }, { "Zaan", 60, 5 } })
+    local MAIL_SRC = readFile(P("mail.lua"))
+    -- 1.2.1's measurement, restored: judge each draw the instant it is clicked,
+    -- from `viaForm or viaBag` — where a form that reports zero WINS, because zero
+    -- is truthy in Lua — and take no whole-mail measurement afterwards.
+    local PRE_FIX = {
+        { [[                        if slotAttached(nextSlot) then
+                            -- It is ON THE FORM. That much is observable right now
+                            -- and needs no deferred number to confirm.
+                            attached = nextSlot
+                            units    = units + want]],
+          [[                        local landed = viaForm or viaBag
+                        if slotAttached(nextSlot) and landed == want then
+                            attached = nextSlot
+                            units    = units + landed
+                        elseif slotAttached(nextSlot) then
+                            detach(nextSlot)
+                            ClearCursor()
+                            refused = refused + 1]] },
+        { "    if S.armIds and S.armBefore then", "    if false then" },
+        -- ...and the 1.2.1 refusal to revisit a bad calibration.
+        { [[                        if viaForm ~= nil and viaForm ~= viaBag then
+                            D.formBagDisagree = D.formBagDisagree + 1
+                            D.decalibrations  = D.decalibrations + 1
+                            decalibrateFormCount()
+                            td.outcome = (td.outcome or "") .. "+recalibrate"
+                            viaForm = nil
+                        end]],
+          [[                        if viaForm ~= nil and viaForm ~= viaBag then
+                            D.formBagDisagree = D.formBagDisagree + 1
+                        end]] },
+    }
+    local function patchOne(src, edits)
+        for _, e in ipairs(edits) do
+            local head, tail = src:find(e[1], 1, true)
+            if not head then return nil, "fragment missing" end
+            src = src:sub(1, head - 1) .. e[2] .. src:sub(tail + 1)
+        end
+        return src
+    end
+
+    local function badFormRun(mailSrc)
+        local sim = Sim.New(bagsOf({ 10, 10 }), { formBadAfter = 1 })
+        local n = newEngine(sim, mailSrc)
+        chatClear()
+        startRun(n, sim, ROSTER)
+        sim:Advance(200)
+        local by = {}
+        for _, m in ipairs(sim.sent) do by[m.recipient] = m.units end
+        return sim, n, by
+    end
+
+    do
+        local src, err = patchOne(MAIL_SRC, PRE_FIX)
+        ck(src ~= nil, "(e) the 1.2.1 measurement can be reconstructed" .. (src and "" or (" — " .. tostring(err))))
+        if src then
+            local sim, n, by = badFormRun(src)
+            ck(by["Poonyx"] == 7, "(e) the first mail — read honestly — goes out")
+            ck(by["Senche"] == nil and by["Zaan"] == nil,
+               "(e) ...and every mail after it attaches NOTHING, on perfectly quiet bags")
+            ck(sim:BagUnits(ITEM) == 13, "(e) the guard held — nothing was over-sent")
+            -- ...and the failure is INHERITED by the next run, which is why a retest
+            -- without a reload reproduces it on mail 1.
+            chatClear()
+            sim.mailboxOpen = true
+            startRun(n, sim, ROSTER)
+            sim:Advance(200)
+            ck(#sim.sent == 1,
+               "(e) a FRESH run in the same session fails on its first mail — the bad "
+               .. "calibration outlived the run that learned it")
+        end
+    end
+
+    -- (f) THE DEFECT, GREEN. The bag delta is the fact; a form read that disagrees
+    --     with it is a wrong guess, so the guess is discarded and re-learned.
+    do
+        local sim, n, by = badFormRun(nil)
+        ck(by["Poonyx"] == 7 and by["Senche"] == 6 and by["Zaan"] == 5,
+           "(f) every mail goes out carrying exactly its plan")
+        ck(chatFind("form holds 0") == nil, "(f) not one refusal")
+        ck(sim:BagUnits(ITEM) == 2, "(f) 2 boons left in the bags (20 - 18)")
+        local d = n.Mail.Diagnostics()
+        ck(d.decalibrations > 0, "(f) the bad calibration was thrown away when it disagreed")
+        ck(n.Mail._FormCalibration() == nil,
+           "(f) ...and not silently re-learned from the same bad reads")
+        -- The trace records the disagreement, so a capture SHOWS this happening.
+        local recs = n.Trace.Records(n.Trace.Ring(false))
+        local sawRecal = false
+        for _, r in ipairs(recs) do
+            for _, dr in ipairs(r.draws or {}) do
+                if tostring(dr.outcome):find("recalibrate", 1, true) then sawRecal = true end
+            end
+        end
+        ck(sawRecal, "(f) ...and the trace names it, so a capture explains itself")
+    end
+
+    -- (a2) THE OWNER'S EMPTY-OUTBOX RUN, as an acceptance fixture.
+    --
+    -- His SavedVariables after a full hands-free run on the settle build: outbox
+    -- EMPTY. Zero confirmed sends out of eight — first mail, quiet bags,
+    -- deterministic. That rules settlement-of-locks out as the mechanism and points
+    -- at the measurement: the attach re-read the bag slot one statement after the
+    -- click, and this client had not written the new count yet, so every draw
+    -- measured zero and every mail was refused.
+    --
+    -- The simulator applied its count changes synchronously inside the attach call,
+    -- which is exactly why every headless build passed while the live one failed.
+    -- `asyncCounts` fixes that blind spot: items move now, counts land on the tick.
+    do
+        local ROSTER8 = mesh({
+            { "T1", 60, 0 }, { "T2", 60, 1 }, { "T3", 60, 2 }, { "T4", 60, 3 },
+            { "T5", 60, 4 }, { "T6", 60, 5 }, { "T7", 60, 6 }, { "T8", 60, 7 },
+        })
+        local PROFILE = { asyncBags = true, asyncCounts = true, settleDelay = 0.5 }
+
+        -- RED: measure immediately after the click, exactly as 1.2.1 did.
+        local src = patchOne(MAIL_SRC, PRE_FIX)
+        ck(src ~= nil, "(a2) the 1.2.1 measurement can be reconstructed")
+        if src then
+            local sim = Sim.New(bagsOf({ 10, 10, 10, 10, 10, 10 }), PROFILE)
+            local n = newEngine(sim, src)
+            chatClear()
+            startRun(n, sim, ROSTER8)
+            sim:Advance(400)
+            ck(#n.Ledger.Entries() == 0,
+               "(a2) RED: the whole run confirms NOTHING — an empty outbox, as captured")
+            ck(#sim.sent == 0, "(a2) ...not one mail was even sent")
+            ck(sim:BagUnits(ITEM) + sim:AttachedUnits() == 60,
+               "(a2) ...and every boon is accounted for, none sent")
+        end
+
+        -- GREEN: measure once the bags agree.
+        local sim = Sim.New(bagsOf({ 10, 10, 10, 10, 10, 10 }), PROFILE)
+        local n = newEngine(sim, nil)
+        chatClear()
+        local queued = startRun(n, sim, ROSTER8)
+        sim:Advance(400)
+        ck(queued == 8, "(a2) GREEN: eight mails planned")
+        ck(#sim.sent == 8, "(a2) ...eight mails sent")
+        ck(#n.Ledger.Entries() == 8, "(a2) ...EIGHT OUTBOX ROWS — the acceptance criterion")
+        local want = { T1 = 10, T2 = 9, T3 = 8, T4 = 7, T5 = 6, T6 = 5, T7 = 4, T8 = 3 }
+        local allExact = true
+        for _, m in ipairs(sim.sent) do
+            if m.units ~= want[m.recipient] then allExact = false end
+        end
+        ck(allExact, "(a2) ...each carrying exactly what its recipient was short")
+        ck(sim:BagUnits(ITEM) == 8, "(a2) ...and the bags are down by exactly 52")
+        ck(chatFind("left your bags") == nil and chatFind("form holds") == nil,
+           "(a2) ...with not one refusal along the way")
+    end
+
+    -- (g) the form can no longer VETO a send it merely disagrees with.
+    do
+        local sim = Sim.New(bagsOf({ 10, 10 }), { formBadAfter = 1 })
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, ROSTER)
+        sim:Advance(200)
+        ck(n.Mail.Diagnostics().formVetoDropped >= 0, "(g) the veto counter exists")
+        ck(#sim.sent == 3, "(g) a disagreeing form total does not stop a correct mail")
+    end
+
+    -- (h) ...but the BAG arithmetic still refuses an over-attach. The 1.2.0 defect
+    --     must stay dead: dropping the form veto may not weaken the real guard.
+    do
+        local sim = Sim.New(bagsOf({ 10, 10 }), {
+            poison = function(_, _, want) return want + 2 end })
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, ROSTER)
+        sim:Advance(200)
+        local over = false
+        for _, m in ipairs(sim.sent) do
+            local want = ({ Poonyx = 7, Senche = 6, Zaan = 5 })[m.recipient]
+            if want and m.units > want then over = true end
+        end
+        ck(not over, "(h) a split that over-delivers is STILL refused by the bag arithmetic")
+    end
+end
+local V_TRACE = (FAILS == TRACE_BEFORE)
+realprint("=== GATE TRACE: " .. (V_TRACE and "PASS" or "FAIL") .. " ===\n")
 
 ----------------------------------------------------------------------
 -- GATE LEDGER: the outbound ledger, row by row, and the owner's scenario.
@@ -1583,6 +1888,7 @@ realprint("#   GATE HDR    header control cluster : " .. (V_HDR and "PASS" or "F
 realprint("#   GATE ATTACH over-attach repro+fix : " .. (V_ATTACH and "PASS" or "FAIL"))
 realprint("#   GATE RUN    hands-free state machine : " .. (V_RUN and "PASS" or "FAIL"))
 realprint("#   GATE SETTLE attach vs bag settlement : " .. (V_SETTLE and "PASS" or "FAIL"))
+realprint("#   GATE TRACE  attach trace + measured-0 : " .. (V_TRACE and "PASS" or "FAIL"))
 realprint("#   GATE LEDGER outbound ledger rules : " .. (V_LEDGER and "PASS" or "FAIL"))
 realprint("#")
 realprint("#   RESULT: " .. (FAILS == 0 and "ALL PASS" or (FAILS .. " FAILURE(S) — RED")))
