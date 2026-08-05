@@ -5,8 +5,9 @@
     mail window (shown on MAIL_SHOW, hidden with the mail window by core.lua's
     mailbox teardown coordinator — MAIL_CLOSED or MailFrame OnHide). It lists the
     configured rules with a per-rule Send button, a Run All button, a live
-    progress line, and — during an active run — a "Send Next" button that drives
-    each continuation mail (SendMail needs a hardware event, so the click is real).
+    progress line, and — during an active run — a "Stop" button. Runs are
+    hands-free: one Accept on the preview sends the whole batch. With step mode on
+    (a setting) the footer offers "Send Next" once per mail instead.
 
     Above Run All sits the optional BOON ROW (Chronoboon replenishment): the button
     on the designated source character, a muted one-liner naming that character
@@ -373,6 +374,27 @@ local function build()
     sendNext:Hide()
     f.sendNext = sendNext
 
+    -- STOP. A hands-free run needs a brake that is always within reach, so it takes
+    -- the footer slot for the whole run. A mail already on the wire cannot be
+    -- recalled — Stop means "no further mails", and says so when pressed.
+    local stop = UI.MakeButton(f, { text = "Stop", width = PANEL_W - PAD * 2, height = 24 })
+    stop:ClearAllPoints()
+    stop:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", PAD, PAD + 30)
+    stop:SetScript("OnClick", function()
+        ns:SafeCall(function() ns.Mail.Stop() end)
+    end)
+    stop:SetScript("OnEnter", function(self)
+        if not GameTooltip then return end
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:AddLine("Stop")
+        GameTooltip:AddLine("Stops the run. A mail already sent cannot be recalled;"
+            .. " the one in flight is allowed to finish.", 1, 1, 1, true)
+        GameTooltip:Show()
+    end)
+    stop:SetScript("OnLeave", function() if GameTooltip then GameTooltip:Hide() end end)
+    stop:Hide()
+    f.stop = stop
+
     -- ── The boon row (Chronoboon replenishment) ───────────────────────────────
     --
     -- One row, three possible faces, and MOST OF THE TIME NONE OF THEM: the whole
@@ -543,12 +565,21 @@ function Panel.Refresh()
         layoutFooter(f, BOON_H)
     end
 
-    -- Footer buttons.
+    -- Footer buttons. Three faces, one slot: Send Next while a STEP-mode run waits
+    -- on a click, Stop for the whole life of a hands-free run, Run All otherwise.
     if awaiting then
         f.runAll:Hide()
+        f.stop:Hide()
         f.sendNext:Show()
+    elseif active then
+        f.runAll:Hide()
+        f.sendNext:Hide()
+        f.stop:Show()
+        f.stop:SetEnabled(true)
+        f.stop:SetAlpha(1)
     else
         f.sendNext:Hide()
+        f.stop:Hide()
         f.runAll:Show()
         local canRun = not active and not disabled and shown > 0
         f.runAll:SetEnabled(canRun)

@@ -134,6 +134,8 @@ _G.GetRealmName      = function() return "Whitemane" end
 _G.UnitFactionGroup  = function() return _G.__TESTFACTION or "Alliance" end
 _G.strfind, _G.strmatch, _G.strsub, _G.format =
     string.find, string.match, string.sub, string.format
+_G.__CLOCK = 1700000000
+_G.time = function() return _G.__CLOCK end
 
 local function chatFind(needle)
     for _, line in ipairs(CHAT) do if line:find(needle, 1, true) then return line end end
@@ -145,8 +147,8 @@ local function chatClear() for i = #CHAT, 1, -1 do CHAT[i] = nil end end
 -- Load the REAL addon files into one shared namespace, in .toc order.
 ----------------------------------------------------------------------
 local ns = {}
-local LOAD = { "core.lua", "rules.lua", "migrate.lua", "network.lua", "boons.lua",
-               "friends.lua", "syncbridge.lua", "selftest.lua" }
+local LOAD = { "core.lua", "rules.lua", "migrate.lua", "network.lua", "ledger.lua",
+               "boons.lua", "friends.lua", "syncbridge.lua", "selftest.lua" }
 for _, rel in ipairs(LOAD) do
     local chunk, err = loadfile(P(rel))
     if not chunk then realprint("  FAIL  loadfile " .. rel .. " -> " .. tostring(err)); os.exit(2) end
@@ -177,6 +179,7 @@ else
     ck(chatFind("boon-plan:") ~= nil, "the boon plan-builder suite ran")
     ck(chatFind("boon-arming:") ~= nil, "the boon arming-matrix suite ran")
     ck(chatFind("boon-queue:") ~= nil, "the boon queue/preview suite ran")
+    ck(chatFind("ledger:") ~= nil, "the outbound-ledger suite ran")
 end
 
 ----------------------------------------------------------------------
@@ -217,6 +220,49 @@ do
     end
     sourceHas("mail.lua", "SplitContainerItem",
         "mail.lua can attach PART of a stack (a top-up to ten is not a whole stack)")
+
+    -- The 1.2.0 contract, pinned where a later edit cannot quietly walk it back.
+    -- GATE ATTACH and GATE RUN drive all of this for real; these are the one-line
+    -- tripwires that say WHY a driven test would suddenly go red.
+    do
+        local m = readFile(P("mail.lua")) or ""
+        ck(m:find("local function verifyAttach", 1, true) ~= nil,
+           "mail.lua verifies the attach against the plan before every send")
+        ck(m:find("local landed = have - left", 1, true) ~= nil,
+           "...measuring what LEFT THE BAG SLOT, not what it hoped would land")
+        ck(m:find("slotAttached(nextSlot) and landed == want", 1, true) ~= nil,
+           "...and a draw only counts when the form took EXACTLY the ask")
+        -- The over-attach itself: a whole-stack pickup that then REWRITES the ask to
+        -- match what it took. The clamp `if want > have then want = have end` is the
+        -- opposite operation (down, never up) and is meant to be there.
+        ck(m:find("C.PickupContainerItem(st.bag, st.slot)\n                        want = have", 1, true) == nil,
+           "...and never rewrites the ask to match a whole stack it picked up (the over-attach)")
+        ck(m:find("if want > have then want = have end", 1, true) ~= nil,
+           "...while the ask is still clamped DOWN to what the slot really holds")
+        ck(m:find('ns:RegisterEvent("MAIL_SUCCESS"', 1, true) ~= nil,
+           "the send ack keys on MAIL_SUCCESS")
+        ck(m:find('ns:RegisterEvent("MAIL_SEND_SUCCESS"', 1, true) == nil,
+           "...and NOT on MAIL_SEND_SUCCESS (spec finding: it is the unreliable one)")
+        ck(m:find("local ACK_TIMEOUT      = 15", 1, true) ~= nil, "15s ceiling on the ack")
+        ck(m:find("local EVIDENCE_TIMEOUT = 15", 1, true) ~= nil, "15s ceiling on the evidence")
+        ck(m:find("local FAILURE_SPACING  = 0.5", 1, true) ~= nil, "0.5s spacing after failures only")
+        ck(m:find("local BUTTON_HOLD      = 0.2", 1, true) ~= nil,
+           "0.2s repeating re-assert of Blizzard's Send button")
+        ck(m:find("local RETRY_BUDGET     = 1", 1, true) ~= nil, "one retry per mail")
+        ck(m:find("ns.Ledger.Record", 1, true) ~= nil, "a confirmed send writes the outbound ledger")
+        local recAt = m:find("ns.Ledger.Record", 1, true)
+        local confirmAt = m:find("local function confirmSend", 1, true)
+        local failAt = m:find("local function failSend", 1, true)
+        ck(recAt and confirmAt and failAt and recAt > confirmAt and recAt < failAt,
+           "...from confirmSend and nowhere else (an attempt is not a send)")
+    end
+    do
+        local b = readFile(P("boons.lua")) or ""
+        ck(b:find("rebuild  = function()", 1, true) ~= nil,
+           "boons.lua re-derives its queue at run start (idempotence by construction)")
+        ck(b:find("check = function(mail)", 1, true) ~= nil,
+           "...and re-checks each mail against live truth before it is attached")
+    end
 end
 if FAILS > 0 then realprint("=== GATE SUITES: FAIL ==="); os.exit(1) end
 realprint("=== GATE SUITES: PASS ===\n")
@@ -248,6 +294,8 @@ ck(db.migratedRaidPrep == true, "the Raid Prep migration marker survives")
 ck(type(db.friendDir) == "table", "friendDir created")
 ck(db.friendDirRev == 1, "friendDirRev seeded")
 ck(type(db.friended) == "table", "friended (per-character markers) created")
+ck(type(db.outbox) == "table", "outbox (the 1.2.0 outbound ledger) created")
+ck(#db.outbox == 0, "...empty, so an existing save starts with nothing in the post")
 realprint("=== GATE SV: " .. (FAILS == 0 and "PASS" or "FAIL") .. " ===\n")
 
 ----------------------------------------------------------------------
@@ -453,6 +501,17 @@ do
             -- equal needs are ordered by name
             if order(P({ ch("zeta", 60, 4), ch("Alpha", 60, 4) })) ~= "Alpha:6,zeta:6" then return false end
 
+            -- IN-FLIGHT IS OWNED. A top-up already in the post counts against the
+            -- need, so a re-run cannot post it twice; and the row that is still
+            -- short says how much is on its way.
+            local tr = B.BuildPlan({ ch("Erro", 60, 9) },
+                { source = "S", stock = 99, itemID = ITEM, inFlight = { erro = 1 } })
+            if #tr.targets ~= 0 or tr.counts.stocked ~= 1 then return false end
+            if not tostring(tr.skipped[1].reason):find("in transit", 1, true) then return false end
+            local tr2 = B.BuildPlan({ ch("Erro", 60, 4) },
+                { source = "S", stock = 99, itemID = ITEM, inFlight = { erro = 2 } })
+            if #tr2.targets ~= 1 or at(tr2, 1).send ~= 4 or at(tr2, 1).inTransit ~= 2 then return false end
+
             -- ages
             if B.FormatAge(89) ~= "just now" or B.FormatAge(90) ~= "1m" then return false end
             if B.FormatAge(3600) ~= "1h" or B.FormatAge(172800) ~= "2d" then return false end
@@ -482,8 +541,12 @@ do
                                          "elseif not lvl or lvl < 0 then" },
         { "level boundary off by one",   "elseif lvl < minLevel then",
                                          "elseif lvl <= minLevel then" },
-        { "need arithmetic flipped",     "local need = target - have",
-                                         "local need = target + have" },
+        { "need arithmetic flipped",     "local need    = target - owned",
+                                         "local need    = target + owned" },
+        -- In-flight is OWNED (ledger.lua): a top-up already in the post must count
+        -- against the need, or a re-run after an interruption mails it all again.
+        { "in-flight ignored",           "local owned   = have + transit",
+                                         "local owned   = have + 0" },
         { "stocked boundary off by one", "if need <= 0 then",
                                          "if need < 0 then" },
         { "rationing order reversed",    "if a.need ~= b.need then return a.need > b.need end",
@@ -662,6 +725,647 @@ local V_HDR = (FAILS == HDR_BEFORE)
 realprint("=== GATE HDR: " .. (V_HDR and "PASS" or "FAIL") .. " ===\n")
 
 ----------------------------------------------------------------------
+-- THE LIVE SEND ENGINE, DRIVEN HEADLESS
+--
+-- mail.lua was the one shipped file this harness could not touch: it is nothing
+-- but live API, so every gate above could only assert things ABOUT it from its
+-- source text. That is precisely where the over-attach lived. harness/mailsim.lua
+-- now stands the mailbox up in plain Lua — bags, cursor, split/pickup, twelve
+-- attachment slots that report their stack counts, a SendMail that answers on a
+-- virtual clock — and the REAL engine drives it.
+----------------------------------------------------------------------
+local Sim = assert(loadfile(HARNESS_DIR .. "/mailsim.lua"))()
+local ITEM = 184937
+
+local ENGINE_FILES = { "rules.lua", "migrate.lua", "network.lua", "ledger.lua",
+                       "boons.lua", "mail.lua" }
+
+-- Load a FRESH addon namespace against `sim`, optionally with a patched mail.lua
+-- (used to reconstruct the pre-fix engine for the red half of GATE ATTACH).
+local function newEngine(sim, mailSrc)
+    _G.DaseekiConduitDB = nil
+    _G.__POPUP = nil
+    sim:Install(_G)
+    local n = {}
+    assert(loadfile(P("core.lua")))(ADDON_NAME, n)
+    n.RegisterEvent = function(_, ev, fn) sim:On(ev, fn) end
+    for _, rel in ipairs(ENGINE_FILES) do
+        local chunk
+        if rel == "mail.lua" and mailSrc then
+            chunk = assert(loadstring(mailSrc, "@patched-mail.lua"))
+        else
+            chunk = assert(loadfile(P(rel)))
+        end
+        chunk(ADDON_NAME, n)
+    end
+    n:InitDB()
+    return n
+end
+
+-- A faithful mirror of boons.lua's Boons.Plan() + Boons.Run() wiring, with the
+-- Nexus roster injected instead of scraped off _G (network.lua's own suite covers
+-- the scrape). Everything else — the ledger sweep, the in-flight read, the plan,
+-- the queue, the rebuild and the per-mail re-check — is the shipped code.
+local function derive(n, entries)
+    local stacks   = n.Boons.ScanStacks(ITEM)
+    local now      = _G.time()
+    n.Ledger.Sweep(n.Boons.MeshSnapshot(entries, ITEM), now)
+    local inFlight = n.Ledger.InFlight(n.Ledger.Entries(), ITEM, now)
+    local plan = n.Boons.BuildPlan(entries, {
+        source = "Bankalt", faction = "Alliance",
+        stock = n.Boons.CountStock(stacks, ITEM),
+        target = 10, minLevel = 60, itemID = ITEM, inFlight = inFlight, now = now,
+    })
+    return n.Boons.BuildQueue(plan, stacks, { maxAttach = 12, subject = "Daseeki Conduit" }), plan
+end
+
+local function startRun(n, sim, entries, opts)
+    opts = opts or {}
+    local q = derive(n, entries)
+    if #q == 0 then return 0 end
+    local shown = n.Mail.RunQueue(q, "preview", {
+        rebuild = (opts.noRebuild == nil) and function() return (derive(n, entries)) end or nil,
+        check   = (opts.noCheck == nil) and function(mail)
+            local _, p = derive(n, entries)
+            for _, t in ipairs(p.targets) do
+                if t.name:lower() == tostring(mail.recipient):lower() then
+                    if t.need >= (tonumber(mail.units) or 0) then return true end
+                    return false, ("only needs %d now"):format(t.need)
+                end
+            end
+            return false, "already topped up (or on its way)"
+        end or nil,
+        onFinish = opts.onFinish,
+    })
+    if not shown then return 0 end
+    sim:Accept(_G)
+    return #q
+end
+
+local function bagsOf(stacks)
+    local layout = { [0] = { size = 20 } }
+    for i, c in ipairs(stacks) do layout[0][i] = { itemID = ITEM, count = c } end
+    return layout
+end
+
+local function mesh(spec)
+    local out = {}
+    for _, row in ipairs(spec) do
+        out[#out + 1] = { name = row[1], level = row[2] or 60,
+                          counts = { [ITEM] = row[3] }, countsAt = row[4] or (_G.__CLOCK - 600) }
+    end
+    return out
+end
+
+----------------------------------------------------------------------
+-- GATE ATTACH: THE OVER-ATTACH, REPRODUCED AND THEN KILLED TWICE OVER
+--
+-- The live report: a boon run reading "Sent 2/8" with the mail for Erro — planned
+-- for SEVEN — sitting on the Send Mail form carrying TWO WHOLE STACKS OF TEN, and
+-- 60 copper of postage confirming two attachments.
+--
+-- ROOT CAUSE, as reproduced below. The old attach decided how many units it
+-- wanted, called split-or-pickup, checked only that the attachment slot had become
+-- NON-EMPTY, and then asserted `units = units + want`. It never asked the form how
+-- much had landed. And the same function contained an explicit `want = have` in the
+-- branch taken whenever the split path was not used, which turns a PARTIAL draw
+-- into a WHOLE-STACK pickup. A seven-unit top-up drawn across two slots therefore
+-- put two whole stacks of ten on the form while the engine's own accounting still
+-- read seven — so nothing downstream could notice, and SendMail fired on a form the
+-- engine had never looked at.
+--
+-- THREE RUNS OF ONE FIXTURE:
+--   RED    pre-fix attach + no guard          -> 20 units sent on a 7-unit plan
+--   GREEN  shipped attach                     -> exactly 7, split across two slots
+--   GREEN  pre-fix attach + the shipped guard -> refused, nothing sent
+--
+-- The fixture, and why it looks the way it does. Two full stacks of ten. Poonyx is
+-- planned for NINE and drawn entirely from the first stack; Erro is planned for
+-- SEVEN and therefore drawn across BOTH — one unit from what Poonyx left, six from
+-- the second stack. Poonyx's mail then fails (a bad name, a full mailbox, a server
+-- hiccup — the engine cannot tell them apart) and is skipped, so his nine never
+-- leave the bags and BOTH of Erro's draw slots are still holding ten when his mail
+-- is armed. That is the exact condition under which a partial draw that cannot be
+-- split becomes a whole stack, and it is a completely ordinary thing to happen
+-- part-way through a batch. `noSplit` on the simulator is the client condition; the
+-- defect is that the engine had a whole-stack fallback for it at all.
+----------------------------------------------------------------------
+local ATTACH_BEFORE = FAILS
+realprint("=== GATE ATTACH: the over-attach, reproduced then fixed ===")
+do
+    local MAIL_SRC = readFile(P("mail.lua"))
+    ck(MAIL_SRC ~= nil, "mail.lua is readable")
+
+    -- The pre-fix engine, reconstructed from the shipped source by three edits.
+    local LEGACY = {
+        { [[                    if want < have then
+                        -- A PARTIAL draw. Only a real split can serve it. If the
+                        -- client will not split, we take nothing: the old fallback
+                        -- to a whole-stack pickup here is precisely the over-attach.
+                        if C and C.SplitContainerItem then
+                            C.SplitContainerItem(st.bag, st.slot, want)
+                            picked = CursorHasItem() and true or false
+                        end
+                    elseif C and C.PickupContainerItem then
+                        C.PickupContainerItem(st.bag, st.slot)
+                        picked = CursorHasItem() and true or false
+                    end]],
+          [[                    if want < have and C and C.SplitContainerItem then
+                        C.SplitContainerItem(st.bag, st.slot, want)
+                        picked = CursorHasItem() and true or false
+                    elseif C and C.PickupContainerItem then
+                        C.PickupContainerItem(st.bag, st.slot)
+                        want = have
+                        picked = CursorHasItem() and true or false
+                    end]] },
+        { [[                        if slotAttached(nextSlot) and landed == want then
+                            attached = nextSlot
+                            units    = units + landed]],
+          [[                        if slotAttached(nextSlot) then
+                            attached = nextSlot
+                            units    = units + want]] },
+    }
+    local NO_GUARD = { { "local okAttach, whyAttach = verifyAttach(mail)",
+                         "local okAttach, whyAttach = true, nil" } }
+
+    local function patch(src, edits)
+        for _, e in ipairs(edits) do
+            local head, tail = src:find(e[1], 1, true)
+            if not head then return nil, "fragment missing: " .. e[1]:sub(1, 60) end
+            if src:find(e[1], tail + 1, true) then return nil, "fragment not unique" end
+            src = src:sub(1, head - 1) .. e[2] .. src:sub(tail + 1)
+        end
+        return src
+    end
+
+    local function bothEdits(src, a, b)
+        local s, err = patch(src, a); if not s then return nil, err end
+        return patch(s, b)
+    end
+
+    -- THE FIXTURE. Two stacks of ten. Poonyx needs 6 (already served by the run
+    -- this one resumes, so the per-mail re-check skips it and leaves its slot
+    -- untouched); Erro needs 7, drawn 4 from the first slot and 3 from the second.
+    local ROSTER = { { "Poonyx", 60, 1 }, { "Erro", 60, 3 } }
+    local function poonyxFails(_, rec) return rec.recipient == "Poonyx" and "fail" or "ok" end
+
+    local function runFixture(mailSrc, opts)
+        opts = opts or {}
+        local sim = Sim.New(bagsOf({ 10, 10 }),
+            { behaviour = poonyxFails, poison = opts.poison, noSplit = opts.noSplit })
+        local n = newEngine(sim, mailSrc)
+        chatClear()
+        startRun(n, sim, mesh(ROSTER))
+        sim:Advance(300)
+        local erro
+        for _, m in ipairs(sim.sent) do if m.recipient == "Erro" then erro = m end end
+        return sim, n, erro
+    end
+
+    -- The fixture must actually produce the shape the report describes.
+    do
+        local sim = Sim.New(bagsOf({ 10, 10 }))
+        local n = newEngine(sim, nil)
+        local q = derive(n, mesh(ROSTER))
+        local erro
+        for _, m in ipairs(q) do if m.recipient == "Erro" then erro = m end end
+        ck(erro ~= nil, "(fixture) the queue contains Erro's mail")
+        ck(erro and erro.units == 7, "(fixture) ...planned for 7 units, as the owner saw")
+        ck(erro and #erro.stacks == 2, "(fixture) ...drawn across TWO bag slots")
+    end
+
+    -- RED: the pre-fix attach with no guard puts 20 on the form and sends it.
+    do
+        local src, err = bothEdits(MAIL_SRC, LEGACY, NO_GUARD)
+        ck(src ~= nil, "(red) the pre-fix engine can be reconstructed" .. (src and "" or (" — " .. tostring(err))))
+        if src then
+            local sim, _, erroSend = runFixture(src, { noSplit = true })
+            ck(erroSend ~= nil, "(red) the pre-fix engine sent Erro's mail")
+            ck(erroSend and erroSend.units == 20,
+               "(red) ...carrying 20 units — the live defect, reproduced ("
+               .. tostring(erroSend and erroSend.desc) .. ")")
+            ck(erroSend and erroSend.attachments == 2,
+               "(red) ...in TWO attachments (60c of postage, as the owner counted)")
+        end
+    end
+
+    -- GREEN A: the shipped attach, on a client whose split works, sends exactly 7.
+    do
+        local sim, n, erroSend = runFixture(nil)
+        ck(erroSend ~= nil, "(green) the shipped engine sends Erro's mail")
+        ck(erroSend and erroSend.units == 7,
+           "(green) ...carrying exactly 7 — the plan, not the stacks (" .. tostring(erroSend and erroSend.desc) .. ")")
+        ck(erroSend and erroSend.attachments == 2, "(green) ...still split across the two slots")
+        ck(sim:BagUnits(ITEM) == 13, "(green) 13 boons left in the bags (20 - 7)")
+        ck(chatFind("skipping Poonyx") ~= nil, "(green) the failing recipient is skipped, not sent to")
+    end
+
+    -- GREEN B: even with the pre-fix ATTACH restored, the guard alone refuses.
+    -- This is the defence-in-depth requirement: a poisoned attach never sends.
+    do
+        local src = patch(MAIL_SRC, LEGACY)
+        ck(src ~= nil, "(guard) the pre-fix attach can be restored on its own")
+        if src then
+            local sim = runFixture(src, { noSplit = true })
+            local overSent = false
+            for _, m in ipairs(sim.sent) do if m.units > 7 then overSent = true end end
+            ck(not overSent, "(guard) a poisoned attach is REFUSED — nothing over-planned is sent")
+            ck(chatFind("form holds") ~= nil, "(guard) ...and says so in plain language")
+            ck(sim:BagUnits(ITEM) == 20, "(guard) every boon is still in the bags")
+        end
+    end
+
+    -- And the same guard against a client that hands back MORE than was asked for.
+    do
+        local sim = runFixture(nil, { poison = function(_, _, n) return n + 2 end })
+        local over = false
+        for _, m in ipairs(sim.sent) do if m.units > 7 then over = true end end
+        ck(not over, "(guard) a split that over-delivers is refused too, not sent")
+    end
+end
+local V_ATTACH = (FAILS == ATTACH_BEFORE)
+realprint("=== GATE ATTACH: " .. (V_ATTACH and "PASS" or "FAIL") .. " ===\n")
+
+----------------------------------------------------------------------
+-- GATE RUN: the hands-free runner's state machine, driven for real.
+----------------------------------------------------------------------
+local RUN_BEFORE = FAILS
+realprint("=== GATE RUN: hands-free runner state machine ===")
+do
+    local FULL = mesh({ { "Aaa", 60, 0 }, { "Bbb", 60, 2 }, { "Ccc", 60, 5 } })
+
+    -- (a) HAPPY PATH: one Accept, three mails, no further interaction.
+    do
+        local sim = Sim.New(bagsOf({ 10, 10, 10 }))
+        local n = newEngine(sim, nil)
+        chatClear()
+        local queued = startRun(n, sim, FULL)
+        ck(queued == 3, "(a) three mails queued from one preview")
+        ck(n.Mail.IsActive(), "(a) the run starts on Accept alone")
+        sim:Advance(120)
+        ck(#sim.sent == 3, "(a) all three sent with no further clicks")
+        ck(not n.Mail.IsActive(), "(a) the run finished and cleared itself")
+        ck(#(sim.violations or {}) == 0, "(a) never two mails in flight at once")
+        ck(sim.sent[1].units == 10 and sim.sent[2].units == 8 and sim.sent[3].units == 5,
+           "(a) each mail carried exactly what the plan asked for")
+        ck(chatFind("done — sent 3 mail(s)") ~= nil, "(a) one completion line")
+    end
+
+    -- (b) THE ACK NEVER COMES. The latch must CLEAR and the run stop with a report
+    --     — the failure mode the behavioural spec flags as latch-until-reload.
+    do
+        local sim = Sim.New(bagsOf({ 10, 10, 10 }), {
+            behaviour = function(i) return (i == 2) and "noack" or "ok" end })
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, FULL)
+        sim:Advance(5)
+        ck(n.Mail.IsInFlight(), "(b) the second mail is in flight and unanswered")
+        sim:Advance(20)
+        ck(not n.Mail.IsInFlight(), "(b) after the 15s ceiling the in-flight latch is CLEAR")
+        ck(not n.Mail.IsActive(), "(b) ...and the run has stopped rather than hanging")
+        ck(chatFind("no answer from the server within 15s") ~= nil, "(b) with a report naming the bound")
+        ck(#sim.sent == 2, "(b) nothing further was sent")
+        ck(sim:LiveTickers() == 0, "(b) the Send-button ticker was released")
+    end
+
+    -- (c) THE ACK COMES BUT NOTHING MOVES. Second ceiling, same discipline.
+    do
+        local sim = Sim.New(bagsOf({ 10, 10, 10 }), {
+            behaviour = function(i) return (i == 1) and "noevidence" or "ok" end })
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, FULL)
+        sim:Advance(5)
+        ck(n.Mail.IsInFlight(), "(c) acknowledged, still waiting on the evidence")
+        sim:Advance(20)
+        ck(not n.Mail.IsInFlight(), "(c) the evidence ceiling clears the latch")
+        ck(not n.Mail.IsActive(), "(c) ...and stops the run")
+        ck(chatFind("nothing left your bags or purse within 15s") ~= nil,
+           "(c) ...with a report a user can act on")
+    end
+
+    -- (d) RETRY THEN SKIP. One retry per mail, counted ONCE, then the recipient is
+    --     skipped and the run CONTINUES — it does not abort the rest over one name.
+    do
+        local fails = 0
+        local sim = Sim.New(bagsOf({ 10, 10, 10 }), {
+            behaviour = function(i, rec)
+                if rec.recipient == "Bbb" then fails = fails + 1; return "fail" end
+                return "ok"
+            end })
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, FULL)
+        sim:Advance(120)
+        ck(fails == 2, "(d) the failing recipient was attempted exactly twice (one retry)")
+        ck(chatFind("retrying Bbb once") ~= nil, "(d) ...and the retry is announced once")
+        ck(chatFind("skipping Bbb") ~= nil, "(d) ...then skipped by name")
+        local sentTo = {}
+        for _, m in ipairs(sim.sent) do sentTo[m.recipient] = (sentTo[m.recipient] or 0) + 1 end
+        ck(sentTo["Ccc"] == 1, "(d) the run CONTINUED to the recipient after the failure")
+        ck(not n.Mail.IsActive(), "(d) and finished cleanly")
+    end
+
+    -- (e) MAILBOX CLOSED MID-RUN is a hard abort that actually returns.
+    do
+        local sim = Sim.New(bagsOf({ 10, 10, 10 }), { latency = 3 })
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, FULL)
+        sim:Advance(1)
+        ck(n.Mail.IsActive(), "(e) the run is still going when the mailbox goes")
+        local sentSoFar = #sim.sent
+        sim:CloseMailbox(n)
+        ck(not n.Mail.IsActive(), "(e) closing the mailbox stops the run at once")
+        ck(not n.Mail.IsInFlight(), "(e) ...and clears the in-flight latch")
+        ck(sim:LiveTickers() == 0, "(e) ...and releases the Send-button ticker")
+        sim:Advance(120)
+        ck(#sim.sent == sentSoFar, "(e) not one further mail is sent into a closed mailbox")
+        ck(chatFind("mailbox closed") ~= nil, "(e) ...and it says so")
+    end
+
+    -- (f) THE SEND BUTTON. Blizzard re-enables its own; the 0.2s ticker must put it
+    --     back for the life of the send, and be gone at the terminal state.
+    do
+        local sim = Sim.New(bagsOf({ 10 }), { latency = 2 })
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, mesh({ { "Aaa", 60, 0 } }))
+        sim:Advance(0.01)
+        ck(sim.buttonEnabled == false, "(f) Blizzard's Send button is disabled for the send")
+        ck(sim:LiveTickers() == 1, "(f) ...held down by exactly one repeating ticker")
+        sim:Advance(0.06)             -- Blizzard re-enables it under us at 0.05s
+        sim:Advance(0.25)             -- ...and the ticker takes it back
+        ck(sim.buttonEnabled == false, "(f) a mid-send re-enable is re-asserted away")
+        sim:Advance(120)
+        ck(sim:LiveTickers() == 0, "(f) the ticker is cancelled at the terminal state")
+        ck(sim.buttonEnabled == true, "(f) ...and the button is handed back")
+        ck(sim:LiveTimers() == 0, "(f) no timer of any kind outlives the run")
+    end
+
+    -- (g) STEP MODE still works, and is not the default.
+    do
+        local sim = Sim.New(bagsOf({ 10, 10, 10 }))
+        local n = newEngine(sim, nil)
+        ck(n.Mail.StepMode() == false, "(g) hands-free is the default")
+        n.Mail.SetStepMode(true)
+        chatClear()
+        startRun(n, sim, FULL)
+        sim:Advance(120)
+        ck(#sim.sent == 0, "(g) step mode sends nothing until you click")
+        ck(n.Mail.IsAwaitingClick(), "(g) ...and says it is waiting")
+        n.Mail.ContinueClick(); sim:Advance(5)
+        ck(#sim.sent == 1, "(g) one click, one mail")
+        n.Mail.ContinueClick(); sim:Advance(5)
+        n.Mail.ContinueClick(); sim:Advance(5)
+        ck(#sim.sent == 3, "(g) ...and the queue completes a click at a time")
+        n.Mail.SetStepMode(false)
+    end
+
+    -- (i) A DEFERRED HOP BELONGS TO ITS RUN. The 0.5s failure spacing means an
+    --     arm can be scheduled for a run that stops before it fires; if the next run
+    --     inherited it, it would arm a mail out of the wrong queue.
+    do
+        local sim = Sim.New(bagsOf({ 10, 10, 10 }), {
+            behaviour = function(_, rec) return rec.recipient == "Aaa" and "fail" or "ok" end })
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, FULL)
+        sim:Advance(0.4)                 -- MAIL_FAILED is in; the retry is pending
+        ck(n.Mail.IsActive(), "(i) the run is alive with a retry scheduled")
+        sim:CloseMailbox(n)
+        ck(not n.Mail.IsActive(), "(i) ...and the mailbox closing kills it")
+        sim.mailboxOpen = true
+        chatClear()
+        local queued = startRun(n, sim, FULL)
+        sim:Advance(120)
+        ck(queued == 3, "(i) a second run plans normally")
+        ck(#(sim.violations or {}) == 0, "(i) ...and the stale hop never touches it")
+        ck(not n.Mail.IsActive(), "(i) ...which then finishes cleanly")
+    end
+
+    -- (h) STOP means no further mails.
+    do
+        local sim = Sim.New(bagsOf({ 10, 10, 10 }), { latency = 2 })
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, FULL)
+        sim:Advance(0.01)
+        n.Mail.Stop()
+        sim:Advance(120)
+        ck(#sim.sent == 1, "(h) Stop lets the mail already sent finish and sends no more")
+        ck(not n.Mail.IsActive(), "(h) ...and the run ends")
+    end
+end
+local V_RUN = (FAILS == RUN_BEFORE)
+realprint("=== GATE RUN: " .. (V_RUN and "PASS" or "FAIL") .. " ===\n")
+
+----------------------------------------------------------------------
+-- GATE LEDGER: the outbound ledger, row by row, and the owner's scenario.
+----------------------------------------------------------------------
+local LEDGER_BEFORE = FAILS
+realprint("=== GATE LEDGER: outbound ledger rules ===")
+do
+    local L = ns.Ledger
+    ck(L ~= nil, "ledger.lua loaded into the shared namespace")
+
+    local NOW = 1700000000
+    local DAY = 86400
+
+    -- (a) the pure rules.
+    do
+        local e = {}
+        L.Add(e, "Erro", ITEM, 7, NOW)
+        L.Add(e, "erro-whitemane", ITEM, 2, NOW)
+        L.Add(e, "Poonyx", ITEM, 3, NOW)
+        ck(#e == 3, "(a) three entries appended")
+        ck(L.Add(e, "", ITEM, 5, NOW) == nil and #e == 3, "(a) a nameless entry is refused")
+        ck(L.Add(e, "Ghost", ITEM, 0, NOW) == nil and #e == 3, "(a) a zero-quantity entry is refused")
+        local f = L.InFlight(e, ITEM, NOW)
+        ck(f["erro"] == 9, "(a) realm-qualified and bare names fold to one character")
+        ck(f["poonyx"] == 3, "(a) ...and other characters are kept apart")
+        ck(L.InFlight(e, 99999, NOW)["erro"] == nil, "(a) another item is not counted")
+    end
+
+    -- (b) evidence retires an entry; a stale snapshot does not.
+    do
+        local e = {}
+        L.Add(e, "Erro", ITEM, 7, NOW)
+        local kept = L.Reconcile(e, { erro = { count = 10, at = NOW - 60 } }, NOW)
+        ck(#kept == 1, "(b) a snapshot taken BEFORE the send proves nothing")
+        kept = L.Reconcile(e, { erro = { count = 3, at = NOW + 60 } }, NOW + 60)
+        ck(#kept == 1, "(b) a newer snapshot that does not show the goods proves nothing")
+        local kept2, retired = L.Reconcile(e, { erro = { count = 10, at = NOW + 3700 } }, NOW + 3700)
+        ck(#kept2 == 0 and retired[1].why == "delivered",
+           "(b) a newer snapshot showing the quantity retires the entry")
+    end
+
+    -- (c) the TTL backstop.
+    do
+        local e = {}
+        L.Add(e, "Erro", ITEM, 7, NOW)
+        ck(#L.Reconcile(e, {}, NOW + 29 * DAY) == 1, "(c) 29 days: still in flight")
+        local kept, retired = L.Reconcile(e, {}, NOW + 31 * DAY)
+        ck(#kept == 0 and retired[1].why == "expired", "(c) 31 days: retired by the TTL")
+        ck(L.InFlight(e, ITEM, NOW + 31 * DAY)["erro"] == nil,
+           "(c) ...and an expired entry stops suppressing a top-up immediately")
+    end
+
+    -- (d) the plan subtracts what is in transit.
+    do
+        local p = ns.Boons.BuildPlan(
+            { { name = "Erro", level = 60, counts = { [ITEM] = 9 }, countsAt = NOW } },
+            { source = "Bankalt", faction = "Alliance", stock = 99, itemID = ITEM,
+              inFlight = { erro = 1 }, now = NOW })
+        ck(#p.targets == 0, "(d) has 9 with 1 in transit -> nothing to send")
+        ck(tostring(p.skipped[1].reason) == "has 9, 1 in transit",
+           "(d) ...and the preview says exactly that")
+        local text = ns.Boons.PreviewText(ns.Boons.BuildPlan(
+            { { name = "Erro", level = 60, counts = { [ITEM] = 9 }, countsAt = NOW },
+              { name = "Orn",  level = 60, counts = { [ITEM] = 0 }, countsAt = NOW } },
+            { source = "Bankalt", faction = "Alliance", stock = 99, itemID = ITEM,
+              inFlight = { erro = 1 }, now = NOW }))
+        ck(text:find("has 9, 1 in transit", 1, true) ~= nil,
+           "(d) ...in the confirm preview, in as many words")
+        ck(text:find("nothing to send", 1, true) ~= nil, "(d) ...and why it is not being sent")
+    end
+
+    -- (e) A CONFIRMED send persists; an ATTEMPT does not.
+    do
+        local sim = Sim.New(bagsOf({ 10 }))
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, mesh({ { "Erro", 60, 3 } }))
+        sim:Advance(120)
+        ck(#n.Ledger.Entries() == 1, "(e) a confirmed send writes one ledger row")
+        ck(n.Ledger.Entries()[1].qty == 7 and n.Ledger.Entries()[1].target == "Erro",
+           "(e) ...recording the recipient and the quantity")
+    end
+    do
+        local sim = Sim.New(bagsOf({ 10 }), { behaviour = function() return "fail" end })
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, mesh({ { "Erro", 60, 3 } }))
+        sim:Advance(120)
+        ck(#n.Ledger.Entries() == 0, "(e) a mail that FAILED writes nothing")
+    end
+    do
+        local sim = Sim.New(bagsOf({ 10 }), { behaviour = function() return "noack" end })
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, mesh({ { "Erro", 60, 3 } }))
+        sim:Advance(120)
+        ck(#n.Ledger.Entries() == 0, "(e) a mail that timed out un-acknowledged writes nothing")
+    end
+    do
+        local sim = Sim.New(bagsOf({ 10 }), { behaviour = function() return "noevidence" end })
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, mesh({ { "Erro", 60, 3 } }))
+        sim:Advance(120)
+        ck(#n.Ledger.Entries() == 0,
+           "(e) an ACKNOWLEDGED mail whose goods never moved writes nothing either")
+    end
+
+    -- (f) THE OWNER'S SCENARIO, VERBATIM: eight targets, the run interrupted after
+    --     two, then re-run. It must plan the remaining SIX and double-send nothing.
+    do
+        local roster = mesh({
+            { "T1", 60, 0 }, { "T2", 60, 1 }, { "T3", 60, 2 }, { "T4", 60, 3 },
+            { "T5", 60, 4 }, { "T6", 60, 5 }, { "T7", 60, 6 }, { "T8", 60, 7 },
+        })
+        local sim = Sim.New(bagsOf({ 10, 10, 10, 10, 10, 10 }))
+        local n = newEngine(sim, nil)
+        -- Step mode for the FIRST run only, so "interrupted at exactly 2 of 8" is
+        -- deterministic rather than a race against the virtual clock. The ledger
+        -- contract under test is identical either way: it is written at the terminal
+        -- success, and nothing about it knows which mode fired the send.
+        n.Mail.SetStepMode(true)
+        chatClear()
+        local queued = startRun(n, sim, roster)
+        ck(queued == 8, "(f) the first run plans eight mails")
+        n.Mail.ContinueClick(); sim:Advance(5)
+        n.Mail.ContinueClick(); sim:Advance(5)
+        -- ...and then the player walks away from the mailbox.
+        sim:CloseMailbox(n)
+        n.Mail.SetStepMode(false)
+        ck(#sim.sent == 2, "(f) interrupted at 2 of 8")
+        ck(#n.Ledger.Entries() == 2, "(f) two confirmed sends are in the ledger")
+
+        -- Re-run at the mailbox. The mesh has NOT caught up (cross-account mail
+        -- takes an hour), so ONLY the ledger can prevent the double-send.
+        sim.mailboxOpen = true
+        chatClear()
+        local q2 = derive(n, roster)
+        ck(#q2 == 6, "(f) the re-run plans SIX mails — the remainder, by construction")
+        local names = {}
+        for _, m in ipairs(q2) do names[m.recipient] = true end
+        ck(not names["T1"] and not names["T2"], "(f) ...and neither of the two already sent")
+
+        local before = {}
+        for _, m in ipairs(sim.sent) do before[m.recipient] = (before[m.recipient] or 0) + m.units end
+        startRun(n, sim, roster)
+        sim:Advance(300)
+        local after = {}
+        for _, m in ipairs(sim.sent) do after[m.recipient] = (after[m.recipient] or 0) + m.units end
+        ck(after["T1"] == before["T1"] and after["T2"] == before["T2"],
+           "(f) NOT ONE extra boon went to the two that were already served")
+        ck(#sim.sent == 8, "(f) eight mails in total across the two runs, not ten")
+    end
+
+    -- (g) evidence clearing end-to-end: the mesh catches up, the entry retires, and
+    --     the character becomes eligible again if they genuinely spend the boons.
+    do
+        local sim = Sim.New(bagsOf({ 10, 10 }))
+        local n = newEngine(sim, nil)
+        local roster = mesh({ { "Erro", 60, 3 } })
+        chatClear()
+        startRun(n, sim, roster)
+        sim:Advance(120)
+        ck(#n.Ledger.Entries() == 1, "(g) one entry in flight")
+        -- an hour later the mail lands and Nexus sees the full pocket
+        _G.__CLOCK = _G.__CLOCK + 3700
+        roster[1].counts[ITEM] = 10
+        roster[1].countsAt = _G.__CLOCK
+        derive(n, roster)
+        ck(#n.Ledger.Entries() == 0, "(g) the delivery is seen and the entry retires")
+        -- ...and after they burn them, a top-up is planned again
+        roster[1].counts[ITEM] = 2
+        roster[1].countsAt = _G.__CLOCK
+        local q = derive(n, roster)
+        ck(#q >= 1 and q[1].units == 8, "(g) a genuinely empty pocket is topped up again")
+        _G.__CLOCK = 1700000000
+    end
+
+    -- (h) MUTATION-CHECK THE IN-FLIGHT LATCH. If the ledger stopped counting
+    --     in-flight quantity, (f) would double-send — prove the suite would notice.
+    do
+        local src = readFile(P("ledger.lua"))
+        local frag = "                out[k] = (out[k] or 0) + e.qty"
+        local head, tail = src:find(frag, 1, true)
+        ck(head ~= nil, "(h) the in-flight accumulator is where the mutation expects it")
+        if head then
+            local mutated = src:sub(1, head - 1) .. "                out[k] = (out[k] or 0) + 0" .. src:sub(tail + 1)
+            local chunk = loadstring(mutated, "@mutant:ledger")
+            local mutNs = {}
+            if chunk then pcall(chunk, ADDON_NAME, mutNs) end
+            local e = {}
+            mutNs.Ledger.Add(e, "Erro", ITEM, 7, NOW)
+            local f = mutNs.Ledger.InFlight(e, ITEM, NOW)
+            ck((f["erro"] or 0) == 0, "(h) the mutant does stop counting (it is a real mutation)")
+            local p = ns.Boons.BuildPlan(
+                { { name = "Erro", level = 60, counts = { [ITEM] = 9 }, countsAt = NOW } },
+                { source = "Bankalt", faction = "Alliance", stock = 99, itemID = ITEM,
+                  inFlight = f, now = NOW })
+            ck(#p.targets == 1, "(h) MUTANT KILLED: with in-flight lost, the plan re-sends")
+        end
+    end
+end
+local V_LEDGER = (FAILS == LEDGER_BEFORE)
+realprint("=== GATE LEDGER: " .. (V_LEDGER and "PASS" or "FAIL") .. " ===\n")
+
+----------------------------------------------------------------------
 realprint("############################################################")
 realprint("# Daseeki-Conduit self-tests")
 realprint("#   GATE 0      toc parse             : PASS")
@@ -671,6 +1375,9 @@ realprint("#   GATE SV     additive SavedVariables : " .. (FAILS == 0 and "PASS"
 realprint("#   GATE FRIEND real auto-friend pass : " .. (FAILS == 0 and "PASS" or "FAIL"))
 realprint("#   GATE MUT    boon plan mutations  : " .. (FAILS == 0 and "PASS" or "FAIL"))
 realprint("#   GATE HDR    header control cluster : " .. (V_HDR and "PASS" or "FAIL"))
+realprint("#   GATE ATTACH over-attach repro+fix : " .. (V_ATTACH and "PASS" or "FAIL"))
+realprint("#   GATE RUN    hands-free state machine : " .. (V_RUN and "PASS" or "FAIL"))
+realprint("#   GATE LEDGER outbound ledger rules : " .. (V_LEDGER and "PASS" or "FAIL"))
 realprint("#")
 realprint("#   RESULT: " .. (FAILS == 0 and "ALL PASS" or (FAILS .. " FAILURE(S) — RED")))
 realprint("############################################################")

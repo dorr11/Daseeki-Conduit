@@ -612,6 +612,19 @@ function Options.Build(flow)
         populateEditor(); refreshAll()
     end })
 
+    -- ── Sending ───────────────────────────────────────────────────────────────
+    -- The default is hands-free: one Accept sends the whole batch, because that is
+    -- what the feature is FOR and nothing in the client requires a click per mail.
+    -- Step mode is kept for anyone who would rather watch each one go — same engine,
+    -- same guards, same confirm popup; it only withholds the trigger.
+    L:AddSection("Sending")
+    L:Checkbox({
+        label = "One mail per click (step mode)",
+        get = function() return ns.Mail and ns.Mail.StepMode() end,
+        set = function(v) if ns.Mail then ns.Mail.SetStepMode(v) end; refreshAll() end,
+    })
+    L:Hint("Off (the default): accept the preview once and the whole batch sends itself, one mail at a time, waiting for each to be confirmed before the next. A Stop button sits on the mailbox panel for the whole run. On: the panel asks you to click Send Next for every mail, as it did before.")
+
     L:AddSection("Mail Recipients")
     L:Checkbox({
         label = "Auto-friend mail recipients",

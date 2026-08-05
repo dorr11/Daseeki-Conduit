@@ -17,7 +17,7 @@ local ADDON, ns = ...
 
 ns.ADDON    = ADDON
 ns.DISPLAY  = "Daseeki Conduit"
-ns.VERSION  = "1.1.0"
+ns.VERSION  = "1.2.0"
 ns.CHAT_TAG_TEXT = "Daseeki Conduit"
 -- Static fallback used only when Daseeki Core (DaseekiUI) is absent; when present the
 -- chat tag derives from the live "brand" token (Field Ledger rollout, BRAND_SPEC §2).
@@ -308,6 +308,12 @@ local function defaultDB()
         friendDir     = {},   -- [canonicalKey] = { name, realm, faction, ts }
         friendDirRev  = 1,    -- monotonic revision of friendDir (cross-account gating)
         friended      = {},   -- [charKey] = { [canonicalKey] = true }
+
+        -- Outbound ledger (ledger.lua): { { target, itemID, qty, ts }, ... } — one
+        -- row per CONFIRMED send, retired on evidence or after a 30-day TTL. Also
+        -- purely ADDITIVE: a new top-level key on an existing save, nothing
+        -- reshaped, so no schema bump is due.
+        outbox        = {},
     }
 end
 
@@ -381,6 +387,7 @@ local function printHelp()
     ns:Print("  /conduit enable          - re-enable Conduit on this character")
     ns:Print("  /conduit debug selftest  - run rule/batch/gold self-tests")
     ns:Print("  /conduit debug friends   - what auto-friend would do on this character")
+    ns:Print("  /conduit debug boons     - the boon plan + the outbound ledger (add 'clear' to empty it)")
     ns:Print("  /conduit help            - this list")
 end
 
@@ -418,12 +425,14 @@ local function dispatch(msg)
             ns:Print("open a mailbox first — the Conduit panel docks beside it.")
         end
     elseif cmd == "debug" then
-        local sub = (rest or ""):match("^(%S*)")
+        local sub, subrest = (rest or ""):match("^(%S*)%s*(.-)$")
         sub = (sub or ""):lower()
         if sub == "selftest" or sub == "" then
             ns:RunSelfTests(true)
         elseif sub == "friends" then
             if ns.Friends and ns.Friends.Debug then ns:SafeCall(ns.Friends.Debug) end
+        elseif sub == "boons" then
+            if ns.Boons and ns.Boons.Debug then ns:SafeCall(ns.Boons.Debug, subrest) end
         else
             ns:Print("unknown debug command: " .. sub)
         end

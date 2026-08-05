@@ -151,11 +151,18 @@ end
 --               faction  = "Alliance",  -- the SOURCE's faction, not the viewer's
 --               stock    = 23,          -- sendable units in the source's BAGS
 --               target   = 10, minLevel = 60, itemID = 184937,
+--               inFlight = { ["erro"] = 1 },  -- already posted, not yet arrived
 --               now      = <epoch> }    -- for the age column; nil = no ages
 --
+-- IN-FLIGHT IS OWNED. Cross-account mail takes an hour to land, so for that hour
+-- the mesh snapshot still shows the count from BEFORE the top-up. Counting what the
+-- outbound ledger (ledger.lua) says is already on its way as though it had arrived
+-- is what stops an interrupted run from posting the same boons twice when it is
+-- re-run — the plan simply no longer asks for them.
+--
 -- Returns a plan:
---   { targets = { { name, realm, class, faction, level, have, need, send,
---                   partial, age, ageText }, ... },   -- in SEND order
+--   { targets = { { name, realm, class, faction, level, have, inTransit, need,
+--                   send, partial, age, ageText }, ... },   -- in SEND order
 --     skipped = { { name, kind, reason }, ... },      -- kind: source/faction/
 --                                                    -- level/unknownLevel/stocked
 --     counts  = { source=, faction=, level=, unknownLevel=, stocked= },
@@ -176,6 +183,7 @@ function Boons.BuildPlan(entries, opts)
     local now      = tonumber(opts.now)
     local srcName  = baseLower(opts.source)
     local srcSide  = faction(opts.faction)
+    local inFlight = (type(opts.inFlight) == "table") and opts.inFlight or {}
 
     local plan = {
         targets = {}, skipped = {},
@@ -205,17 +213,25 @@ function Boons.BuildPlan(entries, opts)
             elseif lvl < minLevel then
                 skip(e.name, "level", ("level %d"):format(math.floor(lvl)))
             else
-                local have = held(e, itemID)
-                local need = target - have
+                local have    = held(e, itemID)
+                local transit = count(inFlight[lower])
+                local owned   = have + transit
+                local need    = target - owned
                 if need <= 0 then
-                    skip(e.name, "stocked", ("has %d"):format(have))
+                    -- A character whose pocket is only full because of a mail still
+                    -- in the post says so, in as many words: "has 9, 1 in transit"
+                    -- is the difference between a plan that is finished and a plan
+                    -- that is about to send a second copy.
+                    skip(e.name, "stocked",
+                         (transit > 0) and ("has %d, %d in transit"):format(have, transit)
+                                        or  ("has %d"):format(have))
                 else
                     local at  = tonumber(e.countsAt)
                     local age = (now and at) and (now - at) or nil
                     plan.targets[#plan.targets + 1] = {
                         name = e.name, realm = e.realm, class = e.class,
                         faction = side, level = lvl,
-                        have = have, need = need, send = 0,
+                        have = have, inTransit = transit, need = need, send = 0,
                         age = age, ageText = Boons.FormatAge(age),
                         hasData = (type(e.counts) == "table") or nil,
                     }
@@ -313,6 +329,10 @@ function Boons.BuildQueue(plan, stacks, opts)
             queue[#queue + 1] = {
                 recipient = t.name, subject = subject, stacks = draws,
                 units = units, unitLabel = unitLabel,
+                -- `units` is the engine's SEND GUARD (mail.lua verifyAttach refuses
+                -- to send a form that does not hold exactly this many), and
+                -- `itemID` is what the outbound ledger records on a confirmed send.
+                itemID = itemID,
             }
         end
     end
@@ -393,6 +413,16 @@ local function ageBit(t)
     return "no inventory data"
 end
 
+-- "has 3" / "has 3, 2 in transit" — the held count, and what is already in the post
+-- to that character. Never hidden: a number the reader cannot see is a number they
+-- cannot correct, and "in transit" is the whole reason a target is asking for less.
+local function haveBit(t)
+    if (t.inTransit or 0) > 0 then
+        return ("has %d, %d in transit"):format(t.have, t.inTransit)
+    end
+    return ("has %d"):format(t.have)
+end
+
 -- The dry-run block the send-confirm popup shows. Nothing sends until this has
 -- been read and accepted, so it lists EVERY target and every amount, states the
 -- rationing rule when it is about to bite, and never leaves the age of a count
@@ -418,14 +448,31 @@ function Boons.PreviewText(plan, opts)
     for _, t in ipairs(plan.targets) do
         local name = wrap("text", t.name)
         if t.send >= t.need then
-            lines[#lines + 1] = ("%s  <-  %d   (has %d, %s)")
-                :format(name, t.send, t.have, ageBit(t))
+            lines[#lines + 1] = ("%s  <-  %d   (%s, %s)")
+                :format(name, t.send, haveBit(t), ageBit(t))
         elseif t.send > 0 then
-            lines[#lines + 1] = ("%s  <-  %d of %d   (has %d, %s)")
-                :format(name, t.send, t.need, t.have, ageBit(t))
+            lines[#lines + 1] = ("%s  <-  %d of %d   (%s, %s)")
+                :format(name, t.send, t.need, haveBit(t), ageBit(t))
         else
             lines[#lines + 1] = wrap("muted",
-                ("%s  <-  none of %d   (has %d, %s)"):format(t.name, t.need, t.have, ageBit(t)))
+                ("%s  <-  none of %d   (%s, %s)"):format(t.name, t.need, haveBit(t), ageBit(t)))
+        end
+    end
+
+    -- Characters left out BECAUSE something is already on its way to them. This is
+    -- the line that stops a re-run after an interruption looking like a bug: the
+    -- boons are not missing, they are in the post.
+    do
+        local transit = {}
+        for _, s in ipairs(plan.skipped) do
+            if s.kind == "stocked" and tostring(s.reason):find("in transit", 1, true) then
+                transit[#transit + 1] = ("%s (%s — nothing to send)"):format(s.name, s.reason)
+            end
+        end
+        if #transit > 0 then
+            table.sort(transit)
+            lines[#lines + 1] = ""
+            lines[#lines + 1] = wrap("muted", "Already on its way: " .. table.concat(transit, ", "))
         end
     end
 
@@ -517,7 +564,27 @@ function Boons.ScanStacks(itemID)
     return out
 end
 
--- The live plan: mesh roster + this character's bags. Returns plan, stacks.
+-- What the mesh has SEEN of each character's boon count, and when. This is the
+-- evidence the outbound ledger retires entries against: a snapshot taken AFTER a
+-- send, showing at least what we posted, means the mail arrived.
+function Boons.MeshSnapshot(entries, itemID)
+    itemID = itemID or Boons.ITEM_ID
+    local out = {}
+    for _, e in ipairs((type(entries) == "table") and entries or {}) do
+        if type(e) == "table" and type(e.name) == "string" and e.name ~= "" then
+            out[baseLower(e.name)] = { count = held(e, itemID), at = tonumber(e.countsAt) }
+        end
+    end
+    return out
+end
+
+-- The live plan: mesh roster + the outbound ledger + this character's bags.
+-- Returns plan, stacks.
+--
+-- The ledger is SWEPT first, so anything the mesh has already confirmed delivered
+-- stops being counted as in-flight before it can suppress a top-up that is really
+-- due. Sweep, then read: in that order, or a delivered mail keeps a character off
+-- the list for thirty days.
 function Boons.Plan()
     local entries = roster()
     local src     = Boons.GetSource() or (UnitName and UnitName("player")) or ""
@@ -525,11 +592,20 @@ function Boons.Plan()
     local side    = (srcRow and srcRow.faction)
         or (UnitFactionGroup and UnitFactionGroup("player")) or nil
     local stacks  = Boons.ScanStacks()
+    local now     = (time and time()) or nil
+
+    local inFlight = nil
+    if ns.Ledger then
+        ns.Ledger.Sweep(Boons.MeshSnapshot(entries, Boons.ITEM_ID), now)
+        inFlight = ns.Ledger.InFlight(ns.Ledger.Entries(), Boons.ITEM_ID, now)
+    end
+
     local plan = Boons.BuildPlan(entries, {
         source  = src, faction = side,
         stock   = Boons.CountStock(stacks, Boons.ITEM_ID),
         target  = Boons.TARGET, minLevel = Boons.MIN_LEVEL, itemID = Boons.ITEM_ID,
-        now     = (time and time()) or nil,
+        inFlight = inFlight,
+        now     = now,
     })
     return plan, stacks
 end
@@ -584,9 +660,79 @@ function Boons.Run()
     end
 
     local text = Boons.PreviewText(plan, { wrap = function(tok, s) return ns:Wrap(tok, s) end })
+
+    -- IDEMPOTENCE BY CONSTRUCTION, not by memory. The engine is handed two ways to
+    -- re-ask the same question it was handed a preview of:
+    --
+    --   rebuild — re-derive the WHOLE queue at run start, from the mesh + the
+    --             outbound ledger + the bags as they are at that moment. A run
+    --             interrupted at 2 of 8 and started again plans the remaining six,
+    --             because the two that went are now in the ledger and the plan no
+    --             longer asks for them.
+    --   check   — re-ask for ONE target immediately before its attachments are
+    --             picked up, which catches anything that changed DURING the run.
+    --
+    -- Neither remembers where a previous run got to. They do not have to.
+    local function derive()
+        local p, s = Boons.Plan()
+        return Boons.BuildQueue(p, s, { maxAttach = ns.MAX_ATTACH, subject = ns.MAIL_SUBJECT }), p
+    end
+
     return ns.Mail.RunQueue(queue, text, {
         onFinish = function(stats) ns:Print(Boons.FinishLine(plan, stats)) end,
+        rebuild  = function()
+            local q, p = derive()
+            plan = p            -- the completion line reports the plan that RAN
+            return q
+        end,
+        check = function(mail)
+            local p = Boons.Plan()
+            for _, t in ipairs(p.targets) do
+                if baseLower(t.name) == baseLower(mail.recipient) then
+                    if t.need >= (tonumber(mail.units) or 0) then return true end
+                    return false, ("only needs %d now"):format(t.need)
+                end
+            end
+            return false, "already topped up (or on its way)"
+        end,
     })
+end
+
+-- ── /conduit debug boons ─────────────────────────────────────────────────────
+--
+-- What the planner currently believes, and WHY — the plan, and the outbound ledger
+-- with ages, which is the piece a user cannot otherwise see and the one that
+-- silently suppresses top-ups while it holds an entry.
+function Boons.Debug(arg)
+    if type(arg) == "string" and arg:lower():match("^clear") then
+        local n = ns.Ledger and ns.Ledger.Clear() or 0
+        ns:Print(("outbound ledger cleared (%d entr%s dropped)."):format(n, n == 1 and "y" or "ies"))
+        return
+    end
+    local src = Boons.GetSource()
+    ns:Print(("boon source: %s"):format(src or "not set"))
+    local entries = roster()
+    ns:Print(("mesh rows: %d   mesh data: %s"):format(#entries, Boons.MeshReady(entries) and "yes" or "no"))
+
+    local now = (time and time()) or 0
+    if ns.Ledger then
+        local rows = ns.Ledger.Describe(ns.Ledger.Entries(), now, Boons.FormatAge)
+        if #rows == 0 then
+            ns:Print("outbound ledger: empty (nothing in the post).")
+        else
+            ns:Print(("outbound ledger (%d in transit; /conduit debug boons clear to drop):"):format(#rows))
+            for _, line in ipairs(rows) do ns:Print("  " .. line) end
+        end
+    end
+
+    local plan = Boons.Plan()
+    ns:Print(("plan: %d target(s), %d to send, stock %d, shortfall %d")
+        :format(#plan.targets, plan.totalSend, plan.stock, plan.shortfall))
+    for _, t in ipairs(plan.targets) do
+        ns:Print(("  %s  <-  %d of %d  (has %d%s)")
+            :format(t.name, t.send, t.need, t.have,
+                    (t.inTransit or 0) > 0 and (", " .. t.inTransit .. " in transit") or ""))
+    end
 end
 
 return Boons

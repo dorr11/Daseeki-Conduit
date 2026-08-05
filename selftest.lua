@@ -1215,3 +1215,95 @@ ns:RegisterSelfTest("boon-queue", function(verbose)
 
     return report(t, verbose)
 end)
+
+-- ── Suite: the outbound ledger (ledger.lua) ───────────────────────────────────
+--
+-- The rules that stop an interrupted run over-mailing on re-run. All pure: what
+-- goes in, what comes out, and what a plan does with it. The end-to-end drive
+-- (a real run, interrupted, resumed) lives in the headless harness, which can
+-- stand up a mailbox; this is the row-by-row contract, and it runs in game too.
+ns:RegisterSelfTest("ledger", function(verbose)
+    local t = newT("ledger")
+    local L = ns.Ledger
+    if not L then check(t, false, "ledger.lua is loaded"); return report(t, verbose) end
+
+    local ITEM, NOW, DAY = 184937, 1700000000, 86400
+
+    -- keys fold the way the planner's do, so a ledger row and a roster row for the
+    -- same character always meet.
+    eq(t, L.Key("Erro-Whitemane"), "erro", "a realm suffix is folded away")
+    eq(t, L.Key("  ERRO "), "erro", "...as are case and whitespace")
+    eq(t, L.Key(nil), "", "junk folds to a key that matches nobody")
+
+    -- what may be recorded
+    local e = {}
+    check(t, L.Add(e, "Erro", ITEM, 7, NOW) ~= nil, "a well-formed send is recorded")
+    check(t, L.Add(e, "", ITEM, 7, NOW) == nil, "a nameless send is not")
+    check(t, L.Add(e, "Erro", ITEM, 0, NOW) == nil, "nor a zero quantity")
+    check(t, L.Add(e, "Erro", nil, 7, NOW) == nil, "nor a send with no item")
+    eq(t, #e, 1, "...and the refusals leave the ledger alone")
+
+    -- in flight, by character and by item
+    L.Add(e, "erro-whitemane", ITEM, 2, NOW)
+    L.Add(e, "Poonyx", ITEM, 3, NOW)
+    L.Add(e, "Erro", 6948, 1, NOW)
+    local f = L.InFlight(e, ITEM, NOW)
+    eq(t, f["erro"], 9, "two mails to one character add up")
+    eq(t, f["poonyx"], 3, "...and other characters stay separate")
+    eq(t, L.InFlight(e, 6948, NOW)["erro"], 1, "a different item is counted separately")
+
+    -- evidence retires an entry; the wrong evidence does not
+    local one = {}
+    L.Add(one, "Erro", ITEM, 7, NOW)
+    eq(t, #(L.Reconcile(one, { erro = { count = 10, at = NOW - 60 } }, NOW)), 1,
+       "a snapshot from BEFORE the send proves nothing")
+    eq(t, #(L.Reconcile(one, { erro = { count = 3, at = NOW + 60 } }, NOW + 60)), 1,
+       "a newer snapshot that does not show the goods proves nothing")
+    local kept, retired = L.Reconcile(one, { erro = { count = 10, at = NOW + 3700 } }, NOW + 3700)
+    eq(t, #kept, 0, "a newer snapshot showing the quantity retires the entry")
+    eq(t, retired[1].why, "delivered", "...and says why")
+
+    -- the TTL backstop (Blizzard's own mail expiry)
+    eq(t, #(L.Reconcile(one, {}, NOW + 29 * DAY)), 1, "29 days on: still in the post")
+    local _, old = L.Reconcile(one, {}, NOW + 31 * DAY)
+    eq(t, old[1].why, "expired", "31 days on: retired by the TTL")
+    eq(t, L.InFlight(one, ITEM, NOW + 31 * DAY)["erro"], nil,
+       "...and an expired entry stops suppressing a top-up at once, sweep or no sweep")
+
+    -- what a plan does with it: in-flight is OWNED
+    local B = ns.Boons
+    local stockedByPost = B.BuildPlan(
+        { { name = "Erro", level = 60, counts = { [ITEM] = 9 }, countsAt = NOW } },
+        { source = "Bankalt", faction = "Alliance", stock = 99, itemID = ITEM,
+          inFlight = { erro = 1 }, now = NOW })
+    eq(t, #stockedByPost.targets, 0, "has 9 with 1 in the post -> nothing to send")
+    eq(t, stockedByPost.skipped[1].reason, "has 9, 1 in transit",
+       "...and the reason names the mail rather than pretending they are stocked")
+
+    local partly = B.BuildPlan(
+        { { name = "Erro", level = 60, counts = { [ITEM] = 4 }, countsAt = NOW } },
+        { source = "Bankalt", faction = "Alliance", stock = 99, itemID = ITEM,
+          inFlight = { erro = 2 }, now = NOW })
+    eq(t, partly.targets[1].send, 4, "a partial top-up already posted is subtracted")
+    eq(t, partly.targets[1].inTransit, 2, "...and the row carries how much is coming")
+
+    local text = B.PreviewText(B.BuildPlan(
+        { { name = "Erro", level = 60, counts = { [ITEM] = 9 }, countsAt = NOW },
+          { name = "Orn",  level = 60, counts = { [ITEM] = 0 }, countsAt = NOW } },
+        { source = "Bankalt", faction = "Alliance", stock = 99, itemID = ITEM,
+          inFlight = { erro = 1 }, now = NOW }))
+    check(t, text:find("has 9, 1 in transit", 1, true) ~= nil,
+       "the preview states the in-transit count in as many words")
+    check(t, text:find("nothing to send", 1, true) ~= nil,
+       "...and that it is therefore not being sent")
+
+    -- the debug view
+    local rows = L.Describe(e, NOW + 7200, B.FormatAge)
+    check(t, #rows == 4, "every valid entry gets a debug row")
+    check(t, rows[1]:find("2h", 1, true) ~= nil, "...carrying its age")
+
+    check(t, pcall(L.InFlight, nil, ITEM, NOW), "nil inputs never error")
+    check(t, pcall(L.Reconcile, nil, nil, nil), "...on any of the pure entry points")
+
+    return report(t, verbose)
+end)
