@@ -17,7 +17,7 @@ local ADDON, ns = ...
 
 ns.ADDON    = ADDON
 ns.DISPLAY  = "Daseeki Conduit"
-ns.VERSION  = "1.0.1"
+ns.VERSION  = "1.1.0"
 ns.CHAT_TAG_TEXT = "Daseeki Conduit"
 -- Static fallback used only when Daseeki Core (DaseekiUI) is absent; when present the
 -- chat tag derives from the live "brand" token (Field Ledger rollout, BRAND_SPEC §2).

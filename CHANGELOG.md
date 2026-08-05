@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — 1.1.0
+## 1.1.0 — 2026-08-05
 
 - **Chronoboon replenishment.** Nominate one character as your boon source, and at
   any mailbox on that character a single button tops every level-60 character in
