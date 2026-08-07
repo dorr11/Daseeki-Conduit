@@ -684,6 +684,81 @@ ns:RegisterSelfTest("network", function(verbose)
     eq(t, #N.BuildAltChoices({ "junk", {}, { name = 7 }, { name = "Ok" } }), 1,
        "junk entries are skipped, real ones survive")
 
+    -- ── FIRST-EXPLICIT-WINS IS A RULE, NOT A COIN FLIP (CDT-1, async Class 8) ──
+    --
+    -- The fold decides class, faction and — the one that leaves the addon — the
+    -- SPELLING of the name by first sighting. That is only a rule if the walk that
+    -- produces "first" is ordered. Under a raw `pairs()` walk the winner was
+    -- whichever entry the table handed over first, so two accounts holding
+    -- "Bankalt" and "bankalt" could put a different spelling on a mail recipient
+    -- between logins, and the same alt could be a warrior on Monday and a mage on
+    -- Tuesday in the dropdown's colouring.
+    --
+    -- Each fixture below is chosen ADVERSARIALLY: its raw `pairs()` order is the
+    -- reverse of its sorted order in this interpreter, so the assertion really is
+    -- discriminating. `rawFirst` proves that, so a fixture that stops being
+    -- adverse fails here instead of quietly passing for the wrong reason.
+    local function rawFirst(tbl)
+        for k in pairs(tbl) do return k end
+    end
+    -- The winner is read through this rather than indexed directly: when the walk
+    -- is unordered the sorted-first spelling is simply ABSENT, and a nil index
+    -- would abort the suite with a stack trace instead of naming the row.
+    local function classOf(data, name) local e = entry(data, name); return e and e.class end
+    local function spellingOf(data, name) local e = entry(data, name); return e and e.name end
+
+    -- (a) two ACCOUNT buckets holding the same character, spelled differently.
+    local twoAccounts = {
+        acctA = bucket({ ["Bankalt-Whitemane"] = { classTag = "WARRIOR" } }),
+        acctB = bucket({ ["BANKALT-Whitemane"] = { classTag = "MAGE" } }),
+    }
+    eq(t, rawFirst(twoAccounts), "acctB",
+       "fixture check: pairs() really does hand over the LATER account first")
+    eq(t, classOf({ accounts = twoAccounts }, "Bankalt"), "WARRIOR",
+       "the sorted-first account decides the class, not whichever pairs() dealt")
+    eq(t, #alts({ accounts = twoAccounts }), 1, "...and the two spellings still fold to one row")
+
+    -- (b) two SPELLINGS inside one bucket. The winning spelling is what the picker
+    --     writes into a rule and what the mail form is addressed with.
+    local twoSpellings = {
+        ["Bankalt-Whitemane"] = { classTag = "WARRIOR" },
+        ["bankalt-Whitemane"] = { classTag = "MAGE" },
+    }
+    eq(t, rawFirst(twoSpellings), "bankalt-Whitemane",
+       "fixture check: pairs() really does hand over the lower-case spelling first")
+    eq(t, spellingOf({ accounts = { ["1"] = bucket(twoSpellings) } }, "Bankalt"), "Bankalt",
+       "the sorted-first SPELLING is the one recorded, so the recipient is stable")
+    eq(t, classOf({ accounts = { ["1"] = bucket(twoSpellings) } }, "Bankalt"), "WARRIOR",
+       "...and it brings its own class with it")
+
+    -- (c) the same, in the homeless table and in the inventory owners map — every
+    --     walk that feeds the fold, not just the one that was noticed.
+    local homelessPair = {
+        ["Wanderer-Whitemane"] = { classTag = "PRIEST" },
+        ["wanderer-Whitemane"] = { classTag = "ROGUE" },
+    }
+    eq(t, rawFirst(homelessPair), "wanderer-Whitemane", "fixture check: homeless pairs() is adverse")
+    eq(t, classOf({ accounts = { ["1"] = bucket(nil, homelessPair) } }, "Wanderer"), "PRIEST",
+       "the homeless walk is ordered too")
+
+    local ownerPair = {
+        ["Owner-Whitemane"] = { rev = 1, data = { class = "HUNTER" } },
+        ["owner-Whitemane"] = { rev = 1, data = { class = "WARLOCK" } },
+    }
+    eq(t, rawFirst(ownerPair), "owner-Whitemane", "fixture check: owners pairs() is adverse")
+    eq(t, classOf({ inventory = inv(ownerPair) }, "Owner"), "HUNTER",
+       "the inventory owners walk is ordered too")
+
+    -- And the ordering never overrides the rules the fold already had: the accounts
+    -- graph still beats the inventory graph, and a faction matching OURS still wins
+    -- outright regardless of who was seen first.
+    eq(t, classOf({
+        accounts  = { ["zzz"] = bucket({ ["Both-Whitemane"] = { classTag = "MAGE" } }) },
+        inventory = inv({ ["aaa-Whitemane"] = { data = { class = "PRIEST" } },
+                          ["Both-Whitemane"] = { data = { class = "PRIEST" } } }),
+    }, "Both"), "MAGE",
+       "sorting is within an area; the accounts graph still wins the class overall")
+
     -- ── the no-error contract, against deliberately hostile junk ──────────────
     local hostile = {
         version   = "banana",

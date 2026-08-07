@@ -167,6 +167,37 @@ end
 --  PURE CORE  (`G` and `me` are injectable so the harness never touches _G)
 -- ════════════════════════════════════════════════════════════════════════════
 
+-- The keys of `t`, in a reproducible order.
+--
+-- `pairs()` deals a different order per table lifetime, so ANY walk whose result
+-- depends on which entry is seen FIRST is a lottery re-rolled every session. The
+-- fold below is exactly that kind of walk: first-explicit-wins decides the class,
+-- the faction when neither sighting matches ours, and — the one that leaves the
+-- addon — the very SPELLING of the name recorded for the row. That spelling is
+-- what the picker writes into a rule and what ends up on a mail recipient, so an
+-- unordered walk means two accounts holding "Bankalt" and "bankalt" can address
+-- the mail differently between logins. Sorting the walk does not change WHO wins;
+-- it makes the same one win every time.
+--
+-- Ordered by type first, then by value, so a saved table holding mixed key types
+-- (the hostile fixture in the suite does) still produces an answer rather than a
+-- comparison error. Table keys are the one residue that can only compare by
+-- address — they are also the one kind of key `fold` rejects outright, so no such
+-- key can reach an output row.
+local function keyOrder(a, b)
+    local ta, tb = type(a), type(b)
+    if ta ~= tb then return ta < tb end
+    if ta == "number" then return a < b end
+    return tostring(a) < tostring(b)
+end
+
+local function sortedKeys(t)
+    local keys = {}
+    for k in pairs(t) do keys[#keys + 1] = k end
+    table.sort(keys, keyOrder)
+    return keys
+end
+
 -- Fold one "Name-Realm" key + whatever its record carries into the accumulator.
 -- `acc` is keyed by the LOWERED base name so two graphs disagreeing about
 -- capitalisation contribute one row, not two.
@@ -181,6 +212,12 @@ end
 -- Class is first-explicit-wins, which favours the character graph: the collector
 -- walks accounts before inventory, and the character record is the more current of
 -- the two (the inventory payload is a snapshot taken at a bag scan).
+--
+-- "FIRST" IS ONLY MEANINGFUL BECAUSE THE WALK IS SORTED. Every table the collector
+-- iterates is walked through `sortedKeys`, so first-explicit-wins — on class, on
+-- faction, and on the spelling of the name this row will hand to the mail form —
+-- resolves the same way every session. Under a raw `pairs()` walk the winner was
+-- whichever entry the table happened to hand over first, which is not a rule.
 --
 -- Level is HIGHEST-WINS rather than first-wins, because in Classic Era a level only
 -- ever goes up: whichever graph carries the bigger number is the more recent truth,
@@ -277,15 +314,23 @@ function Network.CollectAlts(G, me)
     if not (version and version > Network.DATA_VERSION) then
         local accounts = data.accounts
         if type(accounts) == "table" then
-            for _, bucket in pairs(accounts) do
+            -- Sorted at BOTH levels. The account bucket decides which account's
+            -- copy of a character is the first sighting; the character key
+            -- decides which SPELLING of a name inside one bucket is.
+            for _, aid in ipairs(sortedKeys(accounts)) do
+                local bucket = accounts[aid]
                 if type(bucket) == "table" then
                     local chars = bucket.characters
                     if type(chars) == "table" then
-                        for key, rec in pairs(chars) do fold(acc, order, key, rec, ctx) end
+                        for _, key in ipairs(sortedKeys(chars)) do
+                            fold(acc, order, key, chars[key], ctx)
+                        end
                     end
                     local homeless = bucket.homeless
                     if type(homeless) == "table" then
-                        for key, rec in pairs(homeless) do fold(acc, order, key, rec, ctx) end
+                        for _, key in ipairs(sortedKeys(homeless)) do
+                            fold(acc, order, key, homeless[key], ctx)
+                        end
                     end
                 end
             end
@@ -299,7 +344,10 @@ function Network.CollectAlts(G, me)
         if not (schema and schema > Network.INVENTORY_SCHEMA) then
             local owners = inv.owners
             if type(owners) == "table" then
-                for key, entry in pairs(owners) do
+                -- Sorted for the same reason: two owner keys that fold together
+                -- must not take turns deciding the row.
+                for _, key in ipairs(sortedKeys(owners)) do
+                    local entry   = owners[key]
                     local payload = (type(entry) == "table") and entry.data or nil
                     local stamp   = (type(entry) == "table") and tonumber(entry.updatedAt) or nil
                     fold(acc, order, key, payload, ctx, stamp)
