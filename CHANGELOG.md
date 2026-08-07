@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **The alt picker could spell the same alt differently between logins.** When two
+  of your accounts — or two records inside one — knew a character under different
+  capitalisation ("Bankalt" and "bankalt"), which spelling the picker offered, and
+  therefore which spelling went onto the mail form, depended on the order the saved
+  table happened to hand its entries over. That order is not stable, so the same
+  alt could be addressed one way today and another way tomorrow, and the class
+  colour on its row could change with it. The picker now reads the roster in a
+  fixed order, so the same alt always resolves to the same name and the same
+  colour. Nothing about which alts are offered changes.
+
 ## 1.2.3 — 2026-08-05
 
 - **Found it. The game was attaching whole stacks, and never said so.** The log you
