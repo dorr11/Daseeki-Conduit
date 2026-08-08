@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **The one-time Raid Prep import is no longer spent on a login that imported
+  nothing.** Conduit imports your Raid Prep "Send Consumes" settings once, the first
+  time it sees them. It used to count "I saw Raid Prep's data" as having done the
+  import — even when there was nothing there to import yet. If you had built your
+  Raid Prep class checklists but not yet set a bank character to mail to, that first
+  Conduit login produced no rules and marked the job done anyway. Setting the
+  recipient afterwards then imported nothing, ever, with no message and no way to ask
+  for it again. Conduit now marks the import done only when it has actually created a
+  rule, so whichever order you set things up in, the import is still waiting for you.
+
 - **The alt picker could spell the same alt differently between logins.** When two
   of your accounts — or two records inside one — knew a character under different
   capitalisation ("Bankalt" and "bankalt"), which spelling the picker offered, and
