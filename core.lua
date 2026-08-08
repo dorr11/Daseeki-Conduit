@@ -315,6 +315,22 @@ local function defaultDB()
         friendDirRev  = 1,    -- monotonic revision of friendDir (cross-account gating)
         friended      = {},   -- [charKey] = { [canonicalKey] = true }
 
+        -- The confirmed-list discipline (friends.lua, CDT-1). Also purely ADDITIVE.
+        --   friendSeen      [charKey] = { [canonicalKey] = <epoch we SAW them on a
+        --                   confirmed friends list> }. A marker plus a sighting is
+        --                   what makes a later disappearance readable as the owner's
+        --                   own choice rather than an add that never landed.
+        --   friendAmbiguous [charKey] = { canonicalKey, ... } — pre-1.2.4 markers the
+        --                   one-shot heal could not adjudicate, awaiting the owner's
+        --                   /conduit friends reheal.
+        --   friendHealGen   [charKey] = generation. The heal's stamp. PER CHARACTER,
+        --                   because the markers it adjudicates are per character: an
+        --                   account-wide stamp would let the first character to log
+        --                   in answer the question for every other one.
+        friendSeen      = {},
+        friendAmbiguous = {},
+        friendHealGen   = {},
+
         -- Outbound ledger (ledger.lua): { { target, itemID, qty, ts }, ... } — one
         -- row per CONFIRMED send, retired on evidence or after a 30-day TTL. Also
         -- purely ADDITIVE: a new top-level key on an existing save, nothing
@@ -395,11 +411,14 @@ local function printHelp()
     ns:Print("  /conduit settings        - open the Daseeki hub to Conduit settings")
     ns:Print("  /conduit disable         - disable Conduit on this character")
     ns:Print("  /conduit enable          - re-enable Conduit on this character")
+    ns:Print("  /conduit friends         - what auto-friend would do on this character")
+    ns:Print("      ...reheal       - re-check recipients a pre-1.2.4 dark pass marked")
     ns:Print("  /conduit debug selftest  - run rule/batch/gold self-tests")
     ns:Print("  /conduit debug friends   - what auto-friend would do on this character")
     ns:Print("  /conduit debug boons     - build, boon plan, outbound ledger + attach trace")
     ns:Print("      ...clear        - empty the outbound ledger")
     ns:Print("      ...cleartrace   - empty the attach trace")
+    ns:Print("      ...unblock      - re-arm stack splitting after a held-off verdict")
     ns:Print("  /conduit help            - this list")
 end
 
@@ -435,6 +454,13 @@ local function dispatch(msg)
             ns.Panel.Show()
         else
             ns:Print("open a mailbox first — the Conduit panel docks beside it.")
+        end
+    elseif cmd == "friends" then
+        local sub = ((rest or ""):match("^(%S*)") or ""):lower()
+        if sub == "reheal" then
+            if ns.Friends and ns.Friends.Reheal then ns:SafeCall(ns.Friends.Reheal) end
+        else
+            if ns.Friends and ns.Friends.Debug then ns:SafeCall(ns.Friends.Debug) end
         end
     elseif cmd == "debug" then
         local sub, subrest = (rest or ""):match("^(%S*)%s*(.-)$")

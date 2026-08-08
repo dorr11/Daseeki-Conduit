@@ -77,6 +77,11 @@ function M.New(layout, opts)
         -- it looks exactly like a slow client until the ceiling expires.
         splitRefuses = opts.splitRefuses,
         splitAsync = opts.splitAsync,
+        -- HOW LATE the async hand-over is. The default (0.05s) is the ordinary
+        -- frame boundary; set it above Staging.CURSOR_LADDER[1] to model the world
+        -- server hiccup / loading-screen stutter that used to latch
+        -- "this client will not split stacks" for the whole session (CDT-3).
+        splitDelay = opts.splitDelay or 0.05,
         formBadAfter = opts.formBadAfter,
         formBadValue = opts.formBadValue,
         formShape = opts.formShape,
@@ -422,7 +427,7 @@ function M:Install(G)
                 if not s or sim.cursor then return end
                 local moved, id = n, s.itemID
                 if n < s.count then s.count = s.count - n else moved = s.count; b[slot] = nil end
-                sim:schedule(0.05, function()
+                sim:schedule(sim.splitDelay, function()
                     -- Handed over late. If the cursor is busy by then the client
                     -- puts it back rather than dropping it on the floor — nothing
                     -- may vanish, or the conservation check below means nothing.

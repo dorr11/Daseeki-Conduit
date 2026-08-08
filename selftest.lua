@@ -343,7 +343,8 @@ ns:RegisterSelfTest("auto-friend", function(verbose)
 
     -- ── THE SKIP MATRIX ───────────────────────────────────────────────────────
     local function mkCtx(over)
-        local c = { enabled = true, me = "Hero", realm = "whitemane", faction = "Alliance",
+        local c = { enabled = true, listConfirmed = true,
+                    me = "Hero", realm = "whitemane", faction = "Alliance",
                     friends = {}, marked = {}, numFriends = 0, maxFriends = 100 }
         for k, v in pairs(over or {}) do c[k] = v end
         return c
@@ -359,6 +360,9 @@ ns:RegisterSelfTest("auto-friend", function(verbose)
        "skip", "the current character is never friended")
     eq(t, act(ally, { marked = { ["bankalt-whitemane"] = true } }), "skip",
        "a recipient already handled here is never re-added (a deliberate unfriend stands)")
+    eq(t, act(ally, { marked = { ["bankalt-whitemane"] = true }, friends = { bankalt = true } }),
+       "mark",
+       "...but one who IS on the list still answers 'mark', which is where the sighting is recorded")
     eq(t, act({ name = "Bankalt", realm = "faerlina", faction = "Alliance" }), "skip", "other realm -> skip")
     eq(t, act({ name = "Bankalt", realm = "whitemane", faction = "Horde" }), "skip", "other faction -> skip")
     eq(t, act(ally, { friends = { bankalt = true } }), "mark",
@@ -391,6 +395,39 @@ ns:RegisterSelfTest("auto-friend", function(verbose)
     for _, s in ipairs(plan2) do if s.action == "add" then adds = adds + 1 end end
     eq(t, adds, 4, "with room, every entry is added")
     eq(t, #F.Plan(nil, mkCtx()), 0, "a nil directory plans nothing")
+
+    -- ── THE REFUSAL GATE (CDT-1) ──────────────────────────────────────────────
+    -- An unconfirmed friends list is an unanswered question, not an empty list.
+    -- The plan refuses outright rather than deciding anything against one.
+    local darkPlan, darkWhy = F.Plan(batch, mkCtx({ listConfirmed = false }))
+    eq(t, #darkPlan, 0, "an unconfirmed friends list plans NOTHING")
+    check(t, darkWhy ~= nil, "...and says why, rather than looking like an empty directory")
+    local offPlan, offWhy = F.Plan(batch, mkCtx({ enabled = false }))
+    eq(t, #offPlan, 0, "the setting off plans nothing either")
+    check(t, offWhy ~= nil, "...with its own reason")
+
+    -- ── THE ONE-SHOT HEAL'S CLASSIFIER ────────────────────────────────────────
+    -- Three markers, one confirmed list, and the only two answers the evidence
+    -- supports. `gone` was SEEN on the list once and is not on it now: that is the
+    -- owner's own removal, and it appears in NEITHER bucket.
+    local hDir = {
+        ["here-whitemane"]  = { name = "Here",  realm = "whitemane", faction = "Alliance" },
+        ["stuck-whitemane"] = { name = "Stuck", realm = "whitemane", faction = "Alliance" },
+        ["gone-whitemane"]  = { name = "Gone",  realm = "whitemane", faction = "Alliance" },
+    }
+    local hMarkers = { ["here-whitemane"] = true, ["stuck-whitemane"] = true,
+                       ["gone-whitemane"] = true }
+    local hSeen = { ["gone-whitemane"] = 1000 }
+    local present, ambiguous = F.ClassifyMarkers(hMarkers, hSeen, hDir,
+        { friends = { here = true } })
+    eq(t, #present, 1, "one marked recipient is on the list")
+    eq(t, present[1], "here-whitemane", "...and it is the one that is")
+    eq(t, #ambiguous, 1, "one marked recipient is absent and was never seen there")
+    eq(t, ambiguous[1], "stuck-whitemane", "...and it is the one a dark pass could have stranded")
+    local _, none = F.ClassifyMarkers(hMarkers, { ["gone-whitemane"] = 1000,
+                                                  ["stuck-whitemane"] = 1000 }, hDir,
+        { friends = { here = true } })
+    eq(t, #none, 0, "a marker that was ever SEEN on the list is never ambiguous again")
 
     return report(t, verbose)
 end)
@@ -1327,16 +1364,49 @@ ns:RegisterSelfTest("ledger", function(verbose)
     eq(t, f["poonyx"], 3, "...and other characters stay separate")
     eq(t, L.InFlight(e, 6948, NOW)["erro"], 1, "a different item is counted separately")
 
-    -- evidence retires an entry; the wrong evidence does not
+    -- evidence retires an entry; the wrong evidence does not.
+    -- The entry below is the honest shape: 7 posted to a character SEEN holding 3,
+    -- so delivery means a snapshot of 10 or better, taken after the send.
     local one = {}
-    L.Add(one, "Erro", ITEM, 7, NOW)
+    L.Add(one, "Erro", ITEM, 7, NOW, 3)
+    check(t, L.HasBaseline(one[1]), "a recorded send carries the pre-send baseline")
     eq(t, #(L.Reconcile(one, { erro = { count = 10, at = NOW - 60 } }, NOW)), 1,
        "a snapshot from BEFORE the send proves nothing")
     eq(t, #(L.Reconcile(one, { erro = { count = 3, at = NOW + 60 } }, NOW + 60)), 1,
        "a newer snapshot that does not show the goods proves nothing")
+    eq(t, #(L.Reconcile(one, { erro = { count = 9, at = NOW + 3700 } }, NOW + 3700)), 1,
+       "...nor one that rose, but not by what we posted")
     local kept, retired = L.Reconcile(one, { erro = { count = 10, at = NOW + 3700 } }, NOW + 3700)
-    eq(t, #kept, 0, "a newer snapshot showing the quantity retires the entry")
+    eq(t, #kept, 0, "a newer snapshot showing baseline + quantity retires the entry")
     eq(t, retired[1].why, "delivered", "...and says why")
+
+    -- CDT-2: THE ABSOLUTE COUNT IS NOT EVIDENCE.
+    --
+    -- Boons.BuildPlan sets qty = 10 - have, so the pre-1.2.4 test (cnt >= qty)
+    -- reduced to have >= 10 - have: anyone already holding five or more retired the
+    -- entry on the first snapshot to arrive, whether or not the mail had landed.
+    -- Cross-account mail takes an hour; the snapshot arrives in minutes.
+    local holder = {}
+    L.Add(holder, "Bankalt", ITEM, 2, NOW, 8)          -- holds 8, posted the other 2
+    local hKept = L.Reconcile(holder, { bankalt = { count = 8, at = NOW + 600 } }, NOW + 600)
+    eq(t, #hKept, 1,
+       "a holder of 8 sent 2 is NOT retired by a later snapshot still showing 8")
+    eq(t, L.InFlight(holder, ITEM, NOW + 600)["bankalt"], 2,
+       "...so the 2 stay in flight and the button cannot post a second pair")
+    local hKept2, hOut = L.Reconcile(holder, { bankalt = { count = 10, at = NOW + 3700 } }, NOW + 3700)
+    eq(t, #hKept2, 0, "the real delivery — 8 became 10 — does retire it")
+    eq(t, hOut[1].why, "delivered", "...as delivered")
+
+    -- An entry from a build that recorded no baseline has no delta to measure, so
+    -- it has no evidence path at all and rides to the expiry. Under-mailing for a
+    -- while is recoverable; the double-send is not.
+    local legacy = {}
+    L.Add(legacy, "Erro", ITEM, 7, NOW)
+    check(t, not L.HasBaseline(legacy[1]), "a pre-1.2.4 entry carries no baseline")
+    eq(t, #(L.Reconcile(legacy, { erro = { count = 99, at = NOW + 3700 } }, NOW + 3700)), 1,
+       "...and no snapshot, however large, is allowed to prove it delivered")
+    local _, legOld = L.Reconcile(legacy, {}, NOW + 31 * DAY)
+    eq(t, legOld[1].why, "expired", "...it retires on the TTL, and only there")
 
     -- the TTL backstop (Blizzard's own mail expiry)
     eq(t, #(L.Reconcile(one, {}, NOW + 29 * DAY)), 1, "29 days on: still in the post")

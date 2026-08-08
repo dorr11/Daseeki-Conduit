@@ -19,9 +19,13 @@
 --            Nexus alt names).
 --   SV       InitDB adds the auto-friend keys to a PRE-EXISTING save without
 --            touching rules, and without a schema bump (additive-only).
---   FRIEND   the REAL Friends.RunPass against a stubbed C_FriendList:
---            adds once, marks, never re-adds — including after the user
---            deliberately unfriends — and stops cleanly at the list cap.
+--   FRIEND   the REAL Friends.RunPass against a DARK-LIST C_FriendList (the
+--            list answers 0 until ShowFriends has been asked AND the server
+--            has replied): adds once, marks, never re-adds — including after
+--            the user deliberately unfriends — stops cleanly at the list cap,
+--            REFUSES entirely on an unconfirmed list (zero AddFriend calls and
+--            a byte-identical db.friended), re-asks on a bounded ladder, and
+--            drives the one-shot heal for pre-1.2.4 markers both ways round.
 --   MUT      MUTATION TEST of the boon plan builder: twelve one-operator
 --            mutants of boons.lua, every one of which must be killed by the
 --            checks. A survivor is a rule the suite only appears to cover.
@@ -120,13 +124,24 @@ _G.print = function(...)                       -- capture the addon's chat outpu
     CHAT[#CHAT + 1] = table.concat(parts, " ")
 end
 _G.geterrorhandler = function() return function(err) error(err, 0) end end
+-- Every frame the addon creates is kept, WITH the event set it subscribed to, so a
+-- gate can fire a real WoW event into the real handlers instead of poking at the
+-- module's internals. The dark-list fixture needs exactly that: PLAYER_LOGIN and
+-- FRIENDLIST_UPDATE ARE the contract under test.
+local FRAMES = {}
 _G.CreateFrame = function()
-    local f = {}
-    function f:RegisterEvent() end
-    function f:UnregisterEvent() end
+    local f = { _events = {} }
+    function f:RegisterEvent(ev) self._events[ev] = true end
+    function f:UnregisterEvent(ev) self._events[ev] = nil end
     function f:SetScript(_, fn) self._onEvent = fn end
     function f:GetScript() return self._onEvent end
+    FRAMES[#FRAMES + 1] = f
     return f
+end
+local function fireEvent(ev, ...)
+    for _, f in ipairs(FRAMES) do
+        if f._onEvent and f._events[ev] then f._onEvent(f, ev, ...) end
+    end
 end
 _G.SlashCmdList = {}
 _G.UnitName          = function() return _G.__TESTNAME or "Hero" end
@@ -329,6 +344,11 @@ ck(db.friendDirRev == 1, "friendDirRev seeded")
 ck(type(db.friended) == "table", "friended (per-character markers) created")
 ck(type(db.outbox) == "table", "outbox (the 1.2.0 outbound ledger) created")
 ck(#db.outbox == 0, "...empty, so an existing save starts with nothing in the post")
+ck(type(db.friendSeen) == "table", "friendSeen (the 1.2.4 confirmed-list sightings) created")
+ck(type(db.friendAmbiguous) == "table", "friendAmbiguous (the heal's waiting list) created")
+ck(type(db.friendHealGen) == "table", "friendHealGen created, keyed per character")
+ck(next(db.friendHealGen) == nil,
+   "...and UNSTAMPED, so the pre-1.2.4 marker question is still asked once")
 realprint("=== GATE SV: " .. (FAILS == 0 and "PASS" or "FAIL") .. " ===\n")
 
 ----------------------------------------------------------------------
@@ -337,14 +357,48 @@ realprint("=== GATE SV: " .. (FAILS == 0 and "PASS" or "FAIL") .. " ===\n")
 realprint("=== GATE FRIEND: real Friends.RunPass (add once, mark, never re-add) ===")
 local F = ns.Friends
 
+-- ── THE DARK-LIST PROFILE (§5 of the honesty audit) ──────────────────────────
+--
+-- The old stub was KIND, and that kindness is the whole reason CDT-1 was invisible
+-- for four releases: GetNumFriends answered #FRIENDS immediately and ShowFriends
+-- was an empty function, so the list was ALWAYS warm and no test could ever run
+-- the pass against one that had not been answered.
+--
+-- Here the list is SERVER-SIDE, exactly as it is in the client. GetNumFriends
+-- answers 0 — and GetFriendInfoByIndex answers nothing — until ShowFriends has
+-- been asked AND the server has replied with FRIENDLIST_UPDATE. `SERVER_ANSWERS`
+-- turns the reply off, which is the client the 10s backstop was written for and
+-- the one it did the damage on.
 local FRIENDS, ADDED = {}, {}
+local LIVE           = false   -- has the server answered our request?
+local SERVER_ANSWERS = true    -- does ShowFriends get a reply at all?
+local SHOWN          = 0       -- how many times we asked
 _G.C_FriendList = {
-    GetNumFriends        = function() return #FRIENDS end,
-    GetFriendInfoByIndex = function(i) return FRIENDS[i] and { name = FRIENDS[i] } or nil end,
+    GetNumFriends        = function() return LIVE and #FRIENDS or 0 end,
+    GetFriendInfoByIndex = function(i)
+        if not LIVE then return nil end
+        return FRIENDS[i] and { name = FRIENDS[i] } or nil
+    end,
     AddFriend            = function(name) ADDED[#ADDED + 1] = name; FRIENDS[#FRIENDS + 1] = name end,
-    ShowFriends          = function() end,
+    ShowFriends          = function()
+        SHOWN = SHOWN + 1
+        if SERVER_ANSWERS then
+            LIVE = true
+            fireEvent("FRIENDLIST_UPDATE")
+        end
+    end,
 }
 -- No C_Timer: SchedulePass then runs inline, which is exactly what we want here.
+
+local function clearFriends() for i = #FRIENDS, 1, -1 do FRIENDS[i] = nil end end
+-- Put the module in the state a normal confirmed login leaves it in, without going
+-- through the wiring (the wiring gets its own sub-case below).
+local function armList()
+    LIVE = true
+    F._requested     = true
+    F._listConfirmed = true
+    F._passDone      = false
+end
 
 -- (a) settings default + the local-only path (no Nexus on this _G).
 ck(F.IsEnabled() == true, "(a) auto-friend defaults ON (absent key reads as enabled)")
@@ -361,8 +415,88 @@ ck(db.friendDirRev == 2, "(b) revision bumped for the mesh")
 ck(F.Refresh() == false, "(b) a second Refresh changes nothing")
 ck(db.friendDirRev == 2, "(b) ...and does not bump the revision")
 
+-- ── (b2) THE DARK PASS — CDT-1, red then green ───────────────────────────────
+--
+-- The pre-1.2.4 wiring armed C_Timer.After(10, RunPass) at login and ran the pass
+-- whether or not FRIENDLIST_UPDATE had ever answered. Against an unanswered list
+-- every existing friend read as a stranger, so each became an ADD; numFriends read
+-- 0 so the cap gate never fired; and every step wrote a marker into
+-- SavedVariables, which Decide consults before anything else — so a recipient that
+-- dark pass failed to add was never friended again, on this character, ever.
+--
+-- THE GATE ASSERTION, in the audit's own words: zero AddFriend calls and a
+-- byte-identical db.friended.
+do
+    chatClear()
+    SERVER_ANSWERS = false          -- the server never replies to ShowFriends
+    LIVE = false
+    F._listConfirmed, F._requested, F._passDone = false, false, false
+    local addsBefore = #ADDED
+    local markersBefore = 0
+    for _ in pairs(db.friended["Hero-Whitemane"] or {}) do markersBefore = markersBefore + 1 end
+    local seenBefore = db.friendSeen and db.friendSeen["Hero-Whitemane"]
+
+    -- RED, reconstructed: this is precisely what the 10s backstop did.
+    local darkPlan = F.Plan(F.MergeDirectories(F.Directory(), F.remote), {
+        enabled = true, listConfirmed = true,     -- <- the lie the backstop told
+        me = "Hero", realm = "whitemane", faction = "Alliance",
+        friends = {},                             -- the unanswered list, read as empty
+        marked = {}, numFriends = 0, maxFriends = 100,
+    })
+    local darkAdds = 0
+    for _, s in ipairs(darkPlan) do if s.action == "add" then darkAdds = darkAdds + 1 end end
+    ck(darkAdds > 0,
+       "(b2) RED: told the list is confirmed, a dark read plans an ADD for a recipient")
+
+    -- GREEN: the shipped wiring, driven through the real events.
+    fireEvent("PLAYER_LOGIN")
+    ck(SHOWN > 0, "(b2) login ASKS the server for the friends list")
+    ck(F.ListConfirmed() == false, "(b2) ...and an unanswered ask confirms nothing")
+    F.RunPass()                                  -- the backstop's moment, if it still existed
+    ck(#ADDED == addsBefore, "(b2) GREEN: not one AddFriend against an unconfirmed list")
+    local markersAfter = 0
+    for _ in pairs(db.friended["Hero-Whitemane"] or {}) do markersAfter = markersAfter + 1 end
+    ck(markersAfter == markersBefore, "(b2) ...and db.friended is byte-identical")
+    ck((db.friendSeen and db.friendSeen["Hero-Whitemane"]) == seenBefore,
+       "(b2) ...no sighting invented either")
+    ck(#CHAT == 0, "(b2) ...and it says nothing, because nothing happened")
+
+    -- The bounded re-ASK ladder replaces the proceed-anyway backstop: it asks
+    -- again at each rung, and stops.
+    local timers = {}
+    _G.C_Timer = { After = function(sec, fn) timers[#timers + 1] = { at = sec, fn = fn } end }
+    SHOWN = 0
+    fireEvent("PLAYER_LOGIN")
+    ck(SHOWN == 1, "(b2) login asks once immediately")
+    ck(#timers == #F.REQUEST_AT, "(b2) ...and arms exactly one re-ask per ladder rung")
+    for i, t in ipairs(timers) do
+        ck(t.at == F.REQUEST_AT[i], ("(b2) ...rung %d at %ds"):format(i, F.REQUEST_AT[i]))
+        t.fn()
+    end
+    ck(SHOWN == 1 + #F.REQUEST_AT, "(b2) ...every rung re-ASKS rather than proceeding anyway")
+    ck(#ADDED == addsBefore, "(b2) ...and the whole ladder still adds nothing")
+
+    -- Now the server answers. THIS is what may start a pass.
+    SERVER_ANSWERS = true
+    local pending = {}
+    _G.C_Timer = { After = function(sec, fn) pending[#pending + 1] = fn end }
+    F.RequestList()
+    ck(F.ListConfirmed(), "(b2) an answer AFTER our ask confirms the list")
+    for _, fn in ipairs(pending) do fn() end
+    _G.C_Timer = nil
+    ck(#ADDED > addsBefore, "(b2) ...and only then does the pass act")
+end
+
 -- (c) the pass adds the recipient exactly once and says so.
 chatClear()
+clearFriends()
+db.friended["Hero-Whitemane"] = nil
+db.friendSeen = nil
+db.friendHealGen = nil
+ns:InitDB()
+db = _G.DaseekiConduitDB
+for i = #ADDED, 1, -1 do ADDED[i] = nil end
+armList()
 F.RunPass()
 ck(#ADDED == 1 and ADDED[1] == "Bankalt", "(c) Bankalt added to the friends list")
 ck(db.friended["Hero-Whitemane"]["bankalt-whitemane"] == true, "(c) per-character marker written")
@@ -463,6 +597,102 @@ ns.SyncBridge.OnRemote("account-c", { v = 99, recipients = {
     ["future-whitemane"] = { name = "Future", realm = "whitemane", faction = "Alliance" } } })
 ck(F.remote["account-c"] == beforeRemote, "(l) a newer payload version is dropped")
 ck(tostring(ns.SyncBridge._lastReject):find("newer") ~= nil, "(l) ...with a readable reason recorded")
+
+-- ── (m) THE ONE-SHOT HEAL, ADVERSARIAL BOTH WAYS ─────────────────────────────
+--
+-- A save carried forward from a build with the dark pass in it. Three markers on
+-- this character, no sightings recorded anywhere (the seen key did not exist), and
+-- a confirmed friends list that holds exactly one of the three.
+--
+--   Here    marked, ON the list           -> sound. Seed the sighting, say nothing.
+--   Stuck   marked, absent, never seen    -> the dark pass's casualty, or the
+--   Gone    marked, absent, never seen       owner's own unfriend. UNDECIDABLE.
+--
+-- The undecidable half is where both doctrines meet head on, and one of them has
+-- to give: heal automatically and a deliberate unfriend is silently undone; heal
+-- never and the stranded recipients stay stranded forever. So neither is done
+-- behind the owner's back — they are named once, and only the owner's own
+-- /conduit friends reheal acts on them. Additions only, never removals, exactly
+-- once, and only on the names the heal listed.
+do
+    chatClear()
+    _G.__TESTNAME = "Healed"
+    local CK = "Healed-Whitemane"
+    for i = #ADDED, 1, -1 do ADDED[i] = nil end
+    clearFriends()
+    FRIENDS[1] = "Here"
+
+    db.friendDir["here-whitemane"]  = { name = "Here",  realm = "whitemane", faction = "Alliance" }
+    db.friendDir["stuck-whitemane"] = { name = "Stuck", realm = "whitemane", faction = "Alliance" }
+    db.friendDir["gone-whitemane"]  = { name = "Gone",  realm = "whitemane", faction = "Alliance" }
+    -- Every OTHER directory entry is marked and sighted, so this sub-case only ever
+    -- talks about the three names it is about.
+    local seeded = { ["here-whitemane"] = true, ["stuck-whitemane"] = true,
+                     ["gone-whitemane"] = true }
+    db.friended[CK] = seeded
+    local sightings = {}
+    for k in pairs(F.MergeDirectories(F.Directory(), F.remote)) do
+        if not seeded[k] then seeded[k] = true; sightings[k] = 1 end
+    end
+    db.friendSeen      = nil          -- a save written before the key existed
+    db.friendAmbiguous = nil
+    db.friendHealGen   = nil
+    ns:InitDB()
+    db = _G.DaseekiConduitDB
+    db.friendSeen[CK] = sightings     -- ...except for the noise entries above
+    armList()
+    local function addedCount(name)
+        local n = 0
+        for _, a in ipairs(ADDED) do if a == name then n = n + 1 end end
+        return n
+    end
+
+    F.RunPass()
+    ck(addedCount("Stuck") == 0 and addedCount("Gone") == 0 and addedCount("Here") == 0,
+       "(m) the heal itself adds NOBODY — it only classifies")
+    ck(db.friendSeen[CK]["here-whitemane"] ~= nil,
+       "(m) the marked recipient who IS on the list gets a sighting seeded")
+    ck(db.friendSeen[CK]["stuck-whitemane"] == nil and db.friendSeen[CK]["gone-whitemane"] == nil,
+       "(m) ...and the two who are not get no sighting invented for them")
+    local waiting = db.friendAmbiguous[CK]
+    ck(#waiting == 2, "(m) both undecidable markers are listed for the owner")
+    ck(waiting[1] == "gone-whitemane" and waiting[2] == "stuck-whitemane",
+       "(m) ...in canonical-key order, so the line never depends on pairs()")
+    ck(chatFind("reheal") ~= nil, "(m) ...and ONE chat line says what to do about it")
+    ck(db.friendHealGen[CK] == F.HEAL_GEN, "(m) the save is stamped")
+
+    -- Idempotent: the question is asked exactly once per character.
+    chatClear()
+    F.RunPass()
+    ck(#CHAT == 0, "(m) a second pass says nothing — the heal never fires twice")
+    ck(#db.friendAmbiguous[CK] == 2, "(m) ...and the list is not rebuilt")
+
+    -- THE OWNER ACTS. Exactly one AddFriend per listed name, and then it is spent.
+    chatClear()
+    ck(F.Reheal() == 2, "(m) reheal clears the markers on exactly the two listed")
+    ck(addedCount("Stuck") == 1 and addedCount("Gone") == 1,
+       "(m) ...and both are added, once each")
+    ck(#db.friendAmbiguous[CK] == 0, "(m) ...the list is spent")
+    ck(F.Reheal() == 0, "(m) a second reheal does nothing at all")
+    ck(addedCount("Stuck") == 1 and addedCount("Gone") == 1,
+       "(m) ...and adds nobody a second time")
+    ck(db.friended[CK]["stuck-whitemane"] == true,
+       "(m) ...the re-added recipients are marked again, so this cannot repeat")
+
+    -- ADVERSARIAL, THE OTHER WAY. A recipient who was SEEN on a confirmed list and
+    -- is then removed by the owner is a deliberate choice. It is never listed, the
+    -- pass never re-adds it, and reheal cannot reach it.
+    chatClear()
+    clearFriends()                                  -- the owner removes all three
+    F.RunPass()
+    ck(addedCount("Here") == 0 and addedCount("Stuck") == 1 and addedCount("Gone") == 1,
+       "(m) an owner-removed recipient is NOT re-added by the pass")
+    ck(#db.friendAmbiguous[CK] == 0,
+       "(m) ...and never appears on the heal list, because we SAW them on the list")
+    ck(F.Reheal() == 0, "(m) ...so reheal has nothing to offer either")
+    ck(addedCount("Here") == 0, "(m) ...and the deliberate removal stands")
+    _G.__TESTNAME = "Hero"
+end
 
 realprint("=== GATE FRIEND: " .. (FAILS == 0 and "PASS" or "FAIL") .. " ===\n")
 
@@ -775,7 +1005,10 @@ local ENGINE_FILES = { "rules.lua", "migrate.lua", "network.lua", "ledger.lua", 
 
 -- Load a FRESH addon namespace against `sim`, optionally with a patched mail.lua
 -- (used to reconstruct the pre-fix engine for the red half of GATE ATTACH).
-local function newEngine(sim, mailSrc)
+-- `srcOverrides` = { ["staging.lua"] = <source text>, ... } so a gate can stand up
+-- the engine with ONE file reconstructed as a previous build shipped it — the red
+-- half of a red/green pair — without a second copy of the loader.
+local function newEngine(sim, mailSrc, srcOverrides)
     _G.DaseekiConduitDB = nil
     _G.__POPUP = nil
     sim:Install(_G)
@@ -784,8 +1017,11 @@ local function newEngine(sim, mailSrc)
     n.RegisterEvent = function(_, ev, fn) sim:On(ev, fn) end
     for _, rel in ipairs(ENGINE_FILES) do
         local chunk
+        local override = srcOverrides and srcOverrides[rel]
         if rel == "mail.lua" and mailSrc then
             chunk = assert(loadstring(mailSrc, "@patched-mail.lua"))
+        elseif override then
+            chunk = assert(loadstring(override, "@patched-" .. rel))
         else
             chunk = assert(loadfile(P(rel)))
         end
@@ -793,6 +1029,23 @@ local function newEngine(sim, mailSrc)
     end
     n:InitDB()
     return n
+end
+
+-- A condition-waiter on the SIM's virtual clock, with mail.lua's semantics: fire
+-- as soon as the predicate holds, and fire anyway when the ceiling expires. Only
+-- needed by gates that drive a module directly rather than through the send
+-- engine (which injects its own).
+local function makeAwait(sim)
+    return function(pred, fn, ceiling)
+        if pred() then return fn() end
+        local deadline = sim.now + (tonumber(ceiling) or 3.0)
+        local function poll()
+            if pred() then return fn() end
+            if sim.now >= deadline then return fn() end
+            sim:schedule(0.05, poll)
+        end
+        sim:schedule(0.05, poll)
+    end
 end
 
 -- A faithful mirror of boons.lua's Boons.Plan() + Boons.Run() wiring, with the
@@ -1308,12 +1561,15 @@ do
     --
     -- The graceful stop the owner asked for: never attach what was not planned, say
     -- what is wrong, and say what to do instead.
-    for _, case in ipairs({ { noSplit = true, label = "has no split call at all" },
-                            { splitRefuses = true, label = "refuses the split in silence" } }) do
+    for _, case in ipairs({ { noSplit = true, label = "has no split call at all",
+                              reason = "api" },
+                            { splitRefuses = true, label = "refuses the split in silence",
+                              reason = "refused" } }) do
         local sim = Sim.New(bagsOf({ 10, 10 }),
             { asyncBags = true, asyncCounts = true, settleDelay = 0.5,
               noSplit = case.noSplit, splitRefuses = case.splitRefuses })
         local n = newEngine(sim, nil)
+        n.Staging.Unblock()
         chatClear()
         startRun(n, sim, mesh({ { "Aaa", 60, 3 }, { "Bbb", 60, 4 } }))
         sim:Advance(600)
@@ -1322,6 +1578,137 @@ do
            "(e) ...and is told so, with the manual way round")
         ck(sim:BagUnits(ITEM) == 20, "(e) ...every boon still in the bags, none over-mailed")
         ck(n.Staging.IsBlocked(), "(e) ...and staging gives up rather than asking once per mail")
+        ck(n.Staging.BlockedReason() == case.reason,
+           "(e) ...naming WHY it gave up (" .. case.reason .. "), not a generic latch")
+    end
+
+    -- ── (e2) CDT-3: A TIMEOUT IS NOT A REFUSAL ───────────────────────────────
+    --
+    -- Until 1.2.4 `blocked` was latched by ONE expired 1.5s cursor ceiling, for the
+    -- whole session, from a module whose Unblock() had zero live callers. A single
+    -- loading-screen stutter or a busy capital at raid-invite time therefore turned
+    -- off every exact-quantity mail until /reload — and told the owner
+    -- "this client will not split stacks for the mail", which is FALSE about a
+    -- client that splits stacks perfectly well, just slowly.
+    --
+    -- The fixture is that client: the split really happens, the stack simply
+    -- reaches the cursor 2.5s later — past the first rung of the ladder, inside the
+    -- second.
+    do
+        local Sg = ns.Staging
+        ck(Sg.CURSOR_LADDER[1] == Staging.CURSOR_CEILING,
+           "(e2) the first rung of the ladder is the fast ceiling")
+        ck(#Sg.CURSOR_LADDER >= 2 and Sg.CURSOR_LADDER[2] > Sg.CURSOR_LADDER[1],
+           "(e2) ...and it widens, bounded")
+
+        -- RED: the 1.2.3 rule, reconstructed from this file's own source — latch on
+        -- the first expired ceiling, no classification, no strikes, no release.
+        local SSRC = readFile(P("staging.lua"))
+        local edits = {
+            { [[            local after = ns.Rules.SlotInfo(job.bag, job.slot)]],
+              [[            local after = nil
+            if false then after = ns.Rules.SlotInfo(job.bag, job.slot) end]] },
+            { [[            local moved = (after == nil)
+                or (after.itemID ~= job.itemID)
+                or (nowCount ~= nil and td.pre ~= nil and nowCount < td.pre)]],
+              [[            local moved = false]] },
+            { [[        if why == "split" then
+            strikes = strikes + 1
+            if strikes >= Staging.STRIKES_TO_BLOCK then
+                blocked, blockWhy = true, "refused"
+            end
+            return
+        end]],
+              [[        if why == "split" then blocked, blockWhy = true, "refused"; return end]] },
+        }
+        local redSrc = SSRC
+        local redOk = true
+        for _, e in ipairs(edits) do
+            local h, t2 = redSrc:find(e[1], 1, true)
+            if not h then redOk = false break end
+            redSrc = redSrc:sub(1, h - 1) .. e[2] .. redSrc:sub(t2 + 1)
+        end
+        ck(redOk, "(e2) the 1.2.3 latch can be reconstructed from the shipped source")
+        if redOk then
+            local sim = Sim.New(bagsOf({ 10, 10 }),
+                { asyncBags = true, asyncCounts = true, settleDelay = 0.5,
+                  splitAsync = true, splitDelay = 2.5 })
+            local n = newEngine(sim, nil, { ["staging.lua"] = redSrc })
+            n.Staging.Unblock()
+            chatClear()
+            startRun(n, sim, mesh({ { "Aaa", 60, 3 }, { "Bbb", 60, 4 } }))
+            sim:Advance(600)
+            ck(#sim.sent == 0, "(e2) RED: one slow frame and the whole run sends NOTHING")
+            ck(n.Staging.IsBlocked(),
+               "(e2) ...latched for the session off a client that splits fine")
+            ck(chatFind("will not split stacks") ~= nil,
+               "(e2) ...telling the owner something that is not true")
+        end
+
+        -- GREEN: the shipped ladder, same client, same fixture.
+        do
+            local sim = Sim.New(bagsOf({ 10, 10 }),
+                { asyncBags = true, asyncCounts = true, settleDelay = 0.5,
+                  splitAsync = true, splitDelay = 2.5 })
+            local n = newEngine(sim, nil)
+            n.Staging.Unblock()
+            chatClear()
+            startRun(n, sim, mesh({ { "Aaa", 60, 3 }, { "Bbb", 60, 4 } }))
+            sim:Advance(600)
+            ck(not n.Staging.IsBlocked(),
+               "(e2) GREEN: a slow split never writes the sticky verdict")
+            ck(n.Staging.Diagnostics().splitSlow > 0,
+               "(e2) ...it is counted as SLOW, which is what was actually observed")
+            ck(chatFind("will not split stacks") == nil,
+               "(e2) ...and the owner is never told his client refuses to split")
+            local by = {}
+            for _, m in ipairs(sim.sent) do by[m.recipient] = m.units end
+            ck(by["Aaa"] == 7 and by["Bbb"] == 6,
+               "(e2) ...the run retries with a wider ceiling and both mails go out exactly right")
+            ck(sim:BagUnits(ITEM) == 7, "(e2) ...and the arithmetic holds (20 - 13)")
+        end
+
+        -- The strike ladder itself, driven directly: a genuine refusal still gets
+        -- there, and it takes REPEATED evidence rather than one bad frame.
+        do
+            local sim = Sim.New(bagsOf({ 10 }),
+                { asyncBags = true, asyncCounts = true, settleDelay = 0.5, splitRefuses = true })
+            local n = newEngine(sim, nil)
+            local S2 = n.Staging
+            S2.Unblock()
+            local jobs = { { key = 1, bag = 0, slot = 1, count = 3, itemID = ITEM,
+                             destBag = 0, destSlot = 10 } }
+            local await = makeAwait(sim)
+            local lastWhy
+            for i = 1, S2.STRIKES_TO_BLOCK do
+                local ceilingBefore = S2.CursorCeiling()
+                S2.Execute(jobs, await, function(_, why) lastWhy = why end)
+                sim:Advance(60)
+                ck(lastWhy == "split", ("(e2) strike %d is refusal evidence"):format(i))
+                if i < S2.STRIKES_TO_BLOCK then
+                    ck(not S2.IsBlocked(),
+                       ("(e2) ...and %d strike(s) is not yet a verdict"):format(i))
+                    ck(S2.CursorCeiling() > ceilingBefore,
+                       "(e2) ...but the next attempt waits longer")
+                end
+            end
+            ck(S2.IsBlocked() and S2.BlockedReason() == "refused",
+               ("(e2) %d consecutive refusals DOES earn the verdict"):format(S2.STRIKES_TO_BLOCK))
+            -- ...and it can be released, which is the half that did not exist.
+            S2.Unblock()
+            ck(not S2.IsBlocked() and S2.Strikes() == 0 and S2.CursorCeiling() == S2.CURSOR_LADDER[1],
+               "(e2) Unblock() clears the verdict, the strikes and the ladder")
+        end
+
+        -- The advice line names which of the two it was. Pure.
+        ck(Sg.Advice("slowsplit", false) == Sg.SLOW_ADVICE,
+           "(e2) a timeout is reported as a timeout")
+        ck(Sg.Advice("split", false) == Sg.SLOW_ADVICE,
+           "(e2) ...and so is refusal evidence that has not yet earned the verdict")
+        ck(Sg.Advice("split", true) == Sg.BLOCKED_ADVICE,
+           "(e2) only the written verdict says the client will not split")
+        ck(Sg.Advice("api", false) == Sg.BLOCKED_ADVICE,
+           "(e2) a missing split call is a fact, not a measurement, and says so at once")
     end
 
     -- ── (f) SETTLEMENT BETWEEN STAGE AND ATTACH ──────────────────────────────
@@ -2096,25 +2483,133 @@ do
     -- (b) evidence retires an entry; a stale snapshot does not.
     do
         local e = {}
-        L.Add(e, "Erro", ITEM, 7, NOW)
+        L.Add(e, "Erro", ITEM, 7, NOW, 3)          -- posted 7 to a character seen with 3
         local kept = L.Reconcile(e, { erro = { count = 10, at = NOW - 60 } }, NOW)
         ck(#kept == 1, "(b) a snapshot taken BEFORE the send proves nothing")
         kept = L.Reconcile(e, { erro = { count = 3, at = NOW + 60 } }, NOW + 60)
         ck(#kept == 1, "(b) a newer snapshot that does not show the goods proves nothing")
+        kept = L.Reconcile(e, { erro = { count = 9, at = NOW + 3700 } }, NOW + 3700)
+        ck(#kept == 1, "(b) ...nor one that rose, but by less than we posted")
         local kept2, retired = L.Reconcile(e, { erro = { count = 10, at = NOW + 3700 } }, NOW + 3700)
         ck(#kept2 == 0 and retired[1].why == "delivered",
-           "(b) a newer snapshot showing the quantity retires the entry")
+           "(b) a newer snapshot showing baseline + quantity retires the entry")
+    end
+
+    -- ── (b2) CDT-2: THE ABSOLUTE COUNT WAS NEVER EVIDENCE ────────────────────
+    --
+    -- Until 1.2.4 an entry retired on `cnt >= e.qty` — the recipient's ABSOLUTE
+    -- holding against the QUANTITY POSTED, with no baseline anywhere in the row.
+    -- Boons.BuildPlan sets qty = 10 - have, so that test reduces to
+    -- `have >= 10 - have`: ANY recipient already holding five or more retired the
+    -- entry on the first snapshot to arrive, delivered or not.
+    --
+    --   Bankalt posts 2 to a character holding 8. That character logs in ten
+    --   minutes later to raid; Nexus scans their bags and stamps countsAt — STILL
+    --   8, because cross-account mail takes an hour. `at > e.ts` ✓, `8 >= 2` ✓,
+    --   "delivered". inFlight empties, need becomes 2, the button posts 2 MORE.
+    --   Twelve boons for a ten-boon target, out of the very ledger that exists to
+    --   stop it, and boons are scarce.
+    --
+    -- RED is the shipped 1.2.3 rule, reconstructed from this file's own source so
+    -- the reconstruction cannot drift from what really shipped.
+    do
+        local LSRC = readFile(P("ledger.lua"))
+        local frag = [[                if type(m) == "table" and Ledger.HasBaseline(e) then
+                    local at, cnt = num(m.at), num(m.count, 0)
+                    -- THE DELTA, NOT THE ABSOLUTE. The snapshot must be newer than
+                    -- the send AND show the count risen by what we posted.
+                    if at and at > e.ts and cnt >= (num(e.base) + e.qty) then
+                        why = "delivered"
+                    end
+                end]]
+        local head, tail = LSRC:find(frag, 1, true)
+        ck(head ~= nil, "(b2) the retirement test is where the reconstruction expects it")
+        if head then
+            local as123 = LSRC:sub(1, head - 1) .. [[                if type(m) == "table" then
+                    local at, cnt = num(m.at), num(m.count, 0)
+                    if at and at > e.ts and cnt >= e.qty then why = "delivered" end
+                end]] .. LSRC:sub(tail + 1)
+            local chunk = loadstring(as123, "@as-1.2.3:ledger")
+            local oldNs = {}
+            ck(chunk ~= nil, "(b2) ...and the 1.2.3 rule compiles")
+            if chunk then
+                pcall(chunk, ADDON_NAME, oldNs)
+                local OL = oldNs.Ledger
+                local e = {}
+                OL.Add(e, "Bankalt", ITEM, 2, NOW, 8)
+                local kept, retired = OL.Reconcile(e, { bankalt = { count = 8, at = NOW + 600 } },
+                                                  NOW + 600)
+                ck(#kept == 0 and retired[1] and retired[1].why == "delivered",
+                   "(b2) RED: 1.2.3 calls an UNMOVED count of 8 a delivery of 2")
+                ck((OL.InFlight(kept, ITEM, NOW + 600)["bankalt"] or 0) == 0,
+                   "(b2) ...so nothing is in flight any more, and the next plan re-sends")
+            end
+        end
+
+        -- GREEN: the shipped rule, same row, same snapshot.
+        local e = {}
+        L.Add(e, "Bankalt", ITEM, 2, NOW, 8)
+        ck(e[1].base == 8, "(b2) GREEN: the send records the pre-send baseline")
+        local kept = L.Reconcile(e, { bankalt = { count = 8, at = NOW + 600 } }, NOW + 600)
+        ck(#kept == 1, "(b2) ...an unmoved count of 8 is not evidence of anything")
+        ck(L.InFlight(e, ITEM, NOW + 600)["bankalt"] == 2,
+           "(b2) ...the 2 stay in flight, so the button cannot post a second pair")
+        local kept2, retired = L.Reconcile(e, { bankalt = { count = 10, at = NOW + 3700 } },
+                                           NOW + 3700)
+        ck(#kept2 == 0 and retired[1].why == "delivered",
+           "(b2) ...and the REAL delivery — 8 became 10 — does retire it")
+
+        -- The holder-of-many, end to end through the real engine: send, let the
+        -- mesh answer with an unmoved count, re-derive. Nothing may be re-sent.
+        local sim = Sim.New(bagsOf({ 10 }))
+        local n = newEngine(sim, nil)
+        local roster = mesh({ { "Holder", 60, 8 } })
+        chatClear()
+        startRun(n, sim, roster)
+        sim:Advance(120)
+        ck(#sim.sent == 1 and sim.sent[1].units == 2, "(b2) two boons are posted to a holder of 8")
+        ck(#n.Ledger.Entries() == 1 and n.Ledger.Entries()[1].base == 8,
+           "(b2) ...and the row carries the baseline the plan was built from")
+        -- Ten minutes later: they log in, Nexus scans, the count has NOT changed.
+        _G.__CLOCK = _G.__CLOCK + 600
+        roster[1].countsAt = _G.__CLOCK
+        local q = derive(n, roster)
+        ck(#n.Ledger.Entries() == 1, "(b2) the unmoved snapshot does NOT retire the entry")
+        ck(#q == 0, "(b2) ...and the re-run plans nothing — no second pair")
+        -- An hour on, the mail lands.
+        _G.__CLOCK = _G.__CLOCK + 3700
+        roster[1].counts[ITEM] = 10
+        roster[1].countsAt = _G.__CLOCK
+        derive(n, roster)
+        ck(#n.Ledger.Entries() == 0, "(b2) the real delivery retires it")
+        _G.__CLOCK = 1700000000
     end
 
     -- (c) the TTL backstop.
     do
         local e = {}
-        L.Add(e, "Erro", ITEM, 7, NOW)
+        L.Add(e, "Erro", ITEM, 7, NOW, 3)
         ck(#L.Reconcile(e, {}, NOW + 29 * DAY) == 1, "(c) 29 days: still in flight")
         local kept, retired = L.Reconcile(e, {}, NOW + 31 * DAY)
         ck(#kept == 0 and retired[1].why == "expired", "(c) 31 days: retired by the TTL")
         ck(L.InFlight(e, ITEM, NOW + 31 * DAY)["erro"] == nil,
            "(c) ...and an expired entry stops suppressing a top-up immediately")
+    end
+
+    -- (c2) A ROW WITH NO BASELINE — written by a build before 1.2.4 — has no delta
+    --      to measure and therefore no evidence path. It rides to the expiry, and
+    --      the debug listing says so rather than looking stuck.
+    do
+        local e = {}
+        L.Add(e, "Erro", ITEM, 7, NOW)
+        ck(L.HasBaseline(e[1]) == false, "(c2) a pre-1.2.4 row carries no baseline")
+        ck(#L.Reconcile(e, { erro = { count = 99, at = NOW + 3700 } }, NOW + 3700) == 1,
+           "(c2) ...and no snapshot, however large, is allowed to prove it delivered")
+        local kept, retired = L.Reconcile(e, {}, NOW + 31 * DAY)
+        ck(#kept == 0 and retired[1].why == "expired", "(c2) ...it retires on the TTL, and only there")
+        local rows = L.Describe({ { target = "Erro", itemID = ITEM, qty = 7, ts = NOW } }, NOW, nil)
+        ck(tostring(rows[1]):find("no baseline", 1, true) ~= nil,
+           "(c2) ...and /conduit debug boons names it rather than looking stuck")
     end
 
     -- (d) the plan subtracts what is in transit.
@@ -2146,6 +2641,8 @@ do
         ck(#n.Ledger.Entries() == 1, "(e) a confirmed send writes one ledger row")
         ck(n.Ledger.Entries()[1].qty == 7 and n.Ledger.Entries()[1].target == "Erro",
            "(e) ...recording the recipient and the quantity")
+        ck(n.Ledger.Entries()[1].base == 3,
+           "(e) ...and the holding the plan was built from, as the delivery baseline")
     end
     do
         local sim = Sim.New(bagsOf({ 10 }), { behaviour = function() return "fail" end })

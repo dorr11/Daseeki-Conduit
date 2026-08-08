@@ -12,6 +12,56 @@
   fixed order, so the same alt always resolves to the same name and the same
   colour. Nothing about which alts are offered changes.
 
+- **Auto-friend no longer runs before the game has told it who your friends are.**
+  Your friends list lives on the server. For the first seconds after you log in the
+  game answers "you have no friends" — not because you have none, but because it has
+  not been told yet, and nothing distinguishes the two answers. Conduit used to wait
+  ten seconds and then go ahead regardless. On a slow login that meant it read your
+  list as empty, decided every mail recipient was a stranger, fired off a burst of
+  friend requests for people already on your list, and — worst of all — wrote each
+  one down as "handled" in your saved settings. Recipients it failed to add that way
+  were never friended again, on that character, in any future session.
+
+  Conduit now *asks* for the list and waits for the game to answer, re-asking at five,
+  fifteen and thirty seconds. If the answer never comes, it does nothing at all this
+  session and tries again next login. Nothing is decided, nothing is added, and not
+  one "handled" mark is written against a list it has not actually seen.
+
+- **And it can now tell "you unfriended them" apart from "our request never landed".**
+  It records when it has actually *seen* a recipient on your confirmed list. A
+  recipient you remove after that is a deliberate choice and is never re-added — the
+  rule that has always applied, now with the evidence to back it.
+
+- **A one-time check on the marks the old behaviour left behind.** On each
+  character's first proper pass, Conduit compares its existing "handled" marks
+  against your real friends list. Anyone marked and present is confirmed. Anyone
+  marked, absent, and never once seen there is genuinely undecidable — either the old
+  dark pass stranded them, or you removed them on purpose — so Conduit names them in
+  a single line and does nothing. If they were not your doing, `/conduit friends
+  reheal` re-checks that exact set and adds each of them once. It only ever adds, it
+  never removes anyone, and it is spent after one use.
+
+- **The outbound ledger no longer mistakes a well-stocked alt for a delivered mail.**
+  Conduit remembers what it has put in the post so an interrupted run cannot post the
+  same boons twice. It used to retire an entry when a later look at the recipient
+  showed at least as many boons as the mail carried — which, for anyone already
+  holding half a stack, was true the moment they logged in, an hour before the mail
+  could possibly arrive. The entry cleared, the top-up looked due again, and a second
+  batch went out. Every send now records what that character was holding when the
+  mail was built, and the entry only clears when the count has actually *risen* by
+  what was sent. Entries written by older builds carry no such record, so they clear
+  on the thirty-day mail expiry instead; `/conduit debug boons` names them.
+
+- **One slow moment no longer convinces Conduit your game cannot split stacks.**
+  A single stack-split that took longer than a second and a half used to turn off
+  exact-quantity mailing for the whole session and tell you "this client will not
+  split stacks for the mail" — which was simply untrue on a client that splits fine
+  and merely stuttered. Only a `/reload` undid it. A timeout is now read as what it
+  is: slowness. Conduit waits longer on the next attempt, and only says your game
+  refuses to split after three attempts in a row where the stack demonstrably never
+  moved. Opening a mailbox clears the verdict, and `/conduit debug boons unblock`
+  clears it on demand.
+
 ## 1.2.3 — 2026-08-05
 
 - **Found it. The game was attaching whole stacks, and never said so.** The log you

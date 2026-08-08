@@ -73,9 +73,20 @@ ns.Staging = Staging
 
 -- Ceilings (seconds). A wait that can hang is worse than a wait that gives up, and
 -- every step re-checks the world after it resumes.
-Staging.CURSOR_CEILING = 1.5   -- the split reaching the cursor
+Staging.CURSOR_CEILING = 1.5   -- the split reaching the cursor (the FIRST rung)
 Staging.PLACE_CEILING  = 1.5   -- the cursor reaching the destination slot
 Staging.VERIFY_CEILING = 3.0   -- the client agreeing the new stack exists
+
+-- THE CURSOR LADDER (CDT-3). A ceiling that expires is a measurement of SLOWNESS,
+-- never a proof of REFUSAL, so each attempt after one expires waits longer than the
+-- last. Bounded on purpose: three rungs, then the ladder stops widening.
+Staging.CURSOR_LADDER = { 1.5, 4.0, 8.0 }
+
+-- How many consecutive attempts must produce REFUSAL EVIDENCE (see runJob) before
+-- the sticky verdict is written. A client that genuinely will not split fails the
+-- same way every time; a world-server hiccup does not repeat itself three times
+-- across three widening ceilings.
+Staging.STRIKES_TO_BLOCK = 3
 
 -- Session-cumulative diagnostics, in memory only (/conduit debug boons prints them).
 local D = {
@@ -84,7 +95,8 @@ local D = {
     staged       = 0,   -- ...that produced a verified stack of the right size
     reusedExact  = 0,   -- mails served by a stack that was ALREADY the right size
     noFreeSlot   = 0,   -- staging blocked for want of an empty bag slot
-    splitRefused = 0,   -- the client would not split bag-to-bag
+    splitRefused = 0,   -- the client would not split bag-to-bag (source untouched)
+    splitSlow    = 0,   -- the split WAS happening, just not inside the ceiling
     placeFailed  = 0,   -- the split reached the cursor but not the slot
     verifyFailed = 0,   -- the staged slot did not hold what was asked for
     passes       = 0,   -- staging passes run
@@ -92,13 +104,94 @@ local D = {
 function Staging.Diagnostics() return D end
 function Staging.ResetDiagnostics() for k in pairs(D) do D[k] = 0 end end
 
--- Set once the client has proved it will not split bag-to-bag either. Sticky for
--- the session: asking again costs a 1.5s ceiling per mail and cannot succeed.
-local blocked = false
+-- ── THE STICKY VERDICT, AND WHY IT IS NO LONGER A TIMEOUT (CDT-3) ────────────
+--
+-- Until 1.2.4 one expired 1.5s cursor ceiling latched `blocked` for the whole
+-- session: every later exact-quantity mail was short-circuited with
+-- BLOCKED_ADVICE — "this client will not split stacks" — which on a client that
+-- splits perfectly well is simply FALSE. One loading-screen stutter, one busy
+-- capital at raid-invite time, and the entire boon replenishment feature was off
+-- until /reload, telling the owner a lie about his client on the way out.
+--
+-- A timeout is not evidence. Three things replace it:
+--
+--   1. THE LADDER. Every expired ceiling widens the next attempt's ceiling
+--      (CURSOR_LADDER). The per-mail fallback in mail.lua re-attempts what the
+--      up-front pass could not prepare, so a slow frame costs one wait and then
+--      recovers inside the same run.
+--   2. THE CLASSIFICATION. At the ceiling, the SOURCE SLOT is read. A split that
+--      is merely late has already taken its units out of the source; a client that
+--      did nothing at all leaves the source untouched. Only the untouched case is
+--      refusal EVIDENCE and only it may strike.
+--   3. THE STRIKES. STRIKES_TO_BLOCK consecutive evidence-bearing failures before
+--      the verdict. Any success anywhere resets the count and the ladder.
+--
+-- A missing API is different in kind and still latches at once: C_Container with
+-- no SplitContainerItem is a fact about the client, not a measurement of it.
+--
+-- And the latch has a RELEASE PATH now, which is what made it dangerous: Unblock()
+-- had zero live callers and only /reload cleared it. It is cleared on MAIL_SHOW
+-- (a new mailbox visit is a new chance to be wrong about this) and by
+-- `/conduit debug boons unblock`.
+local blocked   = false
+local blockWhy  = nil     -- "refused" | "api"  — the verdict SAYS which it was
+local strikes   = 0       -- consecutive refusal-evidence failures
+local rung      = 1       -- index into CURSOR_LADDER for the next attempt
+
 function Staging.IsBlocked() return blocked end
-function Staging.Unblock() blocked = false end        -- harness seam
+function Staging.BlockedReason() return blockWhy end
+function Staging.Strikes() return strikes end
+
+-- The ceiling the NEXT split attempt gets.
+function Staging.CursorCeiling()
+    local L = Staging.CURSOR_LADDER
+    local r = rung
+    if r < 1 then r = 1 end
+    if r > #L then r = #L end
+    return L[r] or Staging.CURSOR_CEILING
+end
+
+-- Widen for the next attempt, bounded by the end of the ladder.
+local function widen()
+    if rung < #Staging.CURSOR_LADDER then rung = rung + 1 end
+end
+
+-- A split that worked is proof the client splits. Forget every strike.
+--
+-- The LADDER is deliberately not wound back in: a client that needed 4s once will
+-- need it again, and collapsing to the fast rung after every success makes every
+-- single mail pay a wasted ceiling before the wait that works. It only ever widens,
+-- it is bounded at the last rung, and Unblock() (MAIL_SHOW, or the debug command)
+-- resets it — so it is re-learned every mailbox visit rather than latched for the
+-- session. That is the Class 5 discipline: a calibration with a release path.
+local function splitSucceeded()
+    strikes = 0
+end
+
+function Staging.Unblock()
+    blocked, blockWhy, strikes, rung = false, nil, 0, 1
+end
+
 Staging.BLOCKED_ADVICE =
     "this client will not split stacks for the mail — put a stack of exactly the amount you want in your bags and run again."
+-- Said INSTEAD of the verdict while a timeout is still just a timeout. It names
+-- slowness as slowness, because that is all that has been observed.
+Staging.SLOW_ADVICE =
+    "the client did not finish splitting a stack in time — the run will try again with a longer wait."
+
+-- One line for whatever the staging pass came back with. Pure, so the harness can
+-- drive every reason without a mailbox.
+function Staging.Advice(why, isBlocked)
+    if why == "api" then return Staging.BLOCKED_ADVICE end
+    if isBlocked then return Staging.BLOCKED_ADVICE end
+    if why == "blocked" then return Staging.BLOCKED_ADVICE end
+    if why == "slowsplit" then return Staging.SLOW_ADVICE end
+    if why == "split" then
+        -- Refusal evidence, but not yet enough of it to say so out loud.
+        return Staging.SLOW_ADVICE
+    end
+    return nil
+end
 
 -- ════════════════════════════════════════════════════════════════════════════
 --  PURE — THE STAGING PLAN
@@ -362,12 +455,34 @@ local function runJob(job, await, draws, done)
 
     await(cursorHas, function()
         if not cursorHas() then
-            -- Nothing reached the cursor within the ceiling. On a client that
-            -- refuses bag-to-bag splits this is where it says so, once.
+            -- NOTHING REACHED THE CURSOR INSIDE THE CEILING. That is one fact, and
+            -- it has two very different causes. Read the SOURCE to tell them apart:
+            --
+            --   * the source still holds what it held  -> the client did nothing
+            --     with the call. Refusal EVIDENCE; it may strike.
+            --   * the source has given its units up    -> the split is real and
+            --     merely late. Not evidence of anything except a slow frame, and
+            --     the ceiling widens for the next attempt.
+            --
+            -- A source slot that has VANISHED or changed item is also "moved": the
+            -- units left, whatever happened to them afterwards.
+            local after = ns.Rules.SlotInfo(job.bag, job.slot)
+            local nowCount = after and tonumber(after.count) or nil
+            local moved = (after == nil)
+                or (after.itemID ~= job.itemID)
+                or (nowCount ~= nil and td.pre ~= nil and nowCount < td.pre)
+            td.srcAfter = nowCount
+            if moved then
+                D.splitSlow = D.splitSlow + 1
+                widen()
+                return stop("slow-cursor", false, "slowsplit")
+            end
             D.splitRefused = D.splitRefused + 1
+            widen()
             return stop("no-cursor", false, "split")
         end
         td.cursor = true
+        splitSucceeded()
         if not ns.Rules.SlotEmpty(job.destBag, job.destSlot) then
             ClearCursor()
             return stop("dest-taken", false, "dest")
@@ -382,7 +497,7 @@ local function runJob(job, await, draws, done)
             td.placed = true
             stop("placed", true)
         end, Staging.PLACE_CEILING)
-    end, Staging.CURSOR_CEILING)
+    end, Staging.CursorCeiling())
 end
 
 -- Did every job land? Checked against the DESTINATION slots on settled state — the
@@ -412,6 +527,29 @@ function Staging.Execute(jobs, await, done)
     local i, failWhy = 0, nil
     D.passes = D.passes + 1
 
+    -- THE ONE PLACE THE VERDICT IS WRITTEN. Kept in a single function so there is
+    -- exactly one answer to "what latched this?" — the old code set `blocked = true`
+    -- from two places on two different conditions, which is how a timeout came to
+    -- masquerade as a proof in the first place.
+    local function adjudicate(why)
+        if why == "api" then
+            -- Not a measurement. The call is not on this client at all.
+            blocked, blockWhy = true, "api"
+            return
+        end
+        if why == "split" then
+            strikes = strikes + 1
+            if strikes >= Staging.STRIKES_TO_BLOCK then
+                blocked, blockWhy = true, "refused"
+            end
+            return
+        end
+        -- "slowsplit", "verify", "dest", "place", "stale", "short": none of these
+        -- say anything about whether the client can split. They never latch, and a
+        -- slow split is positive evidence that it CAN, so it clears the strikes.
+        if why == "slowsplit" then strikes = 0 end
+    end
+
     local function finish(ok)
         -- ONE verification wait for the whole pass. The client writes container
         -- counts on its own schedule; the pass is not done until it agrees.
@@ -422,13 +560,15 @@ function Staging.Execute(jobs, await, done)
                 failWhy = failWhy or "verify"
             end
             local good = ok and verified
-            if not good and (failWhy == "split" or failWhy == "api") then
-                blocked = true
+            if good then
+                D.staged = D.staged + #jobs
+                splitSucceeded()
             end
-            if good then D.staged = D.staged + #jobs end
             record({ stage = true, draws = draws, count = #jobs,
                      verdict = good and "staged" or "stage-failed",
-                     why = good and nil or (failWhy or "verify") })
+                     why = good and nil or (failWhy or "verify"),
+                     strikes = (not good) and strikes or nil,
+                     blocked = blocked or nil })
             done(good, failWhy or (verified and nil or "verify"))
         end, Staging.VERIFY_CEILING)
     end
@@ -442,12 +582,12 @@ function Staging.Execute(jobs, await, done)
             runJob(jobs[i], await, draws, function(ok, why)
                 if not ok then
                     failWhy = why
-                    if why == "split" or why == "api" then blocked = true end
+                    adjudicate(why)
                     return finish(false)
                 end
                 step()
             end)
-        end, Staging.CURSOR_CEILING)
+        end, Staging.CursorCeiling())
     end
 
     if #jobs == 0 then
@@ -457,6 +597,14 @@ function Staging.Execute(jobs, await, done)
         record({ stage = true, count = #jobs, verdict = "stage-failed", why = "blocked" })
         return done(false, "blocked")
     end
+    -- A SPLIT THAT ARRIVED AFTER WE GAVE UP ON IT. The ladder means a ceiling can
+    -- expire on a split that is merely late, and the stack it was carrying then
+    -- lands on the cursor with nobody waiting for it. Put it back before starting:
+    -- a busy cursor makes stageQuiet false, which would burn the next (wider)
+    -- ceiling and then read the untouched source as a REFUSAL — the very
+    -- misclassification this whole change exists to remove. Safe here and nowhere
+    -- else: between passes the cursor is never ours mid-step.
+    if cursorHas() and ClearCursor then ClearCursor() end
     step()
 end
 
@@ -532,6 +680,22 @@ function Staging.PrepareOne(itemID, units, await, done, opts)
         return done(true, nil)          -- already exactly right in the bags
     end
     Staging.Execute(plan.jobs, await, done)
+end
+
+-- ── THE RELEASE PATH ─────────────────────────────────────────────────────────
+--
+-- The sticky verdict's real defect was never only that a timeout could set it: it
+-- was that NOTHING could clear it. Unblock() existed with zero live callers and
+-- only /reload got the feature back.
+--
+-- A new mailbox visit is the natural release. Whatever the client was doing during
+-- the last one — a loading screen, a zone full of raiders, a world-server hiccup —
+-- is over, and the cost of being wrong here is one bounded ladder, paid once,
+-- against a feature that is otherwise dead for the session. The other door is
+-- `/conduit debug boons unblock`, for a user who has just fixed something and does
+-- not want to close and re-open the mailbox to prove it.
+if ns.RegisterEvent then
+    ns:RegisterEvent("MAIL_SHOW", function() Staging.Unblock() end)
 end
 
 return Staging

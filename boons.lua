@@ -333,6 +333,15 @@ function Boons.BuildQueue(plan, stacks, opts)
                 -- to send a form that does not hold exactly this many), and
                 -- `itemID` is what the outbound ledger records on a confirmed send.
                 itemID = itemID,
+                -- THE DELIVERY BASELINE (CDT-2). What the plan saw this recipient
+                -- holding when it decided to mail them. The ledger retires the
+                -- entry on a snapshot that has RISEN by `units` from here — an
+                -- absolute count proves nothing, because qty is itself derived
+                -- from `have` and the two collide for anyone half-stocked.
+                -- tonumber, NOT count(): a target with no readable holding must
+                -- record NO baseline, and count() would fabricate a zero — which is
+                -- the most dangerous baseline there is (every snapshot beats it).
+                base = tonumber(t.have),
             }
         end
     end
@@ -701,6 +710,19 @@ function Boons.Debug(arg)
         ns:Print(("outbound ledger cleared (%d entr%s dropped)."):format(n, n == 1 and "y" or "ies"))
         return
     end
+    -- THE RELEASE PATH for staging's sticky verdict (CDT-3). It used to have none
+    -- at all: one expired ceiling turned exact-quantity mailing off for the session
+    -- and only /reload brought it back.
+    if sub:match("^unblock") then
+        local was, why = ns.Staging and ns.Staging.IsBlocked(), ns.Staging and ns.Staging.BlockedReason()
+        if ns.Staging and ns.Staging.Unblock then ns.Staging.Unblock() end
+        ns:Print(was
+            and ("stack splitting re-armed (it was held off because %s).")
+                :format(why == "api" and "this client has no split call"
+                                     or  "the client refused the split three times running")
+            or  "stack splitting was not held off — nothing to clear.")
+        return
+    end
     if sub:match("^tracec") or sub:match("^clear%s*trace") then
         local n = ns.Trace and ns.Trace.Clear() or 0
         ns:Print(("attach trace cleared (%d entr%s dropped)."):format(n, n == 1 and "y" or "ies"))
@@ -766,9 +788,18 @@ function Boons.Debug(arg)
         local s = ns.Staging.Diagnostics()
         ns:Print(("staging: %d pass(es), %d split(s) asked, %d staged, %d served by stacks that were already exact")
             :format(s.passes, s.splits, s.staged, s.reusedExact))
-        ns:Print(("  refused: %d no empty bag slot, %d client would not split, %d not placed, %d failed verification%s")
-            :format(s.noFreeSlot, s.splitRefused, s.placeFailed, s.verifyFailed,
-                    ns.Staging.IsBlocked() and "  [STAGING BLOCKED for this session]" or ""))
+        ns:Print(("  refused: %d no empty bag slot, %d client would not split, %d too slow to split, %d not placed, %d failed verification")
+            :format(s.noFreeSlot, s.splitRefused, s.splitSlow, s.placeFailed, s.verifyFailed))
+        -- SLOW AND REFUSED ARE DIFFERENT WORDS HERE, on purpose: the old line said
+        -- "BLOCKED for this session" off a single expired ceiling, which is the
+        -- falsehood CDT-3 is about.
+        ns:Print(("  split ceiling: %.1fs next attempt   strikes: %d of %d%s")
+            :format(ns.Staging.CursorCeiling(), ns.Staging.Strikes(),
+                    ns.Staging.STRIKES_TO_BLOCK,
+                    ns.Staging.IsBlocked()
+                        and ("   [HELD OFF — " .. tostring(ns.Staging.BlockedReason())
+                             .. "; /conduit debug boons unblock to re-arm]")
+                        or ""))
     end
 
     -- THE TRACE. One line here; the detail lives in SavedVariables
