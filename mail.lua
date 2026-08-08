@@ -1065,6 +1065,13 @@ end
 -- stack to somebody who needed three.
 local function stagingRefusal(why, want, label)
     label = label or "item(s)"
+    -- A SLOW SPLIT IS NOT A REFUSAL (CDT-3). Saying "this client will not split"
+    -- because a ceiling expired is the falsehood the strike ladder exists to stop,
+    -- so it is only said once staging has actually written the verdict.
+    if why == "slowsplit" or (why == "split" and not (ns.Staging and ns.Staging.IsBlocked())) then
+        return ("the client did not finish making a stack of exactly %d %s in time — run again and it will wait longer.")
+            :format(want, label)
+    end
     if why == "blocked" or why == "split" or why == "api" then
         return ("this client will not split stacks for the mail — put a stack of exactly %d %s in your bags and run again.")
             :format(want, label)
@@ -1371,8 +1378,15 @@ local function confirmSend()
     -- "probably fine" — on the one path where the mail was acknowledged AND the
     -- goods verifiably left. A mail recorded that did not go is a character this
     -- addon will refuse to top up for the next thirty days.
+    -- The DELIVERY BASELINE travels with the mail (boons.lua stamps the holding the
+    -- plan was built from). Without it there is no delta to measure a later
+    -- snapshot against, and the entry can only ever retire on the 30-day expiry —
+    -- so it is passed through here rather than re-derived from a world that has
+    -- moved on since the plan was made.
     if mail and ns.Ledger and mail.itemID and units > 0 then
-        ns:SafeCall(function() ns.Ledger.Record(mail.recipient, mail.itemID, units) end)
+        ns:SafeCall(function()
+            ns.Ledger.Record(mail.recipient, mail.itemID, units, nil, mail.base)
+        end)
     end
 
     if mail then
@@ -1498,9 +1512,11 @@ local function beginConfirmed(queue, opts)
             if summary.jobs > 0 and summary.ok then
                 say(("prepared %d exact stack(s) in your bags."):format(summary.jobs))
             elseif summary.jobs > 0 and not summary.ok then
-                say((summary.why == "split" or summary.why == "blocked" or summary.why == "api")
-                    and ns.Staging.BLOCKED_ADVICE
-                    or  "could not prepare the exact stacks in your bags — each mail will say what it needed.")
+                -- THE VERDICT SAYS WHICH IT WAS. "this client will not split" is
+                -- only said once the strikes have actually earned it; a timeout is
+                -- reported as a timeout, and the run goes on to try again per mail.
+                say(ns.Staging.Advice(summary.why, ns.Staging.IsBlocked())
+                    or "could not prepare the exact stacks in your bags — each mail will say what it needed.")
             end
             if summary.freeShort > 0 then
                 say(("%d mail(s) need an empty bag slot to prepare and there were none spare — they will be prepared as the run goes.")

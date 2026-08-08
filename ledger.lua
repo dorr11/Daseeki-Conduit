@@ -33,10 +33,43 @@
     Two ways an entry dies, and no third:
 
       * EVIDENCE. The mesh produces a snapshot of that character taken AFTER the
-        send, and its count is at least the quantity we posted. The mail landed and
-        was seen; the entry has done its job.
+        send, and its count has RISEN BY WHAT WE POSTED relative to the baseline we
+        recorded at send time. The mail landed and was seen; the entry has done its
+        job.
       * TIME. A 30-day backstop, which is Blizzard's own mail expiry: after that the
         mail is either opened or returned, and either way it is no longer in flight.
+
+    ── THE BASELINE, AND WHY AN ABSOLUTE COUNT IS NOT EVIDENCE (CDT-2) ──────────
+    Until 1.2.4 the evidence test was `cnt >= e.qty`: the recipient's ABSOLUTE
+    holding against the QUANTITY POSTED. That is not a delivery proof, it is a
+    coincidence. Boons.BuildPlan sets qty = 10 - have, so `cnt >= qty` reduces to
+    `have >= 10 - have`: ANY recipient already holding five or more retired the
+    entry the moment any later snapshot arrived, whether or not the mail had moved.
+
+      Bankalt posts 2 boons to a character holding 8. That character logs in ten
+      minutes later; Nexus scans their bags and stamps countsAt — still 8, because
+      cross-account mail takes an hour. The old test saw `at > e.ts` and `8 >= 2`
+      and called it delivered. inFlight emptied, need became 2, and the button
+      posted two MORE. Twelve boons for a ten-boon target, from the very ledger
+      that exists to stop exactly that.
+
+    So every entry now records `base` — the holding the planner SAW for that
+    recipient at the moment the mail was confirmed (boons.lua's `t.have`, which is
+    the mesh snapshot the plan was built from). Delivery is a DELTA:
+
+        cnt >= e.base + e.qty      -- the count rose by at least what we posted
+
+    Two honest consequences, both of which fail towards keeping the entry rather
+    than dropping it, because a retained entry only delays a top-up while a dropped
+    one over-mails:
+
+      * A recipient who SPENDS boons between the send and the delivery may never
+        reach base + qty. That entry rides to the TTL. Under-mailing for a while is
+        recoverable; the double-send is not.
+      * An entry written by a build older than 1.2.4 carries NO baseline, and no
+        baseline means no delta and therefore no proof. Those entries retire on the
+        TTL alone (`/conduit debug boons` names them, and `...clear` drops them).
+        There is no way to invent a baseline after the fact that is not a guess.
 
     Bounced-mail auto-detection is deliberately OUT of scope — a returned mail is
     indistinguishable at the API from one never sent, and the TTL plus the manual
@@ -85,12 +118,28 @@ function Ledger.IsValid(e)
 end
 
 -- Append a confirmed send. Returns the new entry (callers persist by reference).
-function Ledger.Add(entries, target, itemID, qty, ts)
+--
+-- `base` is the recipient's holding as the PLANNER SAW IT when this mail was built
+-- — the baseline the delivery delta is measured against. It is deliberately
+-- OPTIONAL and deliberately never defaulted to 0: a missing baseline is "we do not
+-- know", which Reconcile refuses to treat as evidence, and an invented zero would
+-- turn every send into a false delivery proof on the next snapshot.
+function Ledger.Add(entries, target, itemID, qty, ts, base)
     if type(entries) ~= "table" then return nil end
-    local e = { target = target, itemID = num(itemID), qty = math.floor(num(qty) or 0), ts = num(ts) }
+    local b = num(base)
+    if b then b = math.floor(b) end
+    if b and b < 0 then b = 0 end
+    local e = { target = target, itemID = num(itemID), qty = math.floor(num(qty) or 0),
+                ts = num(ts), base = b }
     if not Ledger.IsValid(e) then return nil end
     entries[#entries + 1] = e
     return e
+end
+
+-- Does this entry carry a baseline, and therefore a delivery proof at all?
+-- Entries written before 1.2.4 do not; they retire on the TTL and nothing else.
+function Ledger.HasBaseline(e)
+    return type(e) == "table" and num(e.base) ~= nil
 end
 
 -- How much of `itemID` is in transit to each character right now.
@@ -119,9 +168,14 @@ end
 --
 --   mesh = { [key] = { count = <units the snapshot shows>, at = <epoch> } }
 --
--- An entry is retired when the mesh has SEEN the character since the send and the
--- count it saw covers what we posted (the mail arrived and was opened into the
--- bags/bank the snapshot reads), or when the entry is older than the TTL.
+-- An entry is retired when the mesh has SEEN the character since the send AND the
+-- count it saw has RISEN by at least what we posted, measured against the baseline
+-- the entry recorded (the mail arrived and was opened into the bags/bank the
+-- snapshot reads), or when the entry is older than the TTL.
+--
+-- An absolute count proves nothing on its own — see the CDT-2 note in the header.
+-- An entry with no baseline has no delta to measure and therefore no evidence
+-- path: it rides to the TTL.
 --
 -- Returns kept, retired — two arrays. The caller swaps `kept` in.
 function Ledger.Reconcile(entries, mesh, now, ttl)
@@ -138,9 +192,13 @@ function Ledger.Reconcile(entries, mesh, now, ttl)
                 why = "expired"
             else
                 local m = mesh[Ledger.Key(e.target)]
-                if type(m) == "table" then
+                if type(m) == "table" and Ledger.HasBaseline(e) then
                     local at, cnt = num(m.at), num(m.count, 0)
-                    if at and at > e.ts and cnt >= e.qty then why = "delivered" end
+                    -- THE DELTA, NOT THE ABSOLUTE. The snapshot must be newer than
+                    -- the send AND show the count risen by what we posted.
+                    if at and at > e.ts and cnt >= (num(e.base) + e.qty) then
+                        why = "delivered"
+                    end
                 end
             end
             if why then retired[#retired + 1] = { entry = e, why = why }
@@ -166,8 +224,14 @@ function Ledger.Describe(entries, now, fmtAge)
     for _, e in ipairs(rows) do
         local age = (num(now) and (num(now) - e.ts)) or nil
         local ageText = (fmtAge and age and fmtAge(age)) or nil
-        out[#out + 1] = ("%s  <-  %d x %d   (sent %s ago)")
-            :format(e.target, e.qty, e.itemID, ageText or "?")
+        -- A row with no baseline can never be proved delivered, and a user staring
+        -- at a ledger that will not clear deserves to be told which rows those are
+        -- rather than left to guess at a stuck addon.
+        local note = Ledger.HasBaseline(e)
+            and ("had %d"):format(num(e.base))
+            or  "no baseline — clears at the 30-day expiry"
+        out[#out + 1] = ("%s  <-  %d x %d   (sent %s ago, %s)")
+            :format(e.target, e.qty, e.itemID, ageText or "?", note)
     end
     return out
 end
@@ -192,8 +256,11 @@ end
 
 -- Record a CONFIRMED send. Called by mail.lua from the terminal-success path and
 -- from nowhere else — an attempt is not a send.
-function Ledger.Record(target, itemID, qty, ts)
-    local e = Ledger.Add(Ledger.Entries(), target, itemID, qty, ts or Ledger.Now())
+--
+-- `base` comes off the queued mail (boons.lua stamps the planner's `have` on it).
+-- A mail built without one records no baseline rather than a fabricated zero.
+function Ledger.Record(target, itemID, qty, ts, base)
+    local e = Ledger.Add(Ledger.Entries(), target, itemID, qty, ts or Ledger.Now(), base)
     return e
 end
 
