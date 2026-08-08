@@ -23,8 +23,10 @@
     Everything above the runtime wrapper is PURE (no WoW API at call time), so
     selftest.lua exercises it headless. DaseekiPrepDB is read STRICTLY READ-ONLY —
     nothing Raid Prep owns is ever written. A marker in DaseekiConduitDB
-    (migratedRaidPrep) makes the import run at most once, the first time Conduit
-    loads on a client where Raid Prep's data is present.
+    (migratedRaidPrep) makes the import run at most once — the first login on
+    which Raid Prep's data actually PRODUCES a rule. Presence of the table is not
+    the thing being migrated; until a recipient exists there is nothing to import
+    and nothing to mark, so the import is still available to a later login.
 --]]
 
 local ADDON, ns = ...
@@ -132,10 +134,23 @@ end
 --   * Already migrated                    -> 0, no change.
 --   * prepDB absent / not a table         -> 0, marker NOT set (a later Raid Prep
 --                                            install can still migrate).
---   * prepDB present                      -> append any produced rules, set the
---                                            marker (Raid Prep's data has been
---                                            seen), return the count (may be 0 when
---                                            no recipient was ever configured).
+--   * prepDB present but produced NOTHING -> 0, marker NOT set. The presence of
+--                                            the table is not the thing being
+--                                            migrated; the rules are.
+--   * prepDB produced rules               -> append them, set the marker, return
+--                                            the count.
+--
+-- MARKER DISCIPLINE (CDT-4; the in-suite donor is Daseeki-Bags/migrate.lua's
+-- "set ONLY on a non-empty result" and migrate_settings.lua's non-empty gate).
+-- This used to latch the moment DaseekiPrepDB merely EXISTED as a table -- so a
+-- user who had built Raid Prep class checklists but not yet set a mail recipient
+-- burned the one-time import on a run that produced zero rules. Configuring the
+-- recipient afterwards could then never import, silently, forever: there is no
+-- release path for this marker. An empty result is not proof that we read
+-- anything; the door stays open for the recipient to arrive on a later login.
+--
+-- Re-running is free: BuildConsumesRules returns an empty array when there is no
+-- recipient, and allocId is not reached, so nothing is consumed by a no-op pass.
 function Migrate.Apply(db, prepDB)
     if type(db) ~= "table" then return 0 end
     if db.migratedRaidPrep then return 0 end
@@ -150,6 +165,8 @@ function Migrate.Apply(db, prepDB)
     end
 
     local newRules = Migrate.BuildConsumesRules(prepDB, allocId)
+    if #newRules == 0 then return 0 end        -- nothing read -> nothing marked
+
     for _, r in ipairs(newRules) do
         db.rules[#db.rules + 1] = r
     end

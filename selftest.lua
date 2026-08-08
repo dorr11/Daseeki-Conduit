@@ -261,12 +261,38 @@ ns:RegisterSelfTest("raidprep-migration", function(verbose)
     eq(t, M.Apply(db2, nil), 0, "absent prepDB adds nothing")
     check(t, db2.migratedRaidPrep ~= true, "absent prepDB leaves marker unset")
 
-    -- Apply with Raid-Prep present but no recipient configured: 0 rules, marker set.
+    -- ── CDT-4: the marker is earned by a RESULT, never by a table's existence ──
+    -- The install ordering that used to burn the one-time import: Raid Prep is
+    -- installed and class checklists are built (so DaseekiPrepDB.classes is
+    -- populated), but no mail recipient has been set yet. The old code latched
+    -- the marker because prepDB was merely a table; the user configuring the
+    -- recipient afterwards could then never import, silently, forever -- this
+    -- marker has no release path.
     local db3 = { rules = {}, nextRuleId = 1 }
     local noRcpt = { classes = { WARRIOR = { { itemID = 13442 } } }, mailExtra = {},
                      mailIgnored = {}, mailTo = { Alliance = "", Horde = "" } }
-    eq(t, M.Apply(db3, noRcpt), 0, "no recipient => 0 rules")
-    check(t, db3.migratedRaidPrep == true, "marker set (data seen) even with 0 rules")
+    eq(t, M.Apply(db3, noRcpt), 0, "CDT-4: no recipient => 0 rules")
+    check(t, db3.migratedRaidPrep ~= true,
+          "CDT-4: prepDB present but nothing produced leaves the marker UNSET")
+    eq(t, db3.nextRuleId, 1, "CDT-4: a no-op pass consumes no rule id")
+    eq(t, #db3.rules, 0, "CDT-4: a no-op pass adds no rules")
+
+    -- A later login, after the user sets the recipient in Raid Prep: the import
+    -- that the old latch had already spent now runs.
+    noRcpt.mailTo.Alliance = "LateBank"
+    eq(t, M.Apply(db3, noRcpt), 1, "CDT-4: the LATER login imports, because the door stayed open")
+    check(t, db3.migratedRaidPrep == true, "CDT-4: marker set once a rule really was produced")
+    -- Defensive index: under the OLD latch this array is empty, and the point of
+    -- the test is to name that failure, not to blow up the suite runner on it.
+    eq(t, (db3.rules[1] or {}).recipient, "LateBank", "CDT-4: the late recipient is the one imported")
+    eq(t, M.Apply(db3, noRcpt), 0, "CDT-4: and it is still a one-time import after that")
+    eq(t, #db3.rules, 1, "CDT-4: no duplicate on the pass after the latch")
+
+    -- Repeated no-op passes must be free: no ids consumed, no marker, no drift.
+    local db4 = { rules = {}, nextRuleId = 1 }
+    for _ = 1, 5 do M.Apply(db4, noRcpt and { classes = {}, mailTo = {} }) end
+    check(t, db4.migratedRaidPrep ~= true, "CDT-4: five empty logins still leave the door open")
+    eq(t, db4.nextRuleId, 1, "CDT-4: five empty logins consume no rule ids")
 
     return report(t, verbose)
 end)

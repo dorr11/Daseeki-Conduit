@@ -187,6 +187,7 @@ else
     ck(chatFind("ALL SUITES PASS") ~= nil, "every registered suite passes")
     -- A suite that silently fails to register would still report ALL PASS, so name
     -- the ones whose files this harness loads for their own sake.
+    ck(chatFind("raidprep-migration:") ~= nil, "the Raid-Prep migration suite ran (CDT-4)")
     ck(chatFind("auto-friend:") ~= nil, "the auto-friend suite ran")
     ck(chatFind("sync-bridge:") ~= nil, "the sync-bridge suite ran")
     ck(chatFind("network:") ~= nil, "the network suite ran")
