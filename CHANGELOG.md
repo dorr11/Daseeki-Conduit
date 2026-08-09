@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.2.4 — 2026-08-08
 
 - **The one-time Raid Prep import is no longer spent on a login that imported
   nothing.** Conduit imports your Raid Prep "Send Consumes" settings once, the first
