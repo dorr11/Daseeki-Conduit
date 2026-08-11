@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.2.5 — 2026-08-11
 
 - **A long mail run can no longer stack the game up on itself.** The game does not
   always finish an action before telling everyone that it happened: for some calls it

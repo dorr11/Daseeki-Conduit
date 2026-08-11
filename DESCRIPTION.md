@@ -2,7 +2,7 @@
 
 <!-- Canonical CurseForge project description. Update here first, then paste to
      https://www.curseforge.com/wow/addons/daseeki-conduit (project 1638368).
-     Last synced: 2026-08-08 (v1.2.4). -->
+     Last synced: 2026-08-11 (v1.2.5). -->
 
 Daseeki Conduit is the Daseeki suite's mail automation addon for WoW Classic Era. Define rules once — "herbs go to my alchemist, gold above 50g goes to the bank alt" — and Conduit fills the Send Mail form for you at any mailbox.
 
