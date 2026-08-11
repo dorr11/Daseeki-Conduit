@@ -4,6 +4,19 @@
     The send engine. Turns a mail QUEUE (built by rules.lua or boons.lua) into
     actual mails: preview -> ONE Accept -> the whole run, hands-free.
 
+    ── What changed after 1.2.4: THE CLIENT DISPATCHES INSIDE THE CALL ───────────
+
+    This client does not always SCHEDULE the event a mutating API causes — it
+    DISPATCHES it from inside the call, and every handler registered by every addon
+    in the session runs to completion before the call returns. The send loop is
+    mutually recursive by design (arm -> attach -> verify -> fire -> terminal ->
+    arm) and every hop between those states can be reached from a handler, so on
+    such a client the loop could carry straight on to the NEXT mail with the
+    previous SendMail's frame still on the stack: six deep on a six-mail queue,
+    forty on a forty-mail one. Measured, then fixed — see THE SEQUENCE LATCH AND
+    THE DEPTH FUSE below. Every latch a send needs is armed BEFORE the call it
+    guards, which was already true here and is now asserted rather than assumed.
+
     ── What changed in 1.2.3, and why (read this first) ──────────────────────────
 
     THE ATTACH NEVER SPLITS A STACK ANY MORE. On Classic Era 11509,
@@ -169,6 +182,12 @@ local D = {
     bagsRetained     = 0,   -- an attach that left the bag totals UNCHANGED (see below)
     settleWaits      = 0,
     settleTimeouts   = 0,
+    -- Class 9 (synchronous in-call dispatch). See THE SEQUENCE LATCH below.
+    reentryHops      = 0,   -- loop re-entries pushed onto a fresh stack
+    seqDepth         = 0,   -- deepest client-call sequence nesting seen this session
+    depthRefusals    = 0,   -- sends refused by the depth fuse
+    waitersDisplaced = 0,   -- a settle wait installed over a live one
+    lateWaiters      = 0,   -- a predicate that installed the waiter it then proved
 }
 function Mail.Diagnostics() return D end
 function Mail.ResetDiagnostics() for k in pairs(D) do D[k] = 0 end end
@@ -796,6 +815,57 @@ local function thisRun(fn)
     return function(...) if S.active and S.runId == id then fn(...) end end
 end
 
+-- ── THE SEQUENCE LATCH AND THE DEPTH FUSE (client-async lesson class 9) ───────
+--
+-- THE HAZARD, PROVED ELSEWHERE AND MODELLED HERE. This client does not always
+-- SCHEDULE the event a mutating API causes: it DISPATCHES it from inside the call,
+-- and every handler registered by every addon in the session runs to completion
+-- before the call returns. Nexus 1.1.8 hit a C-stack overflow that way — a handler
+-- woken from inside a setter re-entered the setter — and every headless suite
+-- passed it, because the simulators echoed AFTER the call returned.
+--
+-- What that means HERE. The send loop is mutually recursive by design
+-- (arm -> attach -> verify -> fire -> terminal -> arm), and every hop between
+-- those states can be reached from a handler. If the client dispatches a send's
+-- terminal state from inside SendMail, the loop carries straight on to the NEXT
+-- mail with the previous SendMail's frame still on the stack: an eight-mail boon
+-- run nests eight deep, a forty-mail one nests forty, and each level spans several
+-- C boundaries. Measured at depth 6 on a six-mail queue before this existed.
+--
+-- THE MECHANISM, in the shape the lesson prescribes:
+--   * the latch is armed BEFORE the first client call of a sequence and released
+--     when the sequence returns, pcall-protected so an error cannot wedge it, and
+--     incremented/decremented rather than set/cleared so nesting stays honest;
+--   * anything that re-enters the loop while it is up HOPS to a fresh stack
+--     instead of recursing. The work still lands, one frame later — which is
+--     exactly where it would have landed on a client that scheduled its events —
+--     so the latch does not swallow the send, it only refuses to grow the stack;
+--   * and a depth FUSE sits under both, so an unforeseen composition that nests
+--     past what this engine knows how to do degrades to a REFUSAL with a
+--     build-stamped line, never to an overflow.
+local seqDepth  = 0
+local SEQ_MAX   = 4     -- arm(1) + fire(2), with headroom for one unforeseen nest
+
+-- Run `fn` as a client-call sequence, with the latch up for its whole duration.
+local function sequence(fn)
+    seqDepth = seqDepth + 1
+    if seqDepth > D.seqDepth then D.seqDepth = seqDepth end
+    local ok, err = pcall(fn)
+    seqDepth = seqDepth - 1
+    if not ok then geterrorhandler()(err) end
+    return ok
+end
+
+-- Re-enter the loop, on a FRESH STACK if we are inside one of our own client calls.
+local function hop(fn)
+    if seqDepth == 0 then return fn() end
+    D.reentryHops = D.reentryHops + 1
+    newTimer(0, thisRun(fn))
+end
+
+Mail._SeqDepth = function() return seqDepth end     -- harness seam
+Mail._SeqMax   = function() return SEQ_MAX end      -- harness seam
+
 local function resetState()
     releaseFlight()
     S.runId = S.runId + 1
@@ -980,9 +1050,19 @@ local function bagsQuiet()
     return true
 end
 
-local function finishSettle()
+-- Release the pending wait. `only` names the waiter the caller proved the
+-- condition FOR: releasing anything else is the class-9 mistake, because a
+-- predicate on this client can install a new wait while it runs (bagsQuiet calls
+-- ClearCursor, ClearCursor dispatches our own handlers from inside itself, and one
+-- of those handlers can arm the next hop). Firing that newcomer on the strength of
+-- the old one's predicate runs a continuation whose condition nobody ever tested.
+local function finishSettle(only)
     local w = S.settleWaiter
     if not w then return end
+    if only and w ~= only then
+        D.lateWaiters = D.lateWaiters + 1
+        return
+    end
     S.settleWaiter = nil
     S.settlePred   = nil
     S.settleTimer  = cancel(S.settleTimer)
@@ -1000,13 +1080,20 @@ local function awaitCondition(pred, fn, ceiling)
     local wrapped = thisRun(fn)
     if pred() then return wrapped() end
     D.settleWaits = D.settleWaits + 1
+    -- Displacing a live wait drops its continuation AND cancels its ceiling, which
+    -- is the "wait that can hang" this file calls the worst failure in the design
+    -- space. Every real call site installs only after the previous wait has been
+    -- consumed; counted rather than assumed, so if a client dispatch order ever
+    -- makes it happen the diagnostics say so instead of the run going quiet.
+    if S.settleWaiter then D.waitersDisplaced = D.waitersDisplaced + 1 end
     S.settleWaiter = wrapped
     S.settlePred   = pred
     S.settleTimer  = cancel(S.settleTimer)
     S.settleTimer  = newTimer(ceiling or SETTLE_TIMEOUT, function()
-        if not S.settleWaiter then return end
+        local w = S.settleWaiter
+        if not w then return end
         D.settleTimeouts = D.settleTimeouts + 1
-        finishSettle()
+        finishSettle(w)
     end)
 end
 
@@ -1016,10 +1103,18 @@ local function awaitSettlement(fn)
 end
 
 -- Any bag signal is a chance for a pending condition to have become true.
+--
+-- CLASS 9. The predicate is not a pure read: bagsQuiet puts the cursor down, and
+-- on this client putting the cursor down dispatches our own handlers from inside
+-- ClearCursor — so by the time `pred()` returns, the wait it was asked about may
+-- already have been consumed and replaced by the NEXT one. The waiter is therefore
+-- captured before the predicate runs and named on the way out, so only the wait
+-- whose condition was actually proved is released.
 local function onBagsMaybeSettled()
-    if not S.settleWaiter then return end
+    local w = S.settleWaiter
+    if not w then return end
     local pred = S.settlePred or bagsQuiet
-    if pred() then finishSettle() end
+    if pred() then finishSettle(w) end
 end
 
 -- Wait until the WORLD AGREES about the mail that has just been armed.
@@ -1090,7 +1185,7 @@ end
 
 -- Forward declarations: the loop is mutually recursive by nature (arm -> fire ->
 -- terminal -> arm), and naming the hops is clearer than one giant function.
-local armCurrent, fireCurrent, advance, verifyAndFire
+local armCurrent, armSequence, fireCurrent, advance, verifyAndFire
 
 -- Move to the next queue index and arm it. Skips mails that cannot be armed.
 function advance()
@@ -1107,7 +1202,19 @@ function advance()
 end
 
 -- Attach the mail at S.idx and either fire it (hands-free) or await a click (step).
+--
+-- CLASS 9. This is the entry point of every arm -> attach -> verify -> fire
+-- sequence, and the first thing the sequence does is touch the client (clearForm's
+-- ClearCursor). So the latch goes up HERE, before that call — and a re-entry that
+-- arrives while it is already up (the client dispatched an event from inside one
+-- of our own calls and a handler walked back round the loop) is pushed onto a
+-- fresh stack instead of nesting.
 function armCurrent()
+    if seqDepth > 0 then return hop(armCurrent) end
+    return sequence(armSequence)
+end
+
+function armSequence()
     while true do
         if not S.active then return end
         if not S.queue or S.idx > #S.queue then
@@ -1335,6 +1442,16 @@ local function onEvidenceTimeout(token)
 end
 
 -- Send the currently armed mail.
+--
+-- CLASS 9, AND WHY THE ORDER IN HERE IS NOT NEGOTIABLE. Every latch this send
+-- needs — the single-flight flag, the token, the evidence snapshot, the ack
+-- ceiling — is armed BEFORE SendMail, because on a client that dispatches an
+-- event from inside the call every one of them has to be already up when the
+-- sequence's own first echo walks past. The sequence latch goes up around the lot
+-- so that anything woken from inside SendMail re-enters the loop on a fresh stack
+-- rather than on top of this frame. And the depth fuse refuses outright past a
+-- nesting this engine does not know how to do: a mail not sent is recoverable, a
+-- run that overflows the stack mid-send is not.
 function fireCurrent()
     local mail = S.queue and S.queue[S.idx]
     if not mail then return end
@@ -1343,15 +1460,24 @@ function fireCurrent()
         abort("mailbox is no longer open")
         return
     end
-    S.awaitingClick = false
-    S.inFlight, S.acked = true, false
-    S.token    = S.token + 1
-    local token = S.token
-    S.evidence = snapshotEvidence(mail)
-    holdSendButton()
-    S.ackTimer = newTimer(ACK_TIMEOUT, function() onAckTimeout(token) end)
-    notifyPanel()
-    SendMail(mail.recipient, mail.subject or ns.MAIL_SUBJECT, "")
+    if seqDepth >= SEQ_MAX then
+        D.depthRefusals = D.depthRefusals + 1
+        say(("refusing to send %s's mail from %d nested client calls (build %s) — stopping so nothing is sent twice.")
+            :format(tostring(mail.recipient), seqDepth, ns.BUILD or ns.VERSION or "?"))
+        abort("the client nested its own events deeper than this engine allows")
+        return
+    end
+    return sequence(function()
+        S.awaitingClick = false
+        S.inFlight, S.acked = true, false
+        S.token    = S.token + 1
+        local token = S.token
+        S.evidence = snapshotEvidence(mail)
+        holdSendButton()
+        S.ackTimer = newTimer(ACK_TIMEOUT, function() onAckTimeout(token) end)
+        notifyPanel()
+        SendMail(mail.recipient, mail.subject or ns.MAIL_SUBJECT, "")
+    end)
 end
 
 -- Step mode: the panel's Send-Next button click.

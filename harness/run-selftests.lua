@@ -29,8 +29,18 @@
 --   MUT      MUTATION TEST of the boon plan builder: twelve one-operator
 --            mutants of boons.lua, every one of which must be killed by the
 --            checks. A survivor is a rule the suite only appears to cover.
+--   C9       SYNCHRONOUS IN-CALL DISPATCH: the stub-completeness check, the
+--            re-entrant send loop (red then green, measured by the sim), the
+--            depth fuse, the composed leg under both postures with call counts,
+--            and auto-friend's pass latch.
+--
+-- THE DISPATCH POSTURE. Every gate below runs under SYNC-IN-CALL dispatch by
+-- default — the client's own posture, where a mutating API runs our handlers
+-- before it returns. run-selftests.cmd runs the whole file a second time with
+-- DASEEKI_DISPATCH=async for the named variant. Both must be green.
 --
 -- Usage:  lua5.1 run-selftests.lua [CONDUIT_DIR]   (exit 0 = ALL PASS)
+--         DASEEKI_DISPATCH=async lua5.1 run-selftests.lua   (the named variant)
 -- =====================================================================
 
 local realprint = print   -- kept before the addon's print is swallowed below
@@ -380,7 +390,15 @@ _G.C_FriendList = {
         if not LIVE then return nil end
         return FRIENDS[i] and { name = FRIENDS[i] } or nil
     end,
-    AddFriend            = function(name) ADDED[#ADDED + 1] = name; FRIENDS[#FRIENDS + 1] = name end,
+    -- CLASS 9. AddFriend does not SCHEDULE the list update it causes: the client
+    -- dispatches FRIENDLIST_UPDATE from inside the call, so every handler in the
+    -- session — including this addon's, which schedules a pass, and with no C_Timer
+    -- here that pass runs INLINE — completes before AddFriend returns. A stub that
+    -- only mutates the array is a kinder client than the one this ships against.
+    AddFriend            = function(name)
+        ADDED[#ADDED + 1] = name; FRIENDS[#FRIENDS + 1] = name
+        fireEvent("FRIENDLIST_UPDATE")
+    end,
     ShowFriends          = function()
         SHOWN = SHOWN + 1
         if SERVER_ANSWERS then
@@ -1000,6 +1018,19 @@ realprint("=== GATE HDR: " .. (V_HDR and "PASS" or "FAIL") .. " ===\n")
 ----------------------------------------------------------------------
 local Sim = assert(loadfile(HARNESS_DIR .. "/mailsim.lua"))()
 local ITEM = 184937
+
+-- ── CLASS 9: THE DISPATCH POSTURE ────────────────────────────────────────────
+--
+-- SYNC-IN-CALL is the default and every gate below runs under it: the container
+-- and mail-form calls the engine makes dispatch their consequent events INSIDE
+-- the call, so a handler that re-enters the calling sequence does so with the
+-- caller's frame still on the stack. `DASEEKI_DISPATCH=async` re-runs the whole
+-- file under the old posture (events one virtual frame later), which is what
+-- run-selftests.cmd does for its second pass. Both postures must be green; a
+-- suite that only passes async is testing the fix and never the hazard.
+Sim.DISPATCH = (os.getenv("DASEEKI_DISPATCH") == "async") and "async" or "sync"
+realprint("=== DISPATCH POSTURE: " .. Sim.DISPATCH:upper() ..
+          (Sim.DISPATCH == "sync" and "-IN-CALL (default)" or " (named variant)") .. " ===\n")
 
 local ENGINE_FILES = { "rules.lua", "migrate.lua", "network.lua", "ledger.lua", "trace.lua",
                        "staging.lua", "boons.lua", "mail.lua" }
@@ -2769,8 +2800,288 @@ local V_LEDGER = (FAILS == LEDGER_BEFORE)
 realprint("=== GATE LEDGER: " .. (V_LEDGER and "PASS" or "FAIL") .. " ===\n")
 
 ----------------------------------------------------------------------
+-- GATE C9: SYNCHRONOUS IN-CALL EVENT DISPATCH
+--
+-- THE LESSON, and why it needed a gate of its own. This client does not always
+-- SCHEDULE the event a mutating API causes: it DISPATCHES it from inside the call,
+-- and every handler in the session runs to completion before the call returns.
+-- Nexus 1.1.8 met that live as a C-stack overflow, and every headless suite in the
+-- suite had passed it, because the simulators echoed AFTER the call — i.e. with
+-- the guard already up. So the posture is now the sim's default (see mailsim.lua)
+-- and this gate holds the four questions that posture asks of a mail runner:
+--
+--   (a) THE STUBS. An absent API is a kinder client: a call the sim does not
+--       implement is a call whose echo never happens, so the sequence's first echo
+--       lands one call later here than it does live. Every client global the send
+--       engine touches must exist after Install.
+--   (b) RE-ENTRANCY. If a send's terminal state can reach the engine from inside
+--       SendMail, does the loop carry on to the next mail with the previous call
+--       still on the stack? RED, then GREEN, measured by the thing being called.
+--   (c) THE FUSE. With the fresh-stack hop disabled, an unforeseen composition
+--       must degrade to a build-stamped REFUSAL, never to an overflow.
+--   (d) THE LEDGER. The outbound ledger exists to stop a re-run over-mailing. Its
+--       stamp must land before the NEXT send goes out, under sync dispatch, with
+--       the whole composed leg — plan, split, attach, send, ledger, verify —
+--       producing the same result and the same call counts under both postures.
+----------------------------------------------------------------------
+local C9_BEFORE = FAILS
+realprint("=== GATE C9: synchronous in-call event dispatch ===")
+do
+    local MAIL_SRC = readFile(P("mail.lua"))
+
+    -- (a) EVERY CLIENT GLOBAL THE ENGINE CALLS HAS A STUB.
+    --
+    -- The list is the send engine's actual call surface (mail.lua + staging.lua +
+    -- the container reads rules.lua makes on their behalf), read off the source
+    -- with comments stripped. C_Item's class/subclass readers and the send-tab
+    -- switch were absent before this gate existed.
+    do
+        local sim = Sim.New(bagsOf({ 10 }))
+        sim:Install(_G)
+        local NEEDED = {
+            "C_Container.GetContainerNumSlots", "C_Container.GetContainerItemInfo",
+            "C_Container.HasContainerItem", "C_Container.GetContainerNumFreeSlots",
+            "C_Container.PickupContainerItem", "C_Container.SplitContainerItem",
+            "C_Item.GetItemInfoInstant", "C_Item.GetItemClassInfo", "C_Item.GetItemSubClassInfo",
+            "C_Timer.After", "C_Timer.NewTimer", "C_Timer.NewTicker",
+            "CursorHasItem", "ClearCursor",
+            "GetSendMailItem", "ClickSendMailItemButton",
+            "SetSendMailMoney", "GetSendMailMoney", "GetMoney", "GetCoinTextureString",
+            "SendMail", "SendMailFrame", "MailFrame",
+            "SendMailNameEditBox", "SendMailSubjectEditBox", "SendMailBodyEditBox",
+            "SendMailMailButton", "MailFrameTab_OnClick", "MailFrameTab2",
+            "StaticPopup_Show", "StaticPopup_Hide", "StaticPopupDialogs",
+            "NUM_BAG_SLOTS", "ATTACHMENTS_MAX_SEND",
+        }
+        local missing = {}
+        for _, name in ipairs(NEEDED) do
+            local head, tail = name:match("^([%w_]+)%.([%w_]+)$")
+            local v
+            if head then v = _G[head] and _G[head][tail] or nil else v = _G[name] end
+            if v == nil then missing[#missing + 1] = name end
+        end
+        ck(#missing == 0, "(a) every client call the engine makes has a stub" ..
+           (#missing > 0 and (" — MISSING: " .. table.concat(missing, ", ")) or ""))
+        -- ...and the ONE deliberate absence is deliberate, and switchable.
+        ck(_G.PickupContainerItem == nil,
+           "(a) the legacy whole-stack global is absent by default (11509 has no such global)")
+        local simL = Sim.New(bagsOf({ 10 }), { legacyPickup = true })
+        simL:Install(_G)
+        ck(type(_G.PickupContainerItem) == "function",
+           "(a) ...and stubbable, so the fallback branch is not dead code here")
+    end
+
+    -- (b) THE RE-ENTRANT SEND LOOP. RED, then GREEN.
+    --
+    -- The fixture: six recipients holding nothing, six full stacks, so every mail
+    -- is a whole-stack attach with nothing to stage — the shortest possible path
+    -- from one terminal state to the next send. `syncAck` resolves each send from
+    -- INSIDE SendMail, which is the composition the fuse exists for.
+    -- (b) and (c) PIN the sync posture rather than inheriting it: they are ABOUT
+    -- in-call dispatch, so they must run identically in the harness's async pass —
+    -- a hazard gate that switches itself off under the other posture is exactly
+    -- the blind spot this whole lesson is named after.
+    local SIX = mesh({ { "T1", 60, 0 }, { "T2", 60, 0 }, { "T3", 60, 0 },
+                       { "T4", 60, 0 }, { "T5", 60, 0 }, { "T6", 60, 0 } })
+    local function sixStacks() return bagsOf({ 10, 10, 10, 10, 10, 10 }) end
+
+    -- RED: the engine as it stood before the sequence latch — no latch, no hop, no
+    -- fuse. The loop is identical in every other respect.
+    do
+        local NO_LATCH = MAIL_SRC
+            :gsub("    if seqDepth > 0 then return hop%(armCurrent%) end\n", "", 1)
+            :gsub("    if seqDepth >= SEQ_MAX then\n", "    if false then\n", 1)
+        local sim = Sim.New(sixStacks(), { syncAck = true, dispatch = "sync" })
+        local n = newEngine(sim, NO_LATCH)
+        chatClear()
+        startRun(n, sim, SIX)
+        sim:Advance(300)
+        ck(#sim.sent == 6, "(b) RED: the pre-latch engine does send all six")
+        ck(sim.maxSendDepth >= 6,
+           ("(b) RED: ...with %d SendMail calls open at once — one per mail, unbounded in the queue")
+               :format(sim.maxSendDepth))
+    end
+
+    -- GREEN: the shipped engine, same fixture, same client.
+    do
+        local sim = Sim.New(sixStacks(), { syncAck = true, dispatch = "sync" })
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, SIX)
+        sim:Advance(300)
+        ck(#sim.sent == 6, "(b) GREEN: all six mails still go out — the latch does not swallow the run")
+        ck(sim.maxSendDepth == 1,
+           ("(b) GREEN: ...never more than one SendMail on the stack (depth %d, RED was 6)")
+               :format(sim.maxSendDepth))
+        ck((sim.violations and #sim.violations or 0) == 0,
+           "(b) GREEN: the one-in-flight invariant holds through the nested dispatch")
+        local D = n.Mail.Diagnostics()
+        ck(D.reentryHops >= 6, "(b) GREEN: every re-entry was pushed onto a fresh stack")
+        ck(D.seqDepth <= 2, "(b) GREEN: the sequence latch never nested past arm+fire")
+        ck(#n.Ledger.Entries() == 6, "(b) GREEN: six confirmed sends, six ledger rows")
+    end
+
+    -- (c) THE DEPTH FUSE. Disable the fresh-stack hop and leave the latch: an
+    --     unforeseen composition must REFUSE with the build stamp rather than nest.
+    do
+        local NO_HOP = MAIL_SRC:gsub(
+            "    if seqDepth > 0 then return hop%(armCurrent%) end\n", "", 1)
+        ck(NO_HOP ~= MAIL_SRC, "(c) the hop is where the reconstruction expects it")
+        local sim = Sim.New(sixStacks(), { syncAck = true, dispatch = "sync" })
+        local n = newEngine(sim, NO_HOP)
+        chatClear()
+        startRun(n, sim, SIX)
+        sim:Advance(300)
+        local D = n.Mail.Diagnostics()
+        ck(D.depthRefusals >= 1, "(c) the fuse refused rather than nesting without bound")
+        ck(sim.maxSendDepth < 6,
+           ("(c) ...so the stack never reached the pre-fix depth (%d)"):format(sim.maxSendDepth))
+        ck(chatFind("nested client calls") ~= nil, "(c) the refusal says so in plain language")
+        ck(chatFind(n.BUILD or "1.2.4") ~= nil, "(c) ...with the build stamped on it")
+        ck(not n.Mail.IsActive(), "(c) ...and the run stopped instead of carrying on")
+    end
+
+    -- (d) THE COMPOSED LEG, BOTH POSTURES, WITH CALL COUNTS.
+    --
+    --   build plan -> stage (split) -> attach -> send -> ledger -> verify
+    --
+    -- Four recipients whose needs are NOT whole stacks, so every mail has to be
+    -- staged bag-to-bag first: the split ladder, the place, the verify, the attach
+    -- and the send all run under whichever posture is in force. The result and the
+    -- CALL COUNTS must be identical to the other posture — a run that splits a
+    -- different number of times under sync dispatch is a run that is doing
+    -- something different, however right the total comes out.
+    local function composedLeg(dispatch)
+        local sim = Sim.New(bagsOf({ 10, 10, 10, 10 }),
+                            { dispatch = dispatch, asyncBags = true, asyncCounts = true })
+        local n = newEngine(sim, nil)
+        chatClear()
+        local roster = mesh({ { "P1", 60, 3 }, { "P2", 60, 4 }, { "P3", 60, 5 }, { "P4", 60, 2 } })
+        -- THE LEDGER'S STAMP ORDERING, WATCHED FROM INSIDE THE SEND. `behaviour`
+        -- runs inside SendMail, so this is a reading of the ledger taken at the
+        -- exact instant mail N+1 leaves — and by then mail N must already be
+        -- recorded, or an interrupted run re-sends what it has already posted.
+        local stampOk, seen = true, 0
+        sim.behaviour = function(idx)
+            local rows = #n.Ledger.Entries()
+            if rows ~= idx - 1 then stampOk = false end
+            seen = seen + 1
+            return "ok"
+        end
+        startRun(n, sim, roster)
+        sim:Advance(600)
+        local units = 0
+        for _, m in ipairs(sim.sent) do units = units + m.units end
+        return {
+            sent = #sim.sent, units = units, ledger = #n.Ledger.Entries(),
+            splits = n.Staging.Diagnostics().splits, staged = n.Staging.Diagnostics().staged,
+            clicks = sim.attachClicks, sendDepth = sim.maxSendDepth,
+            violations = sim.violations and #sim.violations or 0,
+            stampOk = stampOk, sends = seen,
+        }
+    end
+    local SY, AS = composedLeg("sync"), composedLeg("async")
+    ck(SY.sent == 4 and SY.units == 26,
+       ("(d) sync: four mails, 26 boons (7+6+5+8) — got %d/%d"):format(SY.sent, SY.units))
+    ck(SY.ledger == 4, "(d) sync: four ledger rows, one per confirmed send")
+    ck(SY.stampOk, "(d) sync: EVERY send left with the previous mail already in the ledger")
+    ck(SY.violations == 0, "(d) sync: one mail in flight, strictly")
+    ck(SY.sendDepth == 1, "(d) sync: one SendMail on the stack at a time")
+    for _, k in ipairs({ "sent", "units", "ledger", "splits", "staged", "clicks", "sends" }) do
+        ck(SY[k] == AS[k],
+           ("(d) the composed leg agrees across postures: %s  sync=%s async=%s")
+               :format(k, tostring(SY[k]), tostring(AS[k])))
+    end
+    ck(AS.stampOk, "(d) async: the ledger stamp ordering holds under the named variant too")
+
+    -- (e) MAIL_SEND_SUCCESS IS DISPATCHED INSIDE SendMail AND CHANGES NOTHING.
+    --     The engine keys its ack on MAIL_SUCCESS on purpose (see mail.lua's
+    --     header). Under the sync posture the sim now fires the OTHER one from
+    --     inside the call, so "we ignore it" is a tested fact rather than a note.
+    do
+        local sim = Sim.New(bagsOf({ 10 }), { dispatch = "sync", behaviour = function() return "noack" end })
+        local n = newEngine(sim, nil)
+        chatClear()
+        startRun(n, sim, mesh({ { "Solo", 60, 3 } }))
+        sim:Advance(5)
+        ck(#sim.sent == 1, "(e) the mail went out")
+        ck(n.Mail.IsInFlight(),
+           "(e) ...and MAIL_SEND_SUCCESS from inside SendMail did NOT resolve it")
+        sim:Advance(60)
+        ck(not n.Mail.IsActive(), "(e) the ack ceiling still stops the run cleanly")
+        ck(#n.Ledger.Entries() == 0, "(e) an unacknowledged mail writes nothing to the ledger")
+    end
+
+    -- (f) THE OTHER LATCH IN THIS ADDON: auto-friend's pass guard.
+    --
+    -- C_FriendList.AddFriend dispatches FRIENDLIST_UPDATE from inside the call on
+    -- this client family (the stub above now does the same), and this addon's
+    -- handler for that event schedules a pass — which, with no timer service, runs
+    -- INLINE, inside AddFriend. Two questions follow, and the second is the one
+    -- that was open:
+    --   * does the nested pass re-add? No: _running is armed before the first
+    --     AddFriend, which is the right order and always was.
+    --   * can that latch be WEDGED? It could. It was released on the straight-line
+    --     path only, so anything throwing between the arm and the release left
+    --     auto-friend dead for the session with no way back but /reload.
+    do
+        -- The pre-fix shape: the same body, released without a pcall under it.
+        local FSRC = readFile(P("friends.lua"))
+        local RED = FSRC
+            :gsub("    local ok, err = pcall%(function%(%)\n", "    local ok, err = true, nil; (function()\n", 1)
+            :gsub("    end%)\n    Friends._running  = false", "    end)()\n    Friends._running  = false", 1)
+        ck(RED ~= FSRC, "(f) the pcall release is where the reconstruction expects it")
+
+        -- A namespace that borrows the live one's tables (db, Rules, SafeCall) so
+        -- the reconstruction runs against the same world the shipped module does.
+        local function loadRed(src)
+            local rn = setmetatable({}, { __index = ns })
+            assert(loadstring(src, "@as-pre-c9:friends.lua"))(ADDON_NAME, rn)
+            return rn.Friends
+        end
+
+        local function drivePass(mod)
+            mod._listConfirmed, mod._requested, mod._passDone, mod._running = true, true, false, false
+            local realPlan = mod.Plan
+            mod.Plan = function() error("the client threw while the pass was planning") end
+            pcall(mod.RunPass)
+            mod.Plan = realPlan
+            return mod._running
+        end
+
+        armList()
+        ck(drivePass(loadRed(RED)) == true,
+           "(f) RED: a pass that throws leaves the latch UP — auto-friend dead until /reload")
+        ck(drivePass(loadRed(FSRC)) == false,
+           "(f) GREEN: the shipped release is unconditional, so the latch comes back down")
+
+        -- ...and the shipped module still refuses the pass its own AddFriend wakes.
+        local addsBefore = #ADDED
+        F._listConfirmed, F._requested, F._passDone, F._running = true, true, false, false
+        clearFriends()
+        LIVE = true
+        chatClear()
+        ns:SafeCall(F.RunPass)
+        local wave, dupes = {}, 0
+        for i = addsBefore + 1, #ADDED do
+            local nm = ADDED[i]
+            if wave[nm] then dupes = dupes + 1 end
+            wave[nm] = true
+        end
+        ck((#ADDED - addsBefore) >= 1,
+           "(f) the pass added at least one recipient through the in-call stub")
+        ck(dupes == 0,
+           "(f) ...and no recipient was added twice by the pass FRIENDLIST_UPDATE woke inside AddFriend")
+        ck(F._running == false, "(f) ...with the latch released on the way out")
+        F._passDone = true
+    end
+end
+local V_C9 = (FAILS == C9_BEFORE)
+realprint("=== GATE C9: " .. (V_C9 and "PASS" or "FAIL") .. " ===\n")
+
+----------------------------------------------------------------------
 realprint("############################################################")
-realprint("# Daseeki-Conduit self-tests")
+realprint("# Daseeki-Conduit self-tests   [dispatch: " .. Sim.DISPATCH .. "]")
 realprint("#   GATE 0      toc parse             : PASS")
 realprint("#   GATE FW     clean-room firewall   : PASS")
 realprint("#   GATE SUITES shipped pure suites   : PASS")
@@ -2784,6 +3095,7 @@ realprint("#   GATE RUN    hands-free state machine : " .. (V_RUN and "PASS" or 
 realprint("#   GATE SETTLE attach vs bag settlement : " .. (V_SETTLE and "PASS" or "FAIL"))
 realprint("#   GATE TRACE  attach trace + measured-0 : " .. (V_TRACE and "PASS" or "FAIL"))
 realprint("#   GATE LEDGER outbound ledger rules : " .. (V_LEDGER and "PASS" or "FAIL"))
+realprint("#   GATE C9     sync in-call dispatch : " .. (V_C9 and "PASS" or "FAIL"))
 realprint("#")
 realprint("#   RESULT: " .. (FAILS == 0 and "ALL PASS" or (FAILS .. " FAILURE(S) — RED")))
 realprint("############################################################")

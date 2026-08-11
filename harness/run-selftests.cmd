@@ -18,5 +18,14 @@ if not exist "%LUA%" (
 )
 set CDTDIR=%~1
 if "%CDTDIR%"=="" set CDTDIR=%HERE%..
+REM CLASS 9: the suite is run under BOTH dispatch postures. Sync-in-call is the
+REM default (the client dispatches a mutation's events from inside the call);
+REM async is the named variant (events one frame later). A suite that is only
+REM green under async is testing the fix and never the hazard, so both must pass.
+set DASEEKI_DISPATCH=
 "%LUA%" "%HERE%run-selftests.lua" "%CDTDIR%"
+if errorlevel 1 exit /b %ERRORLEVEL%
+set DASEEKI_DISPATCH=async
+"%LUA%" "%HERE%run-selftests.lua" "%CDTDIR%"
+set DASEEKI_DISPATCH=
 exit /b %ERRORLEVEL%
