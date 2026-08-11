@@ -45,11 +45,38 @@
 --     deterministically and instantly;
 --   * Blizzard's habit of re-enabling its own Send button mid-send.
 --
+-- ── CLASS 9: THE DISPATCH POSTURE IS SYNCHRONOUS-IN-CALL BY DEFAULT ──────────
+--
+-- The 11509 client does not always SCHEDULE the event a mutating API causes: it
+-- DISPATCHES it from inside the call, and every handler registered by every addon
+-- in the session runs to completion before the call returns. Nexus 1.1.8 proved
+-- that live with a C-stack overflow on a trade-skill filter setter, and proved
+-- something worse alongside it: every headless suite passed, because the sims
+-- echoed AFTER the setter returned — i.e. with the guard already up. A sim that
+-- echoes at all is not unkind enough; WHEN it echoes is the whole question.
+--
+-- So `dispatch` defaults to "sync": PickupContainerItem, SplitContainerItem,
+-- ClearCursor and ClickSendMailItemButton run our handlers INSIDE the call, and
+-- SendMail dispatches the client-side MAIL_SEND_SUCCESS inside the call too.
+-- `dispatch = "async"` is retained as a NAMED VARIANT (the old posture, one frame
+-- later) and both are run by the harness. M.DISPATCH is the per-process default so
+-- the whole suite can be re-run under the other posture without touching fixtures.
+--
+-- `syncAck` goes one step further, for the composition gate only: the whole
+-- terminal state of a send (the form emptying, MAIL_SUCCESS) is dispatched inside
+-- SendMail, which is what turns the send loop into a recursion if nothing under it
+-- refuses depth. A real server cannot answer inside the call; this models the
+-- worst composition the fix has to survive, not a claim about the client.
+--
 -- Nothing here is shipped: the .toc does not list it.
 -- =====================================================================
 
 local M = {}
 M.__index = M
+
+-- Per-process default dispatch posture. "sync" is the doctrine default; the
+-- harness flips it to "async" for the named-variant pass.
+M.DISPATCH = "sync"
 
 local STACK_MAX = 10   -- Chronoboon Displacer; the only stackable in these fixtures
 
@@ -103,6 +130,20 @@ function M.New(layout, opts)
         events = {},
         buttonEnabled = true,
         disableCalls = 0, enableCalls = 0,
+        -- CLASS 9. "sync" = consequent events dispatch INSIDE the mutating call.
+        dispatch = opts.dispatch or M.DISPATCH or "sync",
+        syncAck  = opts.syncAck,        -- the composition gate's worst case
+        -- The legacy whole-stack global. Absent on 11509 (and therefore absent
+        -- here by default), but an absent API is a KINDER client, so the fallback
+        -- path gets a stub a gate can switch on deliberately.
+        legacyPickup = opts.legacyPickup,
+        echoDepth = 0, maxEchoDepth = 0,
+        -- THE EXTERNAL WITNESS FOR CLASS 9. How many SendMail calls were on the
+        -- stack at once? One is the contract. More than one means the engine
+        -- carried on to the next mail with the previous mail's call still open,
+        -- which is the shape that overflows a C stack on a long queue. Counted by
+        -- the thing being called, so no instrumentation of the engine is needed.
+        sendDepth = 0, maxSendDepth = 0,
     }, M)
     for bag, b in pairs(layout or {}) do
         local nb = { size = b.size or 16 }
@@ -370,6 +411,37 @@ function M:Fire(event, ...)
     for i = 1, #l do l[i](event, ...) end
 end
 
+-- THE CONSEQUENT EVENTS OF A CLIENT MUTATION (Class 9).
+--
+-- Under the default `sync` posture these run to completion INSIDE the API call
+-- that caused them, exactly as interface 11509 dispatches them, so a handler that
+-- re-enters the calling sequence does so with the caller's frame still on the
+-- stack. Under `async` they land one virtual frame later — the posture every
+-- headless suite in this suite used to assume, kept as a named variant so a
+-- regression can be told apart from a posture difference.
+--
+-- The echo depth is recorded, because "how deep did our own handlers nest inside
+-- one client call" is the number the Nexus overflow was made of.
+function M:Echo(...)
+    if self.dispatch == "async" then
+        local args = { n = select("#", ...), ... }
+        self:schedule(0, function() self:Fire(unpack(args, 1, args.n)) end)
+        return
+    end
+    self.echoDepth = self.echoDepth + 1
+    if self.echoDepth > self.maxEchoDepth then self.maxEchoDepth = self.echoDepth end
+    local ok, err = pcall(self.Fire, self, ...)
+    self.echoDepth = self.echoDepth - 1
+    if not ok then error(err, 0) end
+end
+
+-- Every consequent of a container mutation, in the client's order: the lock state
+-- first, then the bag contents.
+function M:EchoBags()
+    self:Echo("ITEM_LOCK_CHANGED")
+    self:Echo("BAG_UPDATE")
+end
+
 -- ── install the WoW surface ───────────────────────────────────────────────────
 function M:Install(G)
     local sim = self
@@ -409,10 +481,12 @@ function M:Install(G)
                     b[slot], sim.cursor = { itemID = c.itemID, count = c.count }, s
                     sim:commitCursor(c)
                 end
+                sim:EchoBags()
                 return
             end
             if not s then return end
             sim:takeToCursor(bag, slot, s.count)
+            sim:EchoBags()
         end,
         SplitContainerItem = function(bag, slot, n)
             local b = sim.bags[bag]; local s = b and b[slot]
@@ -433,7 +507,10 @@ function M:Install(G)
                     -- may vanish, or the conservation check below means nothing.
                     if not sim.cursor then sim.cursor = { itemID = id, count = moved }
                     else sim:returnToBags({ itemID = id, count = moved }) end
+                    sim:Fire("ITEM_LOCK_CHANGED")
+                    sim:Fire("BAG_UPDATE")
                 end)
+                sim:EchoBags()
                 return
             end
             if not s or sim.cursor then return end
@@ -441,15 +518,44 @@ function M:Install(G)
             -- was asked for is the whole reason the engine verifies at all.
             if sim.poison then n = sim.poison(bag, slot, n, s.count) or n end
             sim:takeToCursor(bag, slot, n)
+            sim:EchoBags()
         end,
     }
     -- A client with no partial-stack API at all. This is the condition the pre-fix
     -- attach had a whole-stack fallback for, and the fallback was the bug.
     if sim.noSplit then G.C_Container.SplitContainerItem = nil end
 
-    G.C_Item = { GetItemInfoInstant = function(id) return id, nil, nil, nil, nil, 0, 0 end }
+    -- THE LEGACY WHOLE-STACK GLOBAL. mail.lua's pickupWhole falls back to it when
+    -- C_Container.PickupContainerItem delivers nothing, and 11509 does not have it
+    -- — so it is absent here by default, which is FAITHFUL. It is stubbable on
+    -- purpose (`legacyPickup`) because an absent API is a kinder client: with no
+    -- stub the fallback branch never runs and never dispatches, so the sequence's
+    -- echo happens one call later here than on a client that does have it.
+    if sim.legacyPickup then
+        G.PickupContainerItem = function(bag, slot)
+            local b = sim.bags[bag]; local s = b and b[slot]
+            if sim:isLocked(bag, slot) or sim.cursor or not s then return end
+            sim:takeToCursor(bag, slot, s.count)
+            sim:EchoBags()
+        end
+    else
+        G.PickupContainerItem = nil
+    end
+
+    G.C_Item = {
+        GetItemInfoInstant = function(id) return id, nil, nil, nil, nil, 0, 0 end,
+        -- rules.lua reads both of these when it renders a class filter. Absent, they
+        -- were simply nil-guarded away; stubbed, that code path actually runs.
+        GetItemClassInfo    = function(c) return "Class" .. tostring(c) end,
+        GetItemSubClassInfo = function(c, s) return "Sub" .. tostring(c) .. "." .. tostring(s) end,
+    }
     G.NUM_BAG_SLOTS = 4
     G.ATTACHMENTS_MAX_SEND = sim.MAXATT
+
+    -- THE SEND-TAB SWITCH. mail.lua's ensureSendTab calls these when SendMailFrame
+    -- is not already shown; unstubbed, the whole branch was dead in the harness.
+    G.MailFrameTab2 = { _tab = 2 }
+    G.MailFrameTab_OnClick = function() sim.tabClicks = (sim.tabClicks or 0) + 1 end
 
     G.CursorHasItem = function() return sim.cursor ~= nil end
     -- Putting something BACK in the bags is itself a container operation, so it
@@ -465,6 +571,12 @@ function M:Install(G)
             if c.commit then c.commit, c.commitAll = nil, nil
             else sim:returnToBags(c) end
             sim:disturbBags(nil)
+            -- CLASS 9. Putting the cursor down is a container mutation like any
+            -- other, and on this client family its lock/bag events run our own
+            -- handlers before ClearCursor returns. That matters more here than
+            -- anywhere: mail.lua's settle PREDICATE calls ClearCursor, so this is
+            -- the echo that re-enters a predicate from inside itself.
+            sim:EchoBags()
         end
     end
 
@@ -496,6 +608,7 @@ function M:Install(G)
                 if a.commit then a.commit, a.commitAll = nil, nil   -- never left the bags
                 else sim:returnToBags(a) end
                 sim:disturbBags(nil)
+                sim:EchoBags()
             end
             return
         end
@@ -524,7 +637,7 @@ function M:Install(G)
             local a = sim.attach[i]
             if a then sim.attach[i] = nil; sim.cursor = a end
         end
-        sim:Fire("BAG_UPDATE")
+        sim:EchoBags()
     end
     G.SetSendMailMoney = function(c)
         if not sim.mailboxOpen then error("mailbox closed: SetSendMailMoney") end
@@ -569,7 +682,15 @@ function M:Install(G)
 
     -- SendMail. Consumes the form (the client clears the attachment slots on a
     -- successful send), then answers on the clock according to `behaviour`.
+    local rawSendMail
     G.SendMail = function(recipient, subject, body)
+        sim.sendDepth = sim.sendDepth + 1
+        if sim.sendDepth > sim.maxSendDepth then sim.maxSendDepth = sim.sendDepth end
+        local okS, errS = pcall(rawSendMail, recipient, subject, body)
+        sim.sendDepth = sim.sendDepth - 1
+        if not okS then error(errS, 0) end
+    end
+    rawSendMail = function(recipient, subject, body)
         if not sim.mailboxOpen then error("mailbox closed: SendMail") end
         -- THE ONE-IN-FLIGHT INVARIANT, checked by the thing being mailed rather
         -- than by the thing doing the mailing: a second SendMail may not arrive
@@ -590,6 +711,13 @@ function M:Install(G)
         local mode = sim.behaviour(idx, rec) or "ok"
         rec.mode = mode
 
+        -- CLASS 9. MAIL_SEND_SUCCESS is the CLIENT's "the packet is away", and on
+        -- this client family it dispatches from inside SendMail — before the server
+        -- has said anything at all. The engine deliberately keys its ack on
+        -- MAIL_SUCCESS instead (see mail.lua's header); firing this here is what
+        -- turns "we ignore it" from a comment into a tested fact.
+        sim:Echo("MAIL_SEND_SUCCESS")
+
         -- Blizzard re-enables its own Send button on its internal frame updates
         -- while a send is in flight. If the engine does not re-assert the disable,
         -- this is what leaves it clickable mid-run.
@@ -606,7 +734,7 @@ function M:Install(G)
 
         -- The mail leaves: the form empties and the money goes.
         local consumed = rec.units
-        sim:schedule(sim.latency, function()
+        local terminal = function()
             sim.unresolved = sim.unresolved - 1
             if mode ~= "noevidence" then
                 for i = 1, sim.MAXATT do
@@ -628,8 +756,24 @@ function M:Install(G)
             if mode ~= "noevidence" then sim:disturbBags(nil) end
             sim:Fire("MAIL_SUCCESS")
             if mode ~= "noevidence" then sim:Fire("PLAYER_MONEY") end
-        end)
+        end
+        -- THE WORST COMPOSITION (`syncAck`, composition gate only). A real server
+        -- cannot answer inside the call — but a client that resolved a send from
+        -- inside SendMail would make the whole send loop re-enter itself: ack ->
+        -- confirm -> ledger -> advance -> arm -> attach -> fire -> SendMail, N deep
+        -- for an N-mail queue, with the first SendMail's frame still on the stack.
+        -- That is the Nexus overflow shape applied to this engine, and it is what
+        -- the depth fuse under fireCurrent has to refuse.
         rec.consumed = consumed
+        if sim.syncAck and sim.dispatch ~= "async" then
+            sim.echoDepth = sim.echoDepth + 1
+            if sim.echoDepth > sim.maxEchoDepth then sim.maxEchoDepth = sim.echoDepth end
+            local okT, errT = pcall(terminal)
+            sim.echoDepth = sim.echoDepth - 1
+            if not okT then error(errT, 0) end
+        else
+            sim:schedule(sim.latency, terminal)
+        end
     end
 
     G.StaticPopupDialogs = G.StaticPopupDialogs or {}

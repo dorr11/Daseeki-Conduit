@@ -630,34 +630,53 @@ function Friends.RunPass()
         maxFriends    = cap,
     }
 
+    -- THE LATCH IS ARMED BEFORE THE FIRST CLIENT CALL, AND RELEASED WHATEVER
+    -- HAPPENS (client-async lesson class 9).
+    --
+    -- C_FriendList.AddFriend can dispatch FRIENDLIST_UPDATE from inside the call on
+    -- this client family, and the handler for that event schedules a pass — so the
+    -- latch has to be up before the first AddFriend, which it is. What it also has
+    -- to be is impossible to WEDGE: a latch released on the straight-line path only
+    -- stays up forever if anything between here and there throws, and auto-friend
+    -- would then be dead for the session with no way back but /reload. So the body
+    -- runs under pcall and the release is unconditional, with the error still
+    -- surfaced rather than swallowed.
     Friends._running = true
-    local dir  = Friends.MergeDirectories(Friends.Directory(), Friends.remote)
-
-    -- Before the first plan of the first confirmed pass, and once per save.
-    ns:SafeCall(healLegacyMarkers, ctx, dir)
-
-    local seen = Friends.Seen()
-    local plan = Friends.Plan(dir, ctx)
-
-    local now = (time and time()) or 0
     local added, capped = {}, nil
-    for _, step in ipairs(plan) do
-        if step.action == "add" then
-            ns:SafeCall(C.AddFriend, step.entry.name)
-            ctx.marked[step.key] = true
-            added[#added + 1] = step.entry.name
-        elseif step.action == "mark" then
-            -- ON THE LIST, WITH OUR KNOWLEDGE. Both facts are written: the marker
-            -- (never re-add) and the sighting (so a later disappearance is
-            -- readable as the owner's own choice and not a failed add).
-            ctx.marked[step.key] = true
-            if not seen[step.key] then seen[step.key] = now end
-        elseif step.action == "cap" and not capped then
-            capped = step.entry.name
+    local ok, err = pcall(function()
+        local dir = Friends.MergeDirectories(Friends.Directory(), Friends.remote)
+
+        -- Before the first plan of the first confirmed pass, and once per save.
+        ns:SafeCall(healLegacyMarkers, ctx, dir)
+
+        local seen = Friends.Seen()
+        local plan = Friends.Plan(dir, ctx)
+
+        local now = (time and time()) or 0
+        for _, step in ipairs(plan) do
+            if step.action == "add" then
+                -- THE MARKER IS WRITTEN BEFORE THE CALL, not after. On a client that
+                -- dispatches FRIENDLIST_UPDATE from inside AddFriend, a marker set
+                -- afterwards is set too late for anything the call itself wakes; the
+                -- _running latch refuses a nested pass anyway, and this makes the
+                -- ordering correct rather than merely covered.
+                ctx.marked[step.key] = true
+                added[#added + 1] = step.entry.name
+                ns:SafeCall(C.AddFriend, step.entry.name)
+            elseif step.action == "mark" then
+                -- ON THE LIST, WITH OUR KNOWLEDGE. Both facts are written: the marker
+                -- (never re-add) and the sighting (so a later disappearance is
+                -- readable as the owner's own choice and not a failed add).
+                ctx.marked[step.key] = true
+                if not seen[step.key] then seen[step.key] = now end
+            elseif step.action == "cap" and not capped then
+                capped = step.entry.name
+            end
         end
-    end
+    end)
     Friends._running  = false
     Friends._passDone = true
+    if not ok then geterrorhandler()(err) end
 
     -- ONE FOLLOW-UP after a pass that added anybody, so the adds we just made are
     -- SEEN on the next confirmed read and stop being ambiguous. A pass that adds

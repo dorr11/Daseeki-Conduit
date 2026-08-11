@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+- **A long mail run can no longer stack the game up on itself.** The game does not
+  always finish an action before telling everyone that it happened: for some calls it
+  hands out the news from inside the call, so every addon listening reacts while the
+  original action is still half-done. Conduit's send loop starts the next mail the
+  moment the last one lands, so on a client that behaves that way an eight-mail boon
+  run could end up with eight mails' worth of work piled on top of each other, and a
+  forty-mail run with forty. That is exactly how another Daseeki addon crashed live
+  this week. Conduit now steps off that pile: when it is woken from inside one of its
+  own calls it starts the next mail on a fresh, clean footing instead of on top of the
+  last one. Every mail still goes out, in the same order, one at a time. And if
+  something ever nests deeper than the engine knows how to handle, it now stops and
+  says so — naming the build — rather than sending from a place it does not
+  understand.
+
+- **The outbound ledger's stamp is now proved to land before the next mail leaves.**
+  The ledger is what stops an interrupted run posting the same boons twice when you
+  run it again. It has always been written the moment a mail is confirmed, before the
+  next one is armed; that ordering is now pinned by a test that reads the ledger from
+  *inside* the send of the following mail, under the harsher event timing above.
+
+- **Auto-friend can no longer be knocked out for the rest of the session.** While a
+  friend-adding pass is running, a flag stops a second pass starting on top of it. If
+  anything went wrong mid-pass, that flag stayed up and auto-friend quietly did
+  nothing more until you reloaded. The flag now always comes back down, and the error
+  is still reported.
+
 ## 1.2.4 — 2026-08-08
 
 - **The one-time Raid Prep import is no longer spent on a login that imported

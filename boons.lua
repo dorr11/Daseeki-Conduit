@@ -780,6 +780,21 @@ function Boons.Debug(arg)
         -- why the bag subtraction is no longer the send guard's authority.
         ns:Print(("  attaches where the bags did not move: %d (this client keeps them until the mail goes)")
             :format(d.bagsRetained))
+        -- IN-CALL DISPATCH. Printed only when this client actually did it, because a
+        -- run of zeroes here is the ordinary case and a line about nothing having
+        -- happened is noise. A non-zero `hops` says the client resolved something
+        -- from INSIDE the call that caused it and the engine stepped off that stack
+        -- rather than building on it; a non-zero `refused` says a composition went
+        -- deeper than this engine will go and a mail was deliberately not sent.
+        if (d.reentryHops or 0) > 0 or (d.depthRefusals or 0) > 0
+           or (d.waitersDisplaced or 0) > 0 or (d.lateWaiters or 0) > 0 then
+            ns:Print(("  in-call dispatch: %d re-entry hop(s), deepest nesting %d, %d send(s) refused by the depth fuse")
+                :format(d.reentryHops, d.seqDepth, d.depthRefusals))
+            if (d.waitersDisplaced or 0) > 0 or (d.lateWaiters or 0) > 0 then
+                ns:Print(("  settle waits: %d displaced, %d released out of turn")
+                    :format(d.waitersDisplaced, d.lateWaiters))
+            end
+        end
     end
 
     -- PRE-SPLIT STAGING. Exact amounts are made in the bags before anything is
