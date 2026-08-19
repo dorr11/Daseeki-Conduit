@@ -1509,9 +1509,14 @@ local function confirmSend()
     -- snapshot against, and the entry can only ever retire on the 30-day expiry —
     -- so it is passed through here rather than re-derived from a world that has
     -- moved on since the plan was made.
+    -- `baseAt` travels with it for the same reason and one more: the baseline the
+    -- plan was built from can be WRONG (the snapshot lags, and a top-up goes to
+    -- the characters whose snapshot is most likely to over-state them). Dating it
+    -- is what lets the ledger replace it with a better pre-send reading instead of
+    -- holding the row for thirty days against a total that can never be reached.
     if mail and ns.Ledger and mail.itemID and units > 0 then
         ns:SafeCall(function()
-            ns.Ledger.Record(mail.recipient, mail.itemID, units, nil, mail.base)
+            ns.Ledger.Record(mail.recipient, mail.itemID, units, nil, mail.base, mail.baseAt)
         end)
     end
 

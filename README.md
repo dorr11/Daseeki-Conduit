@@ -65,6 +65,10 @@ click at any open mailbox — no more manual alt-shuffling.
 
 - Open a mailbox → the **Conduit** panel appears beside it.
 - Configure rules in the Daseeki hub: `/conduit settings` (or `/cdt`).
+- `/conduit transit` lists every boon already in the post with the age of each;
+  `/conduit transit clear <character|all>` drops rows that are plainly wrong. Rows
+  retire by themselves when the mesh sees the boons land, when the recipient has
+  been seen a day later with no sign of them, or at Blizzard's 30-day mail expiry.
 - `/conduit debug selftest` runs the built-in rule/batch/gold self-tests.
 - `/conduit debug friends` shows what auto-friend would do on this character.
 - `/conduit debug boons` shows the boon plan, the outbound ledger with ages, and

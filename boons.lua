@@ -127,6 +127,25 @@ function Boons.FormatAge(secs)
     return ("%dd"):format(math.floor(n / 86400))
 end
 
+-- "has 3, 2 in transit" — and, once that mail is older than it has any business
+-- being, "has 1, 5 in transit (46h)".
+--
+-- THE AGE IS THE WHOLE POINT (CDT-5). A number with no age reads as a mail on its
+-- way, and the owner has no way to tell it from a mail that landed two days ago
+-- and left a row that will not clear. An hour is the threshold because an hour is
+-- Blizzard's worst-case delay between unconnected accounts: below it there is
+-- nothing to report, above it the reader is entitled to wonder. The bound is read
+-- off the ledger so the sentence and the retirement rules can never drift apart.
+function Boons.TransitBit(have, transit, age)
+    local n = tonumber(age)
+    local floor = (ns.Ledger and tonumber(ns.Ledger.DELIVERY_FLOOR)) or 3600
+    if n and n > floor then
+        return ("has %d, %d in transit (%s)")
+            :format(have, transit, Boons.FormatAge(n) or "?")
+    end
+    return ("has %d, %d in transit"):format(have, transit)
+end
+
 -- Is there any mesh inventory data at all to plan from? One owner carrying an
 -- itemCounts map is enough; none at all means Nexus is absent, disabled, or has
 -- never scanned, and the feature degrades to a hint rather than to a plan that
@@ -184,6 +203,9 @@ function Boons.BuildPlan(entries, opts)
     local srcName  = baseLower(opts.source)
     local srcSide  = faction(opts.faction)
     local inFlight = (type(opts.inFlight) == "table") and opts.inFlight or {}
+    -- How old the OLDEST in-transit row for each character is. Optional: a caller
+    -- that does not pass it gets exactly the plan it got before, with no ages.
+    local transitAge = (type(opts.inFlightAge) == "table") and opts.inFlightAge or {}
 
     local plan = {
         targets = {}, skipped = {},
@@ -217,13 +239,14 @@ function Boons.BuildPlan(entries, opts)
                 local transit = count(inFlight[lower])
                 local owned   = have + transit
                 local need    = target - owned
+                local tAge    = (transit > 0) and tonumber(transitAge[lower]) or nil
                 if need <= 0 then
                     -- A character whose pocket is only full because of a mail still
                     -- in the post says so, in as many words: "has 9, 1 in transit"
                     -- is the difference between a plan that is finished and a plan
                     -- that is about to send a second copy.
                     skip(e.name, "stocked",
-                         (transit > 0) and ("has %d, %d in transit"):format(have, transit)
+                         (transit > 0) and Boons.TransitBit(have, transit, tAge)
                                         or  ("has %d"):format(have))
                 else
                     local at  = tonumber(e.countsAt)
@@ -233,6 +256,10 @@ function Boons.BuildPlan(entries, opts)
                         faction = side, level = lvl,
                         have = have, inTransit = transit, need = need, send = 0,
                         age = age, ageText = Boons.FormatAge(age),
+                        transitAge = tAge, transitAgeText = Boons.FormatAge(tAge),
+                        -- Carried so BuildQueue can stamp the baseline WITH the
+                        -- clock it was true on (ledger.lua's `baseAt`).
+                        scanAt = tonumber(e.scanAt) or at,
                         hasData = (type(e.counts) == "table") or nil,
                     }
                     plan.totalNeed = plan.totalNeed + need
@@ -342,6 +369,12 @@ function Boons.BuildQueue(plan, stacks, opts)
                 -- record NO baseline, and count() would fabricate a zero — which is
                 -- the most dangerous baseline there is (every snapshot beats it).
                 base = tonumber(t.have),
+                -- WHEN THAT BASELINE WAS TRUE (CDT-5). The scan clock of the row
+                -- the plan read, not the moment the row reached us. A baseline
+                -- with no date cannot be corrected by a better pre-send reading
+                -- later, and correcting it is what stops a lagging snapshot from
+                -- naming a total the recipient can never reach.
+                baseAt = tonumber(t.scanAt),
             }
         end
     end
@@ -427,7 +460,7 @@ end
 -- cannot correct, and "in transit" is the whole reason a target is asking for less.
 local function haveBit(t)
     if (t.inTransit or 0) > 0 then
-        return ("has %d, %d in transit"):format(t.have, t.inTransit)
+        return Boons.TransitBit(t.have, t.inTransit, t.transitAge)
     end
     return ("has %d"):format(t.have)
 end
@@ -567,12 +600,21 @@ end
 -- What the mesh has SEEN of each character's boon count, and when. This is the
 -- evidence the outbound ledger retires entries against: a snapshot taken AFTER a
 -- send, showing at least what we posted, means the mail arrived.
+-- BOTH CLOCKS TRAVEL (CDT-5). `at` is when we took delivery of the row and is what
+-- the ages in the preview are measured from; `scanAt` is when the count was
+-- actually true, and it is the only one the ledger's ordering-against-a-send may
+-- use. Passing only `at` is what let a row re-stamped after a send, carrying a
+-- payload read before it, look like a sighting of the delivery.
 function Boons.MeshSnapshot(entries, itemID)
     itemID = itemID or Boons.ITEM_ID
     local out = {}
     for _, e in ipairs((type(entries) == "table") and entries or {}) do
         if type(e) == "table" and type(e.name) == "string" and e.name ~= "" then
-            out[baseLower(e.name)] = { count = held(e, itemID), at = tonumber(e.countsAt) }
+            out[baseLower(e.name)] = {
+                count  = held(e, itemID),
+                at     = tonumber(e.countsAt),
+                scanAt = tonumber(e.scanAt) or tonumber(e.countsAt),
+            }
         end
     end
     return out
@@ -594,17 +636,18 @@ function Boons.Plan()
     local stacks  = Boons.ScanStacks()
     local now     = (time and time()) or nil
 
-    local inFlight = nil
+    local inFlight, transitAge = nil, nil
     if ns.Ledger then
         ns.Ledger.Sweep(Boons.MeshSnapshot(entries, Boons.ITEM_ID), now)
-        inFlight = ns.Ledger.InFlight(ns.Ledger.Entries(), Boons.ITEM_ID, now)
+        local f, _total, a = ns.Ledger.InFlight(ns.Ledger.Entries(), Boons.ITEM_ID, now)
+        inFlight, transitAge = f, a
     end
 
     local plan = Boons.BuildPlan(entries, {
         source  = src, faction = side,
         stock   = Boons.CountStock(stacks, Boons.ITEM_ID),
         target  = Boons.TARGET, minLevel = Boons.MIN_LEVEL, itemID = Boons.ITEM_ID,
-        inFlight = inFlight,
+        inFlight = inFlight, inFlightAge = transitAge,
         now     = now,
     })
     return plan, stacks
@@ -698,6 +741,70 @@ function Boons.Run()
     })
 end
 
+-- ── /conduit transit  [clear <char|all>] ─────────────────────────────────────
+--
+-- THE OUTBOUND LEDGER, IN THE OPEN, AND A WAY OUT OF IT.
+--
+-- Every automatic retirement in ledger.lua needs the mesh to deliver something: a
+-- pre-send count to re-baseline against, a post-send count to prove the delivery,
+-- a sighting of the recipient to license the presumption. When the relay between
+-- accounts stalls — and it has — none of those arrive, the ledger is
+-- correct-but-stuck, and the owner watches top-ups get suppressed by mails that
+-- landed days ago with no way to say so. The listing shows every row and its age;
+-- the clear is the escape hatch that depends on nothing.
+--
+-- It is deliberately NOT hidden behind `debug`. `/conduit debug boons clear` has
+-- existed since 1.2.4 and drops the WHOLE ledger, which is a blunt instrument
+-- filed under a word that reads as "not for you".
+function Boons.Transit(arg)
+    local rest = (type(arg) == "string") and arg:match("^%s*(.-)%s*$") or ""
+    local verb, who = rest:match("^(%S*)%s*(.-)$")
+    verb = (verb or ""):lower()
+
+    if not ns.Ledger then
+        ns:Print("the outbound ledger is not loaded.")
+        return
+    end
+
+    if verb == "clear" then
+        who = (who or ""):match("^%s*(.-)%s*$")
+        if who == "" then
+            ns:Print("usage: /conduit transit clear <character|all>")
+            return
+        end
+        if who:lower() == "all" then
+            local n = ns.Ledger.Clear()
+            ns:Print(("in-transit ledger cleared — %d row(s) dropped. Every character is now"
+                      .. " planned from the mesh count alone."):format(n))
+        else
+            local gone, units = ns.Ledger.ClearFor(who)
+            if gone == 0 then
+                ns:Print(("nothing in transit to %s."):format(who))
+            else
+                ns:Print(("cleared %d in-transit row(s) for %s — %d %s no longer counted"
+                          .. " against their top-up."):format(gone, who, units, Boons.ITEM_NAME))
+            end
+        end
+        if ns.Panel and ns.Panel.Refresh then ns:SafeCall(ns.Panel.Refresh) end
+        return
+    end
+
+    local now  = (time and time()) or 0
+    local rows = ns.Ledger.Describe(ns.Ledger.Entries(), now, Boons.FormatAge)
+    if #rows == 0 then
+        ns:Print("nothing in transit — the outbound ledger is empty.")
+        return
+    end
+    local _, total = ns.Ledger.InFlight(ns.Ledger.Entries(), nil, now)
+    ns:Print(("in transit: %d row(s), %d unit(s) held against future top-ups")
+        :format(#rows, total))
+    for _, line in ipairs(rows) do ns:Print("  " .. line) end
+    ns:Print(("  a row retires when the mesh sees the goods arrive, when the recipient has"
+              .. " been seen %s after the send with no sign of them, or at Blizzard's 30-day"
+              .. " expiry."):format(Boons.FormatAge(ns.Ledger.PRESUMED_AFTER) or "a day"))
+    ns:Print("  /conduit transit clear <character|all> drops rows that are plainly wrong.")
+end
+
 -- ── /conduit debug boons ─────────────────────────────────────────────────────
 --
 -- What the planner currently believes, and WHY — the plan, and the outbound ledger
@@ -745,7 +852,8 @@ function Boons.Debug(arg)
         if #rows == 0 then
             ns:Print("outbound ledger: empty (nothing in the post).")
         else
-            ns:Print(("outbound ledger (%d in transit; /conduit debug boons clear to drop):"):format(#rows))
+            ns:Print(("outbound ledger (%d in transit; /conduit transit clear <char|all> to drop):")
+                :format(#rows))
             for _, line in ipairs(rows) do ns:Print("  " .. line) end
         end
     end
@@ -754,9 +862,11 @@ function Boons.Debug(arg)
     ns:Print(("plan: %d target(s), %d to send, stock %d, shortfall %d")
         :format(#plan.targets, plan.totalSend, plan.stock, plan.shortfall))
     for _, t in ipairs(plan.targets) do
-        ns:Print(("  %s  <-  %d of %d  (has %d%s)")
-            :format(t.name, t.send, t.need, t.have,
-                    (t.inTransit or 0) > 0 and (", " .. t.inTransit .. " in transit") or ""))
+        ns:Print(("  %s  <-  %d of %d  (%s)")
+            :format(t.name, t.send, t.need,
+                    (t.inTransit or 0) > 0
+                        and Boons.TransitBit(t.have, t.inTransit, t.transitAge)
+                        or  ("has %d"):format(t.have)))
     end
 
     -- ATTACH DIAGNOSTICS. What the client actually did to the bags while the last

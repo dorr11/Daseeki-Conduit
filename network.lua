@@ -261,12 +261,31 @@ local function fold(acc, order, key, rec, ctx, stamp)
             slot.level = math.floor(lvl)
         end
 
+        -- TWO CLOCKS, AND THEY ARE NOT THE SAME CLOCK (CDT-5).
+        --
+        --   countsAt  the owning row's `updatedAt` — when THIS client last took
+        --             delivery of the row. It is the freshness the UI should show
+        --             ("seen 3h ago") and the arbitration key, unchanged, so which
+        --             sighting wins a contested name never shifts under anyone.
+        --   scanAt    the payload's OWN `ts` — when the remote client actually
+        --             scanned its bags. This is the only clock that says WHEN THE
+        --             COUNT WAS TRUE.
+        --
+        -- The two come apart, and the owner's save proves it: Shalk's row carries
+        -- updatedAt 211 seconds AFTER a send while its payload was scanned 155
+        -- seconds BEFORE it. A relay hop, a backfill answer or a rev replay all
+        -- move `updatedAt` without a single bag being re-read. Anything reasoning
+        -- about WHEN A COUNT WAS TRUE — the outbound ledger's delivery proof and
+        -- its re-baselining, both of which are ordered against a send — must read
+        -- `scanAt`, and reading `updatedAt` for it is how a pre-send count gets
+        -- mistaken for evidence of a delivery.
         if type(rec.itemCounts) == "table" then
-            local at = tonumber(stamp) or tonumber(rec.ts)
+            local at   = tonumber(stamp) or tonumber(rec.ts)
+            local scan = tonumber(rec.ts) or tonumber(stamp)
             if slot.counts == nil then
-                slot.counts, slot.countsAt = rec.itemCounts, at
+                slot.counts, slot.countsAt, slot.scanAt = rec.itemCounts, at, scan
             elseif at and (slot.countsAt == nil or at > slot.countsAt) then
-                slot.counts, slot.countsAt = rec.itemCounts, at
+                slot.counts, slot.countsAt, slot.scanAt = rec.itemCounts, at, scan
             end
         end
     end
@@ -283,7 +302,8 @@ end
 --       class   = "WARLOCK"|nil, -- upper-case token, for the class colour
 --       level   = 60|nil,        -- highest sighting; nil = never recorded
 --       counts  = <table>|nil,   -- Nexus's itemCounts map, BY REFERENCE, read-only
---       countsAt= <epoch>|nil,   -- when that map was stamped (its staleness)
+--       countsAt= <epoch>|nil,   -- when we took delivery of that map (its staleness)
+--       scanAt  = <epoch>|nil,   -- when the map was SCANNED (when it was TRUE)
 --       otherFaction = true|nil} -- explicit conflict with `me` — the ONLY flag the
 --                                -- label layer is allowed to act on
 --

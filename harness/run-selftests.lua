@@ -1126,11 +1126,14 @@ local function bagsOf(stacks)
     return layout
 end
 
+-- { name, level, count, countsAt, scanAt }. The scan clock defaults to the
+-- delivery clock, so every gate written before CDT-5 sees the world it always saw.
 local function mesh(spec)
     local out = {}
     for _, row in ipairs(spec) do
+        local at = row[4] or (_G.__CLOCK - 600)
         out[#out + 1] = { name = row[1], level = row[2] or 60,
-                          counts = { [ITEM] = row[3] }, countsAt = row[4] or (_G.__CLOCK - 600) }
+                          counts = { [ITEM] = row[3] }, countsAt = at, scanAt = row[5] or at }
     end
     return out
 end
@@ -2546,21 +2549,14 @@ do
     -- the reconstruction cannot drift from what really shipped.
     do
         local LSRC = readFile(P("ledger.lua"))
-        local frag = [[                if type(m) == "table" and Ledger.HasBaseline(e) then
-                    local at, cnt = num(m.at), num(m.count, 0)
-                    -- THE DELTA, NOT THE ABSOLUTE. The snapshot must be newer than
-                    -- the send AND show the count risen by what we posted.
-                    if at and at > e.ts and cnt >= (num(e.base) + e.qty) then
-                        why = "delivered"
-                    end
-                end]]
+        local frag = [[            elseif Ledger.HasBaseline(e) and sAt and sAt > e.ts
+                   and cnt >= (num(e.base) + e.qty) then]]
         local head, tail = LSRC:find(frag, 1, true)
         ck(head ~= nil, "(b2) the retirement test is where the reconstruction expects it")
         if head then
-            local as123 = LSRC:sub(1, head - 1) .. [[                if type(m) == "table" then
-                    local at, cnt = num(m.at), num(m.count, 0)
-                    if at and at > e.ts and cnt >= e.qty then why = "delivered" end
-                end]] .. LSRC:sub(tail + 1)
+            local as123 = LSRC:sub(1, head - 1)
+                .. [[            elseif sAt and sAt > e.ts and cnt >= e.qty then]]
+                .. LSRC:sub(tail + 1)
             local chunk = loadstring(as123, "@as-1.2.3:ledger")
             local oldNs = {}
             ck(chunk ~= nil, "(b2) ...and the 1.2.3 rule compiles")
@@ -2604,14 +2600,14 @@ do
            "(b2) ...and the row carries the baseline the plan was built from")
         -- Ten minutes later: they log in, Nexus scans, the count has NOT changed.
         _G.__CLOCK = _G.__CLOCK + 600
-        roster[1].countsAt = _G.__CLOCK
+        roster[1].countsAt, roster[1].scanAt = _G.__CLOCK, _G.__CLOCK
         local q = derive(n, roster)
         ck(#n.Ledger.Entries() == 1, "(b2) the unmoved snapshot does NOT retire the entry")
         ck(#q == 0, "(b2) ...and the re-run plans nothing — no second pair")
         -- An hour on, the mail lands.
         _G.__CLOCK = _G.__CLOCK + 3700
         roster[1].counts[ITEM] = 10
-        roster[1].countsAt = _G.__CLOCK
+        roster[1].countsAt, roster[1].scanAt = _G.__CLOCK, _G.__CLOCK
         derive(n, roster)
         ck(#n.Ledger.Entries() == 0, "(b2) the real delivery retires it")
         _G.__CLOCK = 1700000000
@@ -2761,12 +2757,12 @@ do
         -- an hour later the mail lands and Nexus sees the full pocket
         _G.__CLOCK = _G.__CLOCK + 3700
         roster[1].counts[ITEM] = 10
-        roster[1].countsAt = _G.__CLOCK
+        roster[1].countsAt, roster[1].scanAt = _G.__CLOCK, _G.__CLOCK
         derive(n, roster)
         ck(#n.Ledger.Entries() == 0, "(g) the delivery is seen and the entry retires")
         -- ...and after they burn them, a top-up is planned again
         roster[1].counts[ITEM] = 2
-        roster[1].countsAt = _G.__CLOCK
+        roster[1].countsAt, roster[1].scanAt = _G.__CLOCK, _G.__CLOCK
         local q = derive(n, roster)
         ck(#q >= 1 and q[1].units == 8, "(g) a genuinely empty pocket is topped up again")
         _G.__CLOCK = 1700000000
@@ -2794,6 +2790,381 @@ do
                   inFlight = f, now = NOW })
             ck(#p.targets == 1, "(h) MUTANT KILLED: with in-flight lost, the plan re-sends")
         end
+    end
+
+    -- ══ CDT-5 ═══════════════════════════════════════════════════════════════
+    --
+    -- THE OWNER'S SAVE, 2026-08-19. The top-up dialog read
+    --
+    --     Shalk  <-  4   (has 1, 5 in transit, seen 46h ago)
+    --
+    -- and DaseekiConduitDB.outbox held exactly one Shalk row:
+    --
+    --     { target = "Shalk", itemID = 184937, qty = 5, base = 5, ts = 1786995333 }
+    --
+    -- The mail LANDED. Daseeki-Nexus on the account that owns Shalk carries a scan
+    -- taken two days later showing 184937 = 6 and an EMPTY inbox (mail.n = 0), and
+    -- 1 + 5 = 6 to the unit. The row could not retire because its BASELINE WAS
+    -- WRONG: the planner read a row saying 5, Shalk had actually burned down to 1,
+    -- and `cnt >= base + qty` therefore demanded a total of ten that six could never
+    -- reach. Twenty-eight more days of suppressing top-ups for a character the mesh
+    -- could see was fine.
+    --
+    -- The sender's OWN save carries the reading that would have fixed it, and the
+    -- exact two clocks that hid it:
+    --
+    --     Shalk row: data.ts = 1786995178   (scanned 155s BEFORE the send)
+    --                updatedAt = 1786995544 (re-stamped 211s AFTER it)
+    --                itemCounts[184937] = 1
+    --
+    -- Every number below is that save. The clocks are what the two halves differ by:
+    -- 1.2.5 had only `updatedAt` and therefore could not tell a pre-send count from
+    -- a post-send one, which is both why it never re-baselined and why a re-stamped
+    -- row could have proved a delivery that had not happened.
+    local SEND   = 1786995333
+    local SCAN   = 1786995178      -- 155s before the send
+    local STAMP  = 1786995544      -- 211s after it
+    local LATER  = 1787158930      -- Shalk's own fresh scan, showing 6
+    local SEEN   = 1787162388      -- the moment the save was read, 46h after the send
+    local MID    = SEND + 12 * 3600 -- inside the presumption window, so the PROOF is
+                                    -- what is under test and not the fallback guess
+    do
+        -- ── (i) RED: ONE CLOCK. Exactly what 1.2.5 could see — a row whose only
+        --    timestamp is `updatedAt`. It lands AFTER the send, so it is never a
+        --    candidate to re-baseline from, and the delivery test wants ten.
+        local e = {}
+        L.Add(e, "Shalk", ITEM, 5, SEND, 5)
+        local kept = L.Reconcile(e, { shalk = { count = 1, at = STAMP } }, STAMP)
+        ck(#kept == 1 and kept[1].base == 5,
+           "(i) RED: with only the delivery clock the wrong baseline of 5 stands")
+        -- MID, not the real 46h, so the PROOF is what is being measured. Past the
+        -- presumption the row does eventually go — but as a guess, a day later, and
+        -- the point of the fix is that this delivery was provable all along.
+        kept = L.Reconcile(e, { shalk = { count = 6, at = MID } }, MID)
+        ck(#kept == 1,
+           "(i) RED: ...and the REAL delivery — 1 became 6 — proves nothing against it")
+        ck((L.InFlight(e, ITEM, MID)["shalk"] or 0) == 5,
+           "(i) RED: ...so five phantom boons keep suppressing Shalk's top-up")
+        local rows = L.Describe(e, SEEN, ns.Boons.FormatAge)
+        ck(tostring(rows[1]):find("sent 46h ago", 1, true) ~= nil,
+           "(i) RED: ...and at the moment the owner read it the row was 46h old")
+        -- The one-clock build's ONLY exit for this row, and it is not a proof.
+        local _k, retired = L.Reconcile(e, { shalk = { count = 6, at = LATER } }, LATER)
+        ck(retired[1] and retired[1].why == "presumed",
+           "(i) RED: ...its only way out is the guess, and only after a whole day")
+    end
+    do
+        -- ── (i) GREEN: TWO CLOCKS. The same row, the same save, with the scan
+        --    clock the payload always carried. The pre-send reading of 1 replaces
+        --    the planner's 5, and six is then a delivery.
+        local e = {}
+        L.Add(e, "Shalk", ITEM, 5, SEND, 5)
+        local kept, _r, rebased =
+            L.Reconcile(e, { shalk = { count = 1, at = STAMP, scanAt = SCAN } }, STAMP)
+        ck(#kept == 1, "(i) GREEN: the pre-send count is not itself a retirement")
+        ck(kept[1].base == 1 and kept[1].baseWas == 5,
+           "(i) GREEN: ...it CORRECTS the baseline, 5 -> 1, and remembers what it was")
+        ck(#rebased == 1 and rebased[1].from == 5 and rebased[1].to == 1,
+           "(i) GREEN: ...and the correction is returned, not made silently")
+        local kept2, retired =
+            L.Reconcile(e, { shalk = { count = 6, at = LATER, scanAt = LATER } }, LATER)
+        ck(#kept2 == 0 and retired[1].why == "delivered",
+           "(i) GREEN: ...so 1 became 6 retires the row, which is what really happened")
+        ck(L.Describe(e, LATER, ns.Boons.FormatAge)[1]:find("corrected from 5", 1, true) ~= nil,
+           "(i) GREEN: ...and /conduit transit says the baseline moved")
+    end
+    do
+        -- ── (i) MUTANT: delete the re-baseline and the owner's row must come back.
+        --    A rule that fixes one save is worth nothing if the suite would not
+        --    notice it being removed.
+        local src = readFile(P("ledger.lua"))
+        local frag = "                if not Ledger.HasBaseline(e) then take = true"
+        local head, tail = src:find(frag, 1, true)
+        ck(head ~= nil, "(i) the re-baseline decision is where the mutation expects it")
+        if head then
+            local mutated = src:sub(1, head - 1)
+                .. "                if false then take = true" .. src:sub(tail + 1)
+            -- ...and neutralise the other two arms the same way, so `take` is never
+            -- set and the whole rule is genuinely gone rather than half-gone.
+            mutated = mutated
+                :gsub("elseif num%(e%.baseAt%) then take = %(sAt > num%(e%.baseAt%)%)",
+                      "elseif false                 then take = (sAt > num(e.baseAt))")
+                :gsub("else                               take = %(cnt < num%(e%.base%)%)",
+                      "else                               take = false")
+            local chunk = loadstring(mutated, "@mutant:ledger-rebase")
+            local mutNs = {}
+            ck(chunk ~= nil, "(i) ...and the mutant compiles")
+            if chunk then
+                pcall(chunk, ADDON_NAME, mutNs)
+                local ML = mutNs.Ledger
+                local e = {}
+                ML.Add(e, "Shalk", ITEM, 5, SEND, 5)
+                ML.Reconcile(e, { shalk = { count = 1, at = STAMP, scanAt = SCAN } }, STAMP)
+                ck(e[1].base == 5, "(i) the mutant really does stop re-baselining")
+                local kept = ML.Reconcile(e, { shalk = { count = 6, at = MID, scanAt = MID } },
+                                          MID)
+                ck(#kept == 1,
+                   "(i) MUTANT KILLED: without the re-baseline Shalk is stranded again")
+            end
+        end
+    end
+
+    -- ── (j) THE RE-STAMPED ROW: CDT-2 through the other door ─────────────────
+    --
+    -- `updatedAt` moves when this client takes delivery of a row — a relay hop, a
+    -- backfill answer, a rev replay — with no bag re-read anywhere in it. The
+    -- owner's save has Shalk's row re-stamped 211 seconds AFTER a send while
+    -- carrying a payload scanned 155 seconds BEFORE it. Testing the delivery clock
+    -- lets a PRE-SEND count open the delivery gate, which is exactly the
+    -- double-send CDT-2 closed, arriving through a different door.
+    do
+        local e = {}
+        L.Add(e, "Bankalt", ITEM, 2, SEND, 8)
+        -- RED is a caller with one clock: `at` is all it can offer.
+        local kept, retired = L.Reconcile(e, { bankalt = { count = 10, at = SEND + 211 } },
+                                          SEND + 211)
+        ck(#kept == 0 and retired[1].why == "delivered",
+           "(j) RED: one clock calls a re-stamped PRE-SEND count of 10 a delivery")
+
+        -- GREEN: the same row, the same numbers, with the scan clock supplied.
+        local g = {}
+        L.Add(g, "Bankalt", ITEM, 2, SEND, 8)
+        local keptG = L.Reconcile(g, { bankalt = { count = 10, at = SEND + 211,
+                                                   scanAt = SEND - 155 } }, SEND + 211)
+        ck(#keptG == 1, "(j) GREEN: a count SCANNED before the send proves no delivery")
+        ck(keptG[1].base == 8,
+           "(j) GREEN: ...and it does not re-baseline upward either — 10 > 8 is refused")
+        ck(L.InFlight(g, ITEM, SEND + 211)["bankalt"] == 2,
+           "(j) GREEN: ...so the two stay in flight and no second pair is posted")
+    end
+
+    -- ── (k) PRESUMED RECEIVED: the bound, the floor, and the witness ─────────
+    --
+    -- Some rows can never be proved. The recipient spent the boons before we ever
+    -- saw a pre-send count; the mail bounced; the row predates baselines entirely.
+    -- The owner's save carries SIX of those, thirteen days old, one of them
+    -- suppressing top-ups for a character the mesh shows at a full ten. Waiting the
+    -- remaining seventeen days is not caution.
+    do
+        local FLOOR = L.DELIVERY_FLOOR
+        local AFTER = L.PRESUMED_AFTER
+        ck(FLOOR == 3600, "(k) the floor is Blizzard's worst-case cross-account delay: 1h")
+        ck(AFTER >= 24 * 3600, "(k) the presumption is at least a day, not a raid night")
+        ck(AFTER > FLOOR, "(k) ...and the presumption never sits below the floor")
+
+        local function row() local e = {}; L.Add(e, "Aether", ITEM, 6, NOW); return e end
+        local function seen(at) return { aether = { count = 10, at = at, scanAt = at } } end
+
+        ck(#L.Reconcile(row(), seen(NOW + 60), NOW + 60) == 1,
+           "(k) inside the delivery window, a sighting retires nothing")
+        ck(#L.Reconcile(row(), seen(NOW + 2 * FLOOR), NOW + 2 * FLOOR) == 1,
+           "(k) past the floor but short of the presumption, still nothing")
+        ck(#L.Reconcile(row(), {}, NOW + AFTER + 3600) == 1,
+           "(k) past the presumption with NOBODY SEEN, the row is kept — silence is not evidence")
+        ck(#L.Reconcile(row(), seen(NOW + 60), NOW + AFTER + 3600) == 1,
+           "(k) ...nor does a sighting from INSIDE the delivery window license it")
+        local kept, retired = L.Reconcile(row(), seen(NOW + 2 * FLOOR), NOW + AFTER + 3600)
+        ck(#kept == 0 and retired[1].why == "presumed",
+           "(k) past the presumption, with the recipient seen after delivery, it retires")
+        ck(L.WhyText("presumed") == "presumed received, clear lost",
+           "(k) ...and it retires under that name, not silently")
+
+        -- THE FLOOR IS ITS OWN TEST, not a consequence of the other constant. Prove
+        -- it by mis-tuning the presumption to zero: nothing younger than an hour may
+        -- retire even then.
+        local savedAfter = L.PRESUMED_AFTER
+        L.PRESUMED_AFTER = 0
+        ck(#L.Reconcile(row(), seen(NOW + 60), NOW + 60) == 1,
+           "(k) with PRESUMED_AFTER mis-tuned to 0, the 1h floor still refuses")
+        ck(#L.Reconcile(row(), seen(NOW + 30 * 60), NOW + 30 * 60) == 1,
+           "(k) ...at half an hour too")
+        L.PRESUMED_AFTER = savedAfter
+    end
+
+    -- ── (l) THE LOST CLEAR, END TO END, THROUGH THE REAL ENGINE ──────────────
+    --
+    -- Send; the relay dies so no answer about the recipient ever arrives; the row
+    -- sits. Then the relay comes back, the recipient has plainly been playing, and
+    -- their count still does not show the goods (they spent them, or the mail
+    -- bounced). The row must retire at the bound, say so, and never one second
+    -- before the mail could physically have landed.
+    do
+        local sim = Sim.New(bagsOf({ 10 }))
+        local n = newEngine(sim, nil)
+        local roster = mesh({ { "Erro", 60, 3 } })
+        chatClear()
+        startRun(n, sim, roster)
+        sim:Advance(120)
+        ck(#n.Ledger.Entries() == 1, "(l) the send creates one in-transit row")
+        local sentAt = n.Ledger.Entries()[1].ts
+
+        -- THE RELAY IS DOWN: the roster row never moves. Half an hour, then a day.
+        _G.__CLOCK = sentAt + 1800
+        derive(n, roster)
+        ck(#n.Ledger.Entries() == 1, "(l) half an hour on, with no news, the row stands")
+        _G.__CLOCK = sentAt + 25 * 3600
+        derive(n, roster)
+        ck(#n.Ledger.Entries() == 1,
+           "(l) a DAY on, still with no news of Erro, the row STILL stands — silence is not evidence")
+
+        -- The relay comes back. Erro has been seen, well after delivery, holding
+        -- what they held: the clear, whatever it was, never reached us.
+        chatClear()
+        roster[1].countsAt = _G.__CLOCK
+        roster[1].scanAt   = _G.__CLOCK
+        derive(n, roster)
+        ck(#n.Ledger.Entries() == 0, "(l) the sighting retires the row at the bound")
+        ck(chatFind("presumed received, clear lost") ~= nil,
+           "(l) ...and says so in chat rather than dropping it behind the owner's back")
+
+        -- AND NEVER EARLY. The same shape, with the sighting arriving inside the
+        -- delivery window, must not retire anything.
+        local sim2 = Sim.New(bagsOf({ 10 }))
+        local n2 = newEngine(sim2, nil)
+        local r2 = mesh({ { "Erro", 60, 3 } })
+        chatClear()
+        startRun(n2, sim2, r2)
+        sim2:Advance(120)
+        local t2 = n2.Ledger.Entries()[1].ts
+        _G.__CLOCK = t2 + 25 * 3600
+        r2[1].countsAt = t2 + 600            -- seen ten minutes after the send
+        r2[1].scanAt   = t2 + 600
+        derive(n2, r2)
+        ck(#n2.Ledger.Entries() == 1,
+           "(l) a sighting from INSIDE the hour never licenses the presumption, at any age")
+        _G.__CLOCK = 1700000000
+    end
+
+    -- ── (m) THE MANUAL VERB ──────────────────────────────────────────────────
+    --
+    -- Every automatic retirement needs the mesh to deliver something. When it does
+    -- not — which is the live condition this whole round started from — the owner
+    -- needs a way out that depends on nothing at all.
+    do
+        local sim = Sim.New(bagsOf({ 10, 10 }))
+        local n = newEngine(sim, nil)
+        local roster = mesh({ { "Erro", 60, 3 }, { "Poonyx", 60, 4 } })
+        chatClear()
+        startRun(n, sim, roster)
+        sim:Advance(300)
+        ck(#n.Ledger.Entries() == 2, "(m) two rows in transit")
+
+        chatClear()
+        n.Boons.Transit("")
+        ck(chatFind("in transit: 2 row(s)") ~= nil, "(m) /conduit transit lists them")
+        ck(chatFind("Erro") ~= nil and chatFind("Poonyx") ~= nil,
+           "(m) ...naming every character")
+        ck(chatFind("sent just now ago") ~= nil or chatFind("sent ") ~= nil,
+           "(m) ...with the age of each row")
+
+        chatClear()
+        n.Boons.Transit("clear Erro")
+        ck(#n.Ledger.Entries() == 1, "(m) clear <char> drops only that character's rows")
+        ck(n.Ledger.Entries()[1].target == "Poonyx", "(m) ...and leaves the others alone")
+        ck(chatFind("cleared 1 in-transit row(s) for Erro") ~= nil,
+           "(m) ...and prints what it cleared, not just that it cleared")
+        ck(chatFind("7 Chronoboon") ~= nil, "(m) ...including the units it released")
+
+        chatClear()
+        n.Boons.Transit("clear Nobody")
+        ck(#n.Ledger.Entries() == 1 and chatFind("nothing in transit to Nobody") ~= nil,
+           "(m) an unknown character clears nothing and says so")
+
+        chatClear()
+        n.Boons.Transit("clear all")
+        ck(#n.Ledger.Entries() == 0 and chatFind("1 row(s) dropped") ~= nil,
+           "(m) clear all empties the ledger with a receipt")
+
+        chatClear()
+        n.Boons.Transit("")
+        ck(chatFind("nothing in transit") ~= nil, "(m) ...and an empty ledger says so plainly")
+
+        chatClear()
+        n.Boons.Transit("clear")
+        ck(chatFind("usage:") ~= nil, "(m) clear with no target refuses rather than guessing")
+    end
+
+    -- ── (n) THE AGE, WHERE THE OWNER READS IT ────────────────────────────────
+    --
+    -- "has 1, 5 in transit" and "has 1, 5 in transit (46h)" are different sentences.
+    -- The first reads as a mail on its way; the second is the one that tells the
+    -- owner to look. The hour threshold is read off the ledger so the sentence and
+    -- the retirement rules can never drift apart.
+    do
+        local function planWith(ageSecs)
+            return ns.Boons.BuildPlan(
+                { { name = "Shalk", level = 60, counts = { [ITEM] = 1 }, countsAt = NOW } },
+                { source = "Bankalt", faction = "Alliance", stock = 99, itemID = ITEM,
+                  inFlight = { shalk = 5 }, inFlightAge = { shalk = ageSecs }, now = NOW })
+        end
+        local fresh = planWith(300)
+        ck(fresh.targets[1].inTransit == 5, "(n) a fresh transit row is still counted")
+        local ftext = ns.Boons.PreviewText(fresh)
+        ck(ftext:find("has 1, 5 in transit", 1, true) ~= nil, "(n) ...and named")
+        ck(ftext:find("(300", 1, true) == nil and ftext:find("5m)", 1, true) == nil,
+           "(n) ...with NO age: five minutes old is not news")
+
+        local stale = planWith(46 * 3600)
+        local stext = ns.Boons.PreviewText(stale)
+        ck(stext:find("has 1, 5 in transit (46h)", 1, true) ~= nil,
+           "(n) THE OWNER'S LINE, with the age it was missing: 'has 1, 5 in transit (46h)'")
+
+        -- ...and on the "Already on its way" side, which is where his other six rows
+        -- showed up ("has 10, 6 in transit — nothing to send").
+        local full = ns.Boons.BuildPlan(
+            { { name = "Aether", level = 60, counts = { [ITEM] = 10 }, countsAt = NOW },
+              { name = "Orn",    level = 60, counts = { [ITEM] = 0 },  countsAt = NOW } },
+            { source = "Bankalt", faction = "Alliance", stock = 99, itemID = ITEM,
+              inFlight = { aether = 6 }, inFlightAge = { aether = 13.9 * 86400 }, now = NOW })
+        ck(tostring(full.skipped[1].reason) == "has 10, 6 in transit (13d)",
+           "(n) a thirteen-day-old row on a FULL pocket says how old it is")
+        ck(ns.Boons.PreviewText(full):find("has 10, 6 in transit (13d)", 1, true) ~= nil,
+           "(n) ...in the 'Already on its way' line, where he read it")
+        -- And the old sentence survives untouched when no ages are supplied at all.
+        local none = ns.Boons.BuildPlan(
+            { { name = "Erro", level = 60, counts = { [ITEM] = 9 }, countsAt = NOW } },
+            { source = "Bankalt", faction = "Alliance", stock = 99, itemID = ITEM,
+              inFlight = { erro = 1 }, now = NOW })
+        ck(tostring(none.skipped[1].reason) == "has 9, 1 in transit",
+           "(n) a caller that passes no ages gets exactly the sentence it always got")
+    end
+
+    -- ── (o) THE TWO CLOCKS COME OFF THE MESH SEPARATELY ──────────────────────
+    --
+    -- The whole fix rests on network.lua handing the ledger a scan clock that is
+    -- NOT the delivery clock. If it collapsed them again, every test above would go
+    -- on passing on hand-built maps while the live path quietly reverted.
+    do
+        local G = { DaseekiNexusData = { inventory = { schema = 1, owners = {
+            ["Shalk-Whitemane"] = {
+                rev = 613, updatedAt = STAMP,
+                data = { key = "Shalk-Whitemane", faction = "Alliance", level = 60,
+                         ts = SCAN, itemCounts = { [ITEM] = 1 } },
+            },
+        } } } }
+        local rows = ns.Network.CollectAlts(G, { name = "Bankalt", realm = "Whitemane",
+                                                 faction = "Alliance" })
+        ck(#rows == 1, "(o) the inventory graph yields the row")
+        ck(rows[1].countsAt == STAMP, "(o) countsAt is the row's updatedAt — when we heard it")
+        ck(rows[1].scanAt == SCAN, "(o) scanAt is the payload's own ts — when it was TRUE")
+        ck(rows[1].scanAt < rows[1].countsAt,
+           "(o) THE OWNER'S ROW: scanned before the send, re-stamped after it")
+
+        local snap = ns.Boons.MeshSnapshot(rows, ITEM)
+        ck(snap.shalk.count == 1, "(o) MeshSnapshot carries the count")
+        ck(snap.shalk.at == STAMP and snap.shalk.scanAt == SCAN,
+           "(o) ...and BOTH clocks through to the ledger")
+
+        -- A payload with no ts of its own (a 1.x publisher) must still work: the
+        -- delivery clock stands in, which is exactly 1.2.5's behaviour and no worse.
+        local G2 = { DaseekiNexusData = { inventory = { schema = 1, owners = {
+            ["Old-Whitemane"] = { rev = 1, updatedAt = STAMP,
+                                  data = { key = "Old-Whitemane", level = 60,
+                                           itemCounts = { [ITEM] = 4 } } },
+        } } } }
+        local r2 = ns.Network.CollectAlts(G2, { name = "Bankalt", realm = "Whitemane" })
+        ck(r2[1].scanAt == STAMP,
+           "(o) a payload with no scan clock falls back to the delivery clock, not to nil")
     end
 end
 local V_LEDGER = (FAILS == LEDGER_BEFORE)
