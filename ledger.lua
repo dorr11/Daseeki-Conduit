@@ -73,7 +73,75 @@
 
     Bounced-mail auto-detection is deliberately OUT of scope — a returned mail is
     indistinguishable at the API from one never sent, and the TTL plus the manual
-    `/conduit debug boons clear` cover the case without guessing.
+    `/conduit transit clear` cover the case without guessing.
+
+    ── THE STALE BASELINE, AND WHY CDT-2's FIX STRANDED SHALK (CDT-5) ───────────
+    The delta above is only as good as the baseline it measures from, and 1.2.4
+    took that baseline from THE SAME LAGGING SNAPSHOT THE PLAN WAS BUILT FROM. If
+    the snapshot OVER-states what the recipient holds, `base + qty` names a total
+    the recipient can never reach after delivery, and the entry becomes
+    UNPROVABLE BY CONSTRUCTION — it rides the full 30 days suppressing every
+    top-up, exactly the starvation the ledger exists to avoid in the other
+    direction.
+
+    This is not a corner. A top-up is posted PRECISELY to characters the snapshot
+    shows running low, and the reason they are running low is that they burn boons
+    — so "the snapshot over-states" is the ORDINARY case, not the exception.
+
+    The owner's live save (1.2.5, 2026-08-17) is the worked example:
+
+      Shalk's row said 5. The planner posted 5 (base = 5, target 10). Shalk had
+      ACTUALLY burned down to 1 — a scan stamped 155 seconds BEFORE the send says
+      so in the sender's own mesh. Shalk received the 5 and now holds 6. The proof
+      demanded 10. Six is all there will ever be, so the row sat "in transit" for
+      46 hours and had 28 more days to go.
+
+    THE FIX IS A SECOND CLOCK. Nexus's inventory payload carries its own `ts` —
+    when the remote client actually SCANNED — while the row wrapper's `updatedAt`
+    only says when THIS client last took delivery of the row. The two are not the
+    same thing and 1.2.4 used the wrong one:
+
+      * RE-BASELINE (Rule 1). A count whose SCAN time is at or before the send is,
+        by construction, a PRE-DELIVERY holding. It is a better baseline than the
+        planner's guess and it is not a guess at all. Adopted downwards only —
+        raising the bar can only strand an entry, never save one. Shalk's base
+        drops 5 -> 1 and 6 >= 1 + 5 retires the row the moment the mesh catches up.
+      * THE PROOF NOW RUNS ON THE SCAN CLOCK (Rule 2). `updatedAt` moving is not
+        the recipient being seen — the owner's save has Shalk's row RE-STAMPED 211
+        seconds after the send while carrying a payload scanned 155 seconds
+        BEFORE it. Testing `updatedAt > ts` opened the delivery gate on pre-send
+        data, which is the CDT-2 double-send hazard let back in through the other
+        door. The scan clock shuts it.
+
+    ── PRESUMED RECEIVED: retiring a proof that will never arrive (CDT-5) ───────
+    Some entries can never be proved either way. The recipient spent the boons
+    before we ever saw a pre-send scan; the mail bounced; the row predates any
+    baseline at all. Waiting 30 days for those is not caution, it is a stuck
+    addon — the owner's save carries six of them, thirteen days old, one of them
+    suppressing top-ups for a character the mesh plainly shows at a FULL TEN.
+
+    So an entry retires as PRESUMED RECEIVED when all of these hold:
+
+      * it is older than PRESUMED_AFTER (24h), and
+      * the recipient has been HEARD FROM — a scan of theirs taken at or after the
+        delivery deadline (send + DELIVERY_FLOOR). Silence is never evidence: a
+        recipient nobody has seen keeps their entry.
+
+    and NEVER before DELIVERY_FLOOR (1h), which is Blizzard's worst-case delay for
+    mail between unconnected accounts. Same-account mail is instant; an hour is
+    the ceiling, so an hour is the floor here, asserted separately from
+    PRESUMED_AFTER so a mis-tuned constant can never bypass it.
+
+    WHY 24 HOURS AND NOT THREE. Nexus folds MAIL ATTACHMENTS INTO itemCounts, but
+    only after the recipient opens a mailbox — `parts.mail` is a cache of the last
+    inbox visit. So a recipient who logs in, raids, and never walks to a mailbox
+    produces a perfectly fresh scan that legitimately does NOT show the goods, and
+    retiring on that would re-send a mail that is sitting unopened. Three hours
+    sits squarely inside one raid night; a day does not. The residual is stated
+    rather than hidden: a recipient who ignores their mailbox for a full day can
+    still be double-mailed once. That is the price of not stranding them for a
+    month, and `/conduit transit` shows every row and its age so the owner can see
+    it coming.
 
     ── Purity ───────────────────────────────────────────────────────────────────
     Everything above the LIVE WRAPPERS bar is a function of its arguments alone, so
@@ -88,6 +156,21 @@ ns.Ledger = Ledger
 -- Blizzard's mail expiry. An entry older than this is not in flight any more,
 -- whatever happened to it.
 Ledger.TTL = 30 * 24 * 60 * 60
+
+-- THE FLOOR. Blizzard's worst-case mail delay: an hour, between characters on
+-- unconnected accounts. Same-account mail is instant, so an hour is the ceiling
+-- of the real delay and therefore the floor of anything this file is allowed to
+-- call "not in the post any more". NOTHING retires younger than this — not the
+-- presumption, not a witness, not a tuning mistake.
+Ledger.DELIVERY_FLOOR = 60 * 60
+
+-- THE PRESUMPTION. Older than this, with a post-delivery sighting of the
+-- recipient and still no proof, and the entry retires as presumed received. See
+-- the CDT-5 note in the header for why this is a day and not three hours: Nexus
+-- only folds mail into itemCounts once the recipient opens a mailbox, so a fresh
+-- scan from someone who has not been to one is not evidence of anything, and a
+-- raid night is shorter than a day.
+Ledger.PRESUMED_AFTER = 24 * 60 * 60
 
 -- ════════════════════════════════════════════════════════════════════════════
 --  PURE
@@ -124,13 +207,20 @@ end
 -- OPTIONAL and deliberately never defaulted to 0: a missing baseline is "we do not
 -- know", which Reconcile refuses to treat as evidence, and an invented zero would
 -- turn every send into a false delivery proof on the next snapshot.
-function Ledger.Add(entries, target, itemID, qty, ts, base)
+--
+-- `baseAt` is WHEN THAT BASELINE WAS TRUE — the scan clock of the snapshot `base`
+-- was read from, not the moment we took delivery of the row. It is what lets a
+-- later, NEWER pre-send scan replace a baseline the planner got wrong (CDT-5);
+-- without it a re-baseline cannot tell a better reading from an older one. Also
+-- optional, and for the same reason: an undated baseline is "we do not know when",
+-- which Reconcile handles more conservatively rather than pretending.
+function Ledger.Add(entries, target, itemID, qty, ts, base, baseAt)
     if type(entries) ~= "table" then return nil end
     local b = num(base)
     if b then b = math.floor(b) end
     if b and b < 0 then b = 0 end
     local e = { target = target, itemID = num(itemID), qty = math.floor(num(qty) or 0),
-                ts = num(ts), base = b }
+                ts = num(ts), base = b, baseAt = b and num(baseAt) or nil }
     if not Ledger.IsValid(e) then return nil end
     entries[#entries + 1] = e
     return e
@@ -143,11 +233,17 @@ function Ledger.HasBaseline(e)
 end
 
 -- How much of `itemID` is in transit to each character right now.
---   returns { [key] = qty }, total
+--   returns { [key] = qty }, total, { [key] = <age of the OLDEST row, seconds> }
 -- Entries past the TTL are ignored (they are cleared separately; a plan must not
 -- wait for a sweep to stop believing in a month-old mail).
+--
+-- THE AGES ARE THE THIRD RETURN, not a reshaping of the first, so every existing
+-- caller is untouched. They exist because "5 in transit" and "5 in transit (46h)"
+-- are different sentences: the first reads as a mail on its way, the second reads
+-- as a mail that should have landed two days ago, and only one of them tells the
+-- owner to look. Oldest wins — the stalest row in a pile is the one worth naming.
 function Ledger.InFlight(entries, itemID, now, ttl)
-    local out, total = {}, 0
+    local out, total, ages = {}, 0, {}
     ttl = num(ttl, Ledger.TTL)
     itemID = num(itemID)
     now = num(now)
@@ -158,28 +254,60 @@ function Ledger.InFlight(entries, itemID, now, ttl)
                 local k = Ledger.Key(e.target)
                 out[k] = (out[k] or 0) + e.qty
                 total = total + e.qty
+                if now then
+                    local age = now - e.ts
+                    if age < 0 then age = 0 end
+                    if ages[k] == nil or age > ages[k] then ages[k] = age end
+                end
             end
         end
     end
-    return out, total
+    return out, total, ages
+end
+
+-- The scan clock of a snapshot: WHEN THE COUNT WAS TRUE, not when we took delivery
+-- of the row that carries it. `at` is the fallback for a caller that only has one
+-- clock (and for every pre-CDT-5 test row), which makes the two identical in that
+-- case and changes nothing for them.
+local function scanOf(m)
+    if type(m) ~= "table" then return nil end
+    return num(m.scanAt) or num(m.at)
 end
 
 -- Retire what has been accounted for.
 --
---   mesh = { [key] = { count = <units the snapshot shows>, at = <epoch> } }
+--   mesh = { [key] = { count  = <units the snapshot shows>,
+--                      at     = <when this client last took delivery of the row>,
+--                      scanAt = <when the remote client actually SCANNED>  } }
 --
--- An entry is retired when the mesh has SEEN the character since the send AND the
--- count it saw has RISEN by at least what we posted, measured against the baseline
--- the entry recorded (the mail arrived and was opened into the bags/bank the
--- snapshot reads), or when the entry is older than the TTL.
+-- FOUR RULES, IN THIS ORDER. Each is stated in full in the header; here is what
+-- the code does:
 --
--- An absolute count proves nothing on its own — see the CDT-2 note in the header.
--- An entry with no baseline has no delta to measure and therefore no evidence
--- path: it rides to the TTL.
+--   0 EXPIRED     older than the TTL. Blizzard's own mail expiry — opened or
+--                 returned, either way not in the post.
+--   1 RE-BASELINE (not a retirement) a count whose SCAN time is at or before the
+--                 send is a PRE-DELIVERY holding, and therefore a better baseline
+--                 than the planner's lagging guess. CDT-5: this is what unsticks a
+--                 row whose recorded baseline names a total the recipient can
+--                 never reach.
+--   2 DELIVERED   a scan taken AFTER the send shows the count risen by what we
+--                 posted, measured from the baseline. The SCAN clock, never the
+--                 delivery clock — a row re-stamped after the send while carrying
+--                 pre-send data must not open this gate (that is CDT-2 through
+--                 the other door).
+--   3 PRESUMED    older than PRESUMED_AFTER, the recipient sighted at or after the
+--                 delivery deadline, and still no proof. Never younger than
+--                 DELIVERY_FLOOR, asserted here and not merely implied.
 --
--- Returns kept, retired — two arrays. The caller swaps `kept` in.
+-- Silence is never evidence: a recipient nobody has seen keeps their entry until
+-- the TTL, whatever its age.
+--
+-- Returns kept, retired, rebased — three arrays. The caller swaps `kept` in. THE
+-- REBASE MUTATES THE ENTRY IN PLACE (entries are persisted by reference, and a
+-- baseline correction that did not stick would have to be re-derived on every
+-- sweep); `rebased` is how that mutation is made visible rather than silent.
 function Ledger.Reconcile(entries, mesh, now, ttl)
-    local kept, retired = {}, {}
+    local kept, retired, rebased = {}, {}, {}
     ttl  = num(ttl, Ledger.TTL)
     now  = num(now)
     mesh = (type(mesh) == "table") and mesh or {}
@@ -188,24 +316,75 @@ function Ledger.Reconcile(entries, mesh, now, ttl)
             retired[#retired + 1] = { entry = e, why = "malformed" }
         else
             local why = nil
-            if now and (now - e.ts) > ttl then
-                why = "expired"
-            else
-                local m = mesh[Ledger.Key(e.target)]
-                if type(m) == "table" and Ledger.HasBaseline(e) then
-                    local at, cnt = num(m.at), num(m.count, 0)
-                    -- THE DELTA, NOT THE ABSOLUTE. The snapshot must be newer than
-                    -- the send AND show the count risen by what we posted.
-                    if at and at > e.ts and cnt >= (num(e.base) + e.qty) then
-                        why = "delivered"
+            local m   = mesh[Ledger.Key(e.target)]
+            local sAt = scanOf(m)
+            local cnt = num(m and m.count, 0)
+
+            -- ── 1. RE-BASELINE ───────────────────────────────────────────────
+            -- A count that was true BEFORE the mail could have arrived. Which
+            -- pre-send reading wins depends on what we know about the one we hold:
+            --   * no baseline at all -> take it; a legacy row gets an evidence path
+            --     it never had, and this is an observation, not the invention the
+            --     1.2.4 header ruled out.
+            --   * a DATED baseline   -> the NEWER pre-send scan wins outright.
+            --   * an UNDATED one     -> downward only. We cannot tell a better
+            --     reading from an older one, and only the downward move can
+            --     unstick a row; raising the bar can never do anything but strand.
+            if sAt and sAt <= e.ts then
+                local take
+                if not Ledger.HasBaseline(e) then take = true
+                elseif num(e.baseAt)          then take = (sAt > num(e.baseAt))
+                else                               take = (cnt < num(e.base))
+                end
+                if take then
+                    local from = num(e.base)
+                    e.base, e.baseAt = math.floor(cnt), sAt
+                    if from ~= e.base then
+                        -- Stamped on the ROW, not just returned: a correction that
+                        -- only lived in a return value would vanish at the next
+                        -- /reload, and `/conduit transit` could not tell the owner
+                        -- that the number their planner acted on has since moved.
+                        e.baseWas  = e.baseWas or from
+                        e.rebases  = (num(e.rebases, 0)) + 1
+                        rebased[#rebased + 1] = { entry = e, from = from, to = e.base }
                     end
                 end
             end
+
+            if now and (now - e.ts) > ttl then
+                why = "expired"
+            elseif Ledger.HasBaseline(e) and sAt and sAt > e.ts
+                   and cnt >= (num(e.base) + e.qty) then
+                -- ── 2. DELIVERED ─────────────────────────────────────────────
+                why = "delivered"
+            elseif now then
+                -- ── 3. PRESUMED RECEIVED ─────────────────────────────────────
+                -- THE FLOOR IS ITS OWN TEST. PRESUMED_AFTER is expected to be the
+                -- larger of the two, but a floor that is only implied by another
+                -- constant is a floor one edit away from not existing.
+                local age = now - e.ts
+                if age >= Ledger.DELIVERY_FLOOR and age >= Ledger.PRESUMED_AFTER
+                   and sAt and sAt >= (e.ts + Ledger.DELIVERY_FLOOR) then
+                    why = "presumed"
+                end
+            end
+
             if why then retired[#retired + 1] = { entry = e, why = why }
             else kept[#kept + 1] = e end
         end
     end
-    return kept, retired
+    return kept, retired, rebased
+end
+
+-- The plain-English sentence for a retirement reason, for the line that tells the
+-- owner an entry went away. A retirement the user cannot see is the same shape of
+-- problem as an entry they cannot clear.
+function Ledger.WhyText(why)
+    if why == "delivered" then return "the mesh saw it arrive" end
+    if why == "presumed"  then return "presumed received, clear lost" end
+    if why == "expired"   then return "past Blizzard's 30-day mail expiry" end
+    if why == "malformed" then return "the row was unusable" end
+    return tostring(why)
 end
 
 -- Human-readable rows for /conduit debug boons, newest first.
@@ -224,12 +403,25 @@ function Ledger.Describe(entries, now, fmtAge)
     for _, e in ipairs(rows) do
         local age = (num(now) and (num(now) - e.ts)) or nil
         local ageText = (fmtAge and age and fmtAge(age)) or nil
-        -- A row with no baseline can never be proved delivered, and a user staring
-        -- at a ledger that will not clear deserves to be told which rows those are
-        -- rather than left to guess at a stuck addon.
-        local note = Ledger.HasBaseline(e)
-            and ("had %d"):format(num(e.base))
-            or  "no baseline — clears at the 30-day expiry"
+        -- A row that cannot be proved deserves to say so rather than look stuck.
+        -- Since CDT-5 there are two of those and they are not the same thing: a
+        -- row with no baseline is waiting for a pre-send scan to give it one, and
+        -- a row that has aged past the presumption is waiting on the RECIPIENT
+        -- being seen at all. Naming which tells the owner whether to wait or to
+        -- reach for `/conduit transit clear`.
+        local note
+        if not Ledger.HasBaseline(e) then
+            note = "no baseline yet — waiting for a pre-send count of theirs"
+        elseif num(e.baseWas) then
+            note = ("had %d, corrected from %d"):format(num(e.base), num(e.baseWas))
+        else
+            note = ("had %d"):format(num(e.base))
+        end
+        if age and age >= Ledger.PRESUMED_AFTER then
+            note = note .. "; past the presumption — the recipient has not been seen since"
+        elseif age and age < Ledger.DELIVERY_FLOOR then
+            note = note .. "; still inside the delivery window"
+        end
         out[#out + 1] = ("%s  <-  %d x %d   (sent %s ago, %s)")
             :format(e.target, e.qty, e.itemID, ageText or "?", note)
     end
@@ -259,18 +451,36 @@ end
 --
 -- `base` comes off the queued mail (boons.lua stamps the planner's `have` on it).
 -- A mail built without one records no baseline rather than a fabricated zero.
-function Ledger.Record(target, itemID, qty, ts, base)
-    local e = Ledger.Add(Ledger.Entries(), target, itemID, qty, ts or Ledger.Now(), base)
+function Ledger.Record(target, itemID, qty, ts, base, baseAt)
+    local e = Ledger.Add(Ledger.Entries(), target, itemID, qty, ts or Ledger.Now(), base, baseAt)
     return e
 end
 
 -- Sweep against a mesh snapshot map. Returns how many entries were retired.
+--
+-- A PRESUMED retirement SAYS SO. Every other exit is either proved (the mesh saw
+-- the goods) or a calendar fact (30 days), but the presumption is this file
+-- deciding on a bounded guess that a clear was lost, and a guess that removes the
+-- only thing standing between the owner and a second mail has to be spoken aloud.
+-- It can print at most once per entry — the entry is gone the moment it does.
 function Ledger.Sweep(mesh, now)
     local db = ns.db
     if not db then return 0 end
-    local kept, retired = Ledger.Reconcile(Ledger.Entries(), mesh, now or Ledger.Now())
+    local kept, retired, rebased =
+        Ledger.Reconcile(Ledger.Entries(), mesh, now or Ledger.Now())
     db.outbox = kept
-    return #retired
+    for _, r in ipairs(retired) do
+        if r.why == "presumed" and ns.Print then
+            ns:Print(("in-transit row retired — %s x%d to %s: %s.")
+                :format(tostring(r.entry.itemID), r.entry.qty, tostring(r.entry.target),
+                        Ledger.WhyText(r.why)))
+        end
+    end
+    -- A baseline correction is NOT printed. It fires on ordinary mesh catch-up and
+    -- chat is not the place for it — but it is not silent either: Reconcile stamps
+    -- the correction onto the row itself, so it survives into SavedVariables and
+    -- `/conduit transit` says which rows have been corrected and from what.
+    return #retired, #rebased
 end
 
 function Ledger.Clear()
@@ -278,6 +488,33 @@ function Ledger.Clear()
     local n = #Ledger.Entries()
     if db then db.outbox = {} end
     return n
+end
+
+-- Drop every row for ONE character. Returns how many went, and their units, so the
+-- caller can print what it did rather than a bare count — "cleared 1 row (5 units)
+-- for Shalk" is a receipt; "cleared" is a hope.
+--
+-- THE MANUAL VERB EXISTS BECAUSE THE AUTOMATIC ONES CAN ALL STALL. Every rule
+-- above needs the mesh to deliver something: a pre-send count to re-baseline from,
+-- a post-send count to prove delivery, a sighting to license the presumption. When
+-- the relay between accounts is down, none of them arrive and the ledger is
+-- correct-but-stuck. This is the owner's way out that depends on nothing.
+function Ledger.ClearFor(name)
+    local db = ns.db
+    if not db then return 0, 0 end
+    local want = Ledger.Key(name)
+    if want == "" then return 0, 0 end
+    local kept, gone, units = {}, 0, 0
+    for _, e in ipairs(Ledger.Entries()) do
+        if Ledger.IsValid(e) and Ledger.Key(e.target) == want then
+            gone  = gone + 1
+            units = units + e.qty
+        else
+            kept[#kept + 1] = e
+        end
+    end
+    db.outbox = kept
+    return gone, units
 end
 
 return Ledger

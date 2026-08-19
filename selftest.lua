@@ -1423,16 +1423,59 @@ ns:RegisterSelfTest("ledger", function(verbose)
     eq(t, #hKept2, 0, "the real delivery — 8 became 10 — does retire it")
     eq(t, hOut[1].why, "delivered", "...as delivered")
 
-    -- An entry from a build that recorded no baseline has no delta to measure, so
-    -- it has no evidence path at all and rides to the expiry. Under-mailing for a
-    -- while is recoverable; the double-send is not.
+    -- An entry from a build that recorded no baseline has no delta to measure, so a
+    -- POST-send snapshot can never prove it, however large. (Since CDT-5 a PRE-send
+    -- one can give it a baseline — see below — but that is an observation of what
+    -- they held, not a licence to read any count as a delivery.)
     local legacy = {}
     L.Add(legacy, "Erro", ITEM, 7, NOW)
     check(t, not L.HasBaseline(legacy[1]), "a pre-1.2.4 entry carries no baseline")
     eq(t, #(L.Reconcile(legacy, { erro = { count = 99, at = NOW + 3700 } }, NOW + 3700)), 1,
-       "...and no snapshot, however large, is allowed to prove it delivered")
+       "...and no post-send snapshot, however large, is allowed to prove it delivered")
     local _, legOld = L.Reconcile(legacy, {}, NOW + 31 * DAY)
-    eq(t, legOld[1].why, "expired", "...it retires on the TTL, and only there")
+    eq(t, legOld[1].why, "expired", "...it retires on the TTL when nothing else speaks")
+
+    -- CDT-5: THE STALE BASELINE, AND THE SECOND CLOCK THAT FIXES IT.
+    --
+    -- The owner's save, 2026-08-17: Shalk's row said 5, the planner posted 5, Shalk
+    -- had actually burned down to 1. `cnt >= base + qty` therefore demanded a total
+    -- of TEN from a character who would hold SIX after delivery — unprovable by
+    -- construction, and the row sat for 46 hours with 28 days to go. The sender's
+    -- own mesh held the reading that fixes it, stamped 155 seconds BEFORE the send.
+    local SEND, SCAN, STAMP = 1786995333, 1786995178, 1786995544
+    local shalk = {}
+    L.Add(shalk, "Shalk", ITEM, 5, SEND, 5)
+    L.Reconcile(shalk, { shalk = { count = 1, at = STAMP, scanAt = SCAN } }, STAMP)
+    eq(t, shalk[1].base, 1, "a count SCANNED before the send corrects the wrong baseline")
+    eq(t, shalk[1].baseWas, 5, "...and the row remembers what the planner acted on")
+    local sKept, sOut = L.Reconcile(shalk, { shalk = { count = 6, at = SEND + 43200,
+                                                       scanAt = SEND + 43200 } }, SEND + 43200)
+    eq(t, #sKept, 0, "...so 1 became 6 is the delivery it always was")
+    eq(t, sOut[1].why, "delivered", "...proved, not guessed")
+
+    -- The delivery clock is NOT the scan clock. A row re-stamped after a send while
+    -- carrying a payload read before it must not open the delivery gate — that is
+    -- CDT-2's double-send arriving through the other door.
+    local restamped = {}
+    L.Add(restamped, "Bankalt", ITEM, 2, SEND, 8)
+    eq(t, #(L.Reconcile(restamped, { bankalt = { count = 10, at = SEND + 211,
+                                                 scanAt = SEND - 155 } }, SEND + 211)), 1,
+       "a pre-send count on a re-stamped row proves no delivery")
+    eq(t, restamped[1].base, 8, "...and never re-baselines UPWARD, which could only strand it")
+
+    -- PRESUMED RECEIVED: bounded, witnessed, and never inside the delivery window.
+    local function lost() local x = {}; L.Add(x, "Aether", ITEM, 6, NOW); return x end
+    local function seenAt(at) return { aether = { count = 10, at = at, scanAt = at } } end
+    eq(t, #(L.Reconcile(lost(), seenAt(NOW + 60), NOW + 60)), 1,
+       "inside Blizzard's hour, nothing is presumed at any age")
+    eq(t, #(L.Reconcile(lost(), {}, NOW + L.PRESUMED_AFTER + 3600)), 1,
+       "past the presumption with the recipient UNSEEN, the row is kept — silence is not evidence")
+    local pKept, pOut = L.Reconcile(lost(), seenAt(NOW + 2 * L.DELIVERY_FLOOR),
+                                    NOW + L.PRESUMED_AFTER + 3600)
+    eq(t, #pKept, 0, "past the presumption, with a post-delivery sighting, it retires")
+    eq(t, pOut[1].why, "presumed", "...as a presumption, which is not the same word as proved")
+    check(t, L.DELIVERY_FLOOR == 3600 and L.PRESUMED_AFTER > L.DELIVERY_FLOOR,
+       "the floor is Blizzard's hour and the presumption never sits under it")
 
     -- the TTL backstop (Blizzard's own mail expiry)
     eq(t, #(L.Reconcile(one, {}, NOW + 29 * DAY)), 1, "29 days on: still in the post")
@@ -1467,6 +1510,22 @@ ns:RegisterSelfTest("ledger", function(verbose)
        "the preview states the in-transit count in as many words")
     check(t, text:find("nothing to send", 1, true) ~= nil,
        "...and that it is therefore not being sent")
+
+    -- ...and once a mail is older than it has any business being, the reader is told
+    -- so. "has 1, 5 in transit" and "has 1, 5 in transit (46h)" are the difference
+    -- between a mail on its way and a row that should have cleared two days ago.
+    local aged = B.BuildPlan(
+        { { name = "Shalk", level = 60, counts = { [ITEM] = 1 }, countsAt = NOW } },
+        { source = "Bankalt", faction = "Alliance", stock = 99, itemID = ITEM,
+          inFlight = { shalk = 5 }, inFlightAge = { shalk = 46 * 3600 }, now = NOW })
+    check(t, B.PreviewText(aged):find("has 1, 5 in transit (46h)", 1, true) ~= nil,
+       "a transit row past the delivery hour carries its own age")
+    local young = B.BuildPlan(
+        { { name = "Shalk", level = 60, counts = { [ITEM] = 1 }, countsAt = NOW } },
+        { source = "Bankalt", faction = "Alliance", stock = 99, itemID = ITEM,
+          inFlight = { shalk = 5 }, inFlightAge = { shalk = 300 }, now = NOW })
+    check(t, B.PreviewText(young):find("has 1, 5 in transit,", 1, true) ~= nil,
+       "...and one still inside it does not — five minutes old is not news")
 
     -- the debug view
     local rows = L.Describe(e, NOW + 7200, B.FormatAge)

@@ -32,7 +32,7 @@ ns.SCHEMA = 1
 -- every attach-trace entry. Its whole job is to make a STALE-CODE run self-evident:
 -- when a field capture and the shipped source disagree about what the engine should
 -- have done, this says which of them is wrong before anyone theorises.
-ns.BUILD = "1.2.4+honesty.1"
+ns.BUILD = "1.2.5+transit.1"
 
 -- Mail constants. ATTACHMENTS_MAX_SEND is a FrameXML constant (12 in Classic Era);
 -- fall back defensively so a client that omits it still batches correctly.
@@ -413,6 +413,8 @@ local function printHelp()
     ns:Print("  /conduit enable          - re-enable Conduit on this character")
     ns:Print("  /conduit friends         - what auto-friend would do on this character")
     ns:Print("      ...reheal       - re-check recipients a pre-1.2.4 dark pass marked")
+    ns:Print("  /conduit transit         - boons already posted, with the age of each")
+    ns:Print("      ...clear <char> - drop rows for one character (or 'all')")
     ns:Print("  /conduit debug selftest  - run rule/batch/gold self-tests")
     ns:Print("  /conduit debug friends   - what auto-friend would do on this character")
     ns:Print("  /conduit debug boons     - build, boon plan, outbound ledger + attach trace")
@@ -462,6 +464,11 @@ local function dispatch(msg)
         else
             if ns.Friends and ns.Friends.Debug then ns:SafeCall(ns.Friends.Debug) end
         end
+    elseif cmd == "transit" then
+        -- NOT under `debug`. The in-transit ledger silently suppresses top-ups, and
+        -- when a clear never arrives the only way out is this verb — which makes it
+        -- ordinary operation, not diagnostics.
+        if ns.Boons and ns.Boons.Transit then ns:SafeCall(ns.Boons.Transit, rest) end
     elseif cmd == "debug" then
         local sub, subrest = (rest or ""):match("^(%S*)%s*(.-)$")
         sub = (sub or ""):lower()

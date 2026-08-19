@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased
+
+- **Boons that already arrived no longer sit "in transit" for a month.** When Conduit
+  posts a top-up it writes down what it sent, so an interrupted run started again
+  never mails the same boons twice. That note is supposed to be torn up when the mesh
+  sees the boons land — but it was measured against *what the mesh thought the
+  character was holding when the mail was built*, and that number is usually the one
+  thing about a top-up that is out of date. Post 5 to a character the mesh says has 5,
+  and Conduit waited to see them holding 10. If they had really burned down to 1 —
+  which is why they needed boons — they end up holding 6, the note is never torn up,
+  and every future top-up for them is suppressed for thirty days. That is what
+  produced "Shalk ← 4 (has 1, 5 in transit, seen 46h ago)". Conduit now takes the
+  baseline from a count it can *prove* was true before the mail could have landed, and
+  corrects the note when a better one turns up. Shalk's row clears the moment the mesh
+  catches up, and `/conduit transit` says the baseline moved and what it moved from.
+
+- **A note whose confirmation never arrives now retires by itself.** Some of these can
+  never be settled either way — the character spent the boons before anyone saw them,
+  the mail bounced, or the note predates the bookkeeping entirely. Those used to wait
+  the full thirty days. Now, once a day has passed *and* the character has actually
+  been seen since the mail would have arrived, the note retires and says so in chat
+  rather than vanishing quietly. Nothing retires inside the first hour, ever — that is
+  how long mail between separate accounts can take — and a character nobody has seen
+  keeps their note, because silence is not evidence.
+
+- **`/conduit transit`** — every boon already in the post, with the age of each, and
+  `/conduit transit clear <character>` (or `all`) to drop rows that are plainly wrong.
+  Every automatic rule above needs the mesh to deliver something; when it cannot, this
+  is the way out that depends on nothing.
+
+- **The dialog now shows how old an "in transit" line is** once it is past the hour
+  mail can take: "has 1, 5 in transit (46h)" rather than "has 1, 5 in transit". A
+  number with no age reads as a mail on its way, which is the one thing a 46-hour-old
+  row is not.
+
+- **A recount that was never a recount can no longer look like a delivery.** Conduit
+  was reading "when this computer last received a character's row" as "when that
+  character was last counted". Those come apart constantly — a row can be re-sent
+  between machines with nothing re-counted — and the owner's own data had a row
+  restamped three minutes *after* a mail while carrying a count taken two minutes
+  *before* it. Read the wrong way round, that is a delivery Conduit never saw, and the
+  double-send this bookkeeping exists to prevent. Both timings are now kept apart.
+
 ## 1.2.5 — 2026-08-11
 
 - **A long mail run can no longer stack the game up on itself.** The game does not

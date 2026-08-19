@@ -17,7 +17,8 @@ Daseeki Conduit is the Daseeki suite's mail automation addon for WoW Classic Era
 ## Chat Commands
 - `/conduit` — open the Conduit section in the Daseeki hub
 - `/conduit debug friends` — show the auto-friend decision per recipient
-- `/conduit debug boons` — show the boon plan and everything currently in the post (add `clear` to empty it)
+- `/conduit transit` — everything currently in the post, with the age of each (`clear <character|all>` drops rows)
+- `/conduit debug boons` — show the boon plan, the outbound ledger and the attach diagnostics
 
 ## Requires
 - **Daseeki Core** (required) — the suite's shared UI foundation
